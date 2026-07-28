@@ -742,7 +742,29 @@ where
     }
 
     ans = shrink_ancestor_frontiers(&ans, get);
-    if has_unmatched_branch && !has_trimmed_history_deps(&ans, get) {
+    // A branch that died without meeting the other side means `ans` may not be the
+    // mathematical LCA, and some checkout calculators need a base that precedes
+    // every branch which can affect operation positions. Falling back to empty
+    // frontiers is the conservative answer, but it makes the diff calculator
+    // replay the whole history for every container in the document, which is
+    // quadratic and hangs large documents (loro-dev/loro#1056).
+    //
+    // Checking out to a version that is already in the past always ends with an
+    // unmatched branch, and it is the one case where the fallback is provably
+    // unnecessary: `ans == right` means every id of `right` is reachable from
+    // `left` too, so `right`'s ancestors *are* the common ancestors and `ans` is
+    // already the maximal one. It is also the safe direction for the calculators,
+    // because `from_vv` then strictly contains `to_vv`, so the retreat is never
+    // empty and the richtext/list/movable-list trackers are rebuilt from the CRDT
+    // ids rather than advanced incrementally.
+    //
+    // Note this deliberately does not extend to `ans == left` (fast-forwarding
+    // past a concurrent branch): that direction has no retreat to force a rebuild,
+    // and relying on `mark_source_not_in_op_context` alone regresses `undo_tree`
+    // in crates/fuzz.
+    let target_is_ancestor_of_source = &ans == right;
+    if has_unmatched_branch && !target_is_ancestor_of_source && !has_trimmed_history_deps(&ans, get)
+    {
         ans = Default::default();
     }
 
@@ -1224,6 +1246,23 @@ mod tests {
 
         let (ancestor, mode) = dag.find_common_ancestor(&left.id.into(), &merge.id.into());
         assert_eq!(ancestor, Frontiers::default());
+        assert_eq!(mode, DiffMode::Checkout);
+    }
+
+    /// Regression for loro-dev/loro#1056: checking out (or `fork_at`-ing) to a
+    /// version that is a strict subset of the current frontiers used to discard
+    /// the exact common ancestor and fall back to empty frontiers, which forces
+    /// the diff calculator to replay the whole history for every container.
+    #[test]
+    fn common_ancestor_of_subset_target_is_the_target_itself() {
+        let a = node(1, 0, 11, 0, Frontiers::default());
+        let b = node(2, 0, 6, 4, ID::new(1, 3).into());
+        let current = Frontiers::from([ID::new(1, 10), ID::new(2, 5)]);
+        let target = Frontiers::from_id(ID::new(1, 10));
+        let dag = TestDag::new(vec![a, b], current.clone());
+
+        let (ancestor, mode) = dag.find_common_ancestor(&current, &target);
+        assert_eq!(ancestor, target);
         assert_eq!(mode, DiffMode::Checkout);
     }
 

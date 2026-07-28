@@ -26,7 +26,11 @@ over graceful degradation.
   before changing mergeable containers.
 - `src/handler.rs`: typed container handlers, local operation creation, and
   `MapHandler::ensure_mergeable_*`.
-- `src/diff_calc/`: diff calculation when moving between versions.
+- `src/diff_calc/`: diff calculation when moving between versions. Read
+  [../../context/diff-calc-replay-base.md](../../context/diff-calc-replay-base.md)
+  before changing `find_common_ancestor` or a calculator's rebuild condition; the
+  replay base decides which containers are touched at all, so loosening it is a
+  correctness risk and tightening it is a large perf win.
 - `docs/diff_calc.md`: design notes for diff calculation.
 - `docs/mergeable-container-id.md`: current mergeable container id encoding.
 - `tests/mergeable_container/` and `tests/mergeable_cid_encoding.rs`: focused
