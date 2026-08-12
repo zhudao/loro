@@ -1477,6 +1477,23 @@ impl RichtextState {
         result
     }
 
+    /// Whether every position in the entity range already resolves `key` to
+    /// `value`, in which case a mark with that key and value can be skipped.
+    pub(crate) fn range_has_style_key_value(
+        &mut self,
+        range: Range<usize>,
+        key: &str,
+        value: &LoroValue,
+    ) -> bool {
+        self.check_cache();
+        let result = match self.style_ranges.as_ref() {
+            Some(s) => s.range_has_key_value(range, key, value),
+            None => false,
+        };
+        self.check_cache();
+        result
+    }
+
     /// Return the entity range and text styles at the given range.
     /// If in the target range the leaves are not in the same span, the returned styles would be None
     pub(crate) fn get_entity_range_and_text_styles_at_range(
@@ -2171,7 +2188,7 @@ impl RichtextState {
 
             let mut cur_style_range = style_range_iter.next();
             let mut cur_styles: Option<StyleMeta> =
-                cur_style_range.as_ref().map(|x| x.1.clone().into());
+                cur_style_range.as_ref().map(|x| StyleMeta::from(x.1));
 
             let mut ans: Vec<(String, StyleMeta)> = Vec::new();
 
@@ -2188,7 +2205,7 @@ impl RichtextState {
                                 if current_entity_index >= inner_cur_range.end {
                                     cur_style_range = style_range_iter.next();
                                     cur_styles =
-                                        cur_style_range.as_ref().map(|x| x.1.clone().into());
+                                        cur_style_range.as_ref().map(|x| StyleMeta::from(x.1));
                                 } else {
                                     break;
                                 }
@@ -2506,7 +2523,7 @@ impl RichtextState {
             };
         let mut cur_style_range = style_range_iter.next();
         let mut cur_styles: Option<StyleMeta> =
-            cur_style_range.as_ref().map(|x| x.1.clone().into());
+            cur_style_range.as_ref().map(|x| StyleMeta::from(x.1));
 
         self.tree.iter().filter_map(move |x| match x {
             RichtextStateChunk::Text(s) => {
@@ -2521,7 +2538,7 @@ impl RichtextState {
                         break;
                     } else {
                         cur_style_range = style_range_iter.next();
-                        cur_styles = cur_style_range.as_ref().map(|x| x.1.clone().into());
+                        cur_styles = cur_style_range.as_ref().map(|x| StyleMeta::from(x.1));
                     }
                 }
 
