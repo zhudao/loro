@@ -1,6 +1,6 @@
 # Internal Encoding Context
 
-Verified against code 2026-07-31.
+Verified against code 2026-09-21.
 
 Loro has one binary blob envelope, two current binary body formats, two
 recognized-but-unsupported legacy top-level modes, and a separate JSON updates
@@ -165,7 +165,7 @@ The relay may already contain that predecessor. In that case the second path can
 reach the end of the queue without meeting the other side even though it is not
 concurrent.
 
-To distinguish those cases, `_find_common_ancestor_new` carries the dependency
+To distinguish those cases, `_find_meet_and_mode` carries the dependency
 tip where each path split. When a path remains unmatched, it checks only that tip
 against the ancestors of the candidate common frontiers. A covered tip is a
 redundant route and does not lower the replay base; an uncovered tip is a real
@@ -201,9 +201,34 @@ All three use `FastSnapshot` mode; there is no on-wire subtype field:
   version, but only from a non-shallow source document; a shallow source
   currently returns `NotImplemented`.
 
-For `ShallowSnapshot`, the requested frontier is reduced to a single valid
-history boundary, moved past a rich-text StyleStart when necessary, and clamped
-to an existing shallow root. The root state carries `fr`; a later state overlay
+`SnapshotAt` MUST retain the encoded state of normal containers whose creating
+operation belongs to the exported version, including deleted descendants.
+Historical checkout reverses operations on those containers; an alive-only
+filter can leave their operation history present while their materialized state
+is absent. `prepare_snapshot_container_state` owns construction of the filtered
+state copy. It combines `alive_indices_to_bytes` with
+`retain_containers_at_version`, which extends the alive set from encoded KV
+keys and checks creation IDs against the target version vector. It excludes normal
+containers created after the target, without decoding their state. Root and
+mergeable-container retention follows the existing alive walk. Shallow and
+state-only exports keep their history-boundary filtering and redaction rules.
+The public `snapshot_at_test` regressions exercise historical diffs, removed
+list/text descendants, later-created containers, and detached-source restoration.
+All recoverable errors after the temporary checkout MUST reach source
+restoration. The saved attachment mode MUST be restored explicitly, including
+a source detached at its current head.
+
+For `ShallowSnapshot`, the root is the latest single-head *critical version*
+(`latest_single_head_critical_version`, spec lemma L11) of the requested
+frontier together with the latest version, because every op from the root up
+to the latest version is retained and each one must be causally before or
+after the root, never concurrent with it (loro-dev/loro#1095). The meet of
+the requested heads is not enough: a branch merged later that
+forked below the requested version is concurrent with it. `StateOnly` retains
+history only up to its target, so it uses the target on both sides.
+`crates/loro/tests/shallow_root_critical.rs` checks the property op by op. The
+root is then moved past a rich-text StyleStart when necessary and clamped to
+an existing shallow root. The root state carries `fr`; a later state overlay
 does not. Import loads the root first and then either overlays the later state
 or replays retained changes when the state section is `E`. Unknown handling is
 path-dependent: rebuilding a root, or reusing a cached root to build an

@@ -296,7 +296,7 @@ pub(crate) fn export_shallow_snapshot_inner(
     start_from: &Frontiers,
 ) -> Result<(Snapshot, Frontiers), LoroEncodeError> {
     let oplog = doc.oplog().lock();
-    let start_from = calc_shallow_doc_start(&oplog, start_from);
+    let start_from = calc_shallow_doc_start(&oplog, start_from, oplog.frontiers());
     // `root_vv` is the version of the state at the shallow root; `start_vv`
     // additionally excludes the frontier ops themselves because the retained
     // history must include them.
@@ -675,7 +675,7 @@ pub(crate) fn export_state_only_snapshot<W: std::io::Write>(
     w: &mut W,
 ) -> Result<Frontiers, LoroEncodeError> {
     let oplog = doc.oplog().lock();
-    let start_from = calc_shallow_doc_start(&oplog, target_frontiers);
+    let start_from = calc_shallow_doc_start(&oplog, target_frontiers, target_frontiers);
     let mut start_vv =
         frontiers_to_vv_for_export(&oplog, &start_from, "export_state_only_snapshot")?;
     for id in start_from.iter() {
@@ -787,41 +787,37 @@ fn restore_export_doc_state(
     Ok(())
 }
 
-/// Calculates optimal starting version for the shallow doc
+/// Picks the shallow root for an export at `frontiers`.
 ///
-/// It should be a common ancestor version of the user-given version and the latest version.
-/// Otherwise, users cannot replay the history from the initial version till the latest version.
-fn calc_shallow_doc_start(oplog: &crate::OpLog, frontiers: &Frontiers) -> Frontiers {
-    // Find a common ancestor version of the given frontiers by iterative pairwise reduction.
-    // This converges to a single frontier or empty if there is no common ancestor.
-    let mut current = frontiers.clone();
-    while current.len() > 1 {
-        let ids: Vec<ID> = current.iter().collect();
-        let mut next = Frontiers::new();
-        let mut i = 0;
-        while i < ids.len() {
-            if i + 1 < ids.len() {
-                let (gca, _) = oplog
-                    .dag()
-                    .find_common_ancestor(&Frontiers::from(ids[i]), &Frontiers::from(ids[i + 1]));
-                for id in gca.iter() {
-                    next.push(id);
-                }
-            } else {
-                next.push(ids[i]);
-            }
-            i += 2;
-        }
-        if next == current {
-            // Cannot converge further (pairwise GCAs are the nodes themselves).
-            // Fall back to empty frontiers, meaning export full history.
-            return clamp_to_shallow_root(oplog, Frontiers::default());
-        }
-        current = next;
+/// The root must be a *critical version* of every op the export retains: each
+/// one is causally before the root or causally after it, never concurrent.
+/// The shallow format stores the state at the root plus every op above it, so
+/// an op concurrent with the root belongs to neither side and the snapshot
+/// cannot be imported (loro-dev/loro#1095). The meet of the heads is not
+/// enough.
+///
+/// `retained_to` is where the retained history ends: the latest version for a
+/// shallow snapshot, `frontiers` itself for a state-only snapshot. It matters
+/// because a branch merged after `frontiers` that forked below it is
+/// concurrent with `frontiers`, so a single-head past version is not a valid
+/// root on its own. See `docs/critical-version-spec.md`.
+fn calc_shallow_doc_start(
+    oplog: &crate::OpLog,
+    frontiers: &Frontiers,
+    retained_to: &Frontiers,
+) -> Frontiers {
+    if frontiers.is_empty() {
+        return clamp_to_shallow_root(oplog, Frontiers::default());
     }
 
+    // Single-head or empty: the empty version is the answer when no critical
+    // version exists, e.g. for independent heads with no common history.
+    let root = oplog
+        .dag()
+        .latest_single_head_critical_version(frontiers, retained_to);
+
     let mut ans = Frontiers::new();
-    for id in current.iter() {
+    for id in root.iter() {
         let mut processed = false;
         if let Some(op) = oplog.get_op_that_includes(id) {
             if let crate::op::InnerContent::List(InnerListOp::StyleStart { .. }) = &op.content {
@@ -858,6 +854,63 @@ fn clamp_to_shallow_root(oplog: &crate::OpLog, frontiers: Frontiers) -> Frontier
     } else {
         oplog.shallow_since_frontiers().clone()
     }
+}
+
+/// Retains container state required by the exported version.
+///
+/// The supplied keys retain alive containers and roots. History also needs
+/// deleted normal containers whose creating operations belong to `version`.
+/// The scan reads encoded keys without decoding container state. Validation
+/// completes before the KV store is filtered.
+///
+/// # Errors
+///
+/// Returns an encoding error for malformed keys or unknown normal containers
+/// retained by history.
+fn retain_containers_at_version(
+    state_kv: &KvWrapper,
+    mut retained_containers: BTreeSet<Vec<u8>>,
+    version: &VersionVector,
+) -> Result<(), LoroEncodeError> {
+    for key in state_kv.keys() {
+        let container = ContainerID::try_from_bytes(&key)?;
+        if let ContainerID::Normal { peer, counter, .. } = container {
+            if version.includes_id(ID::new(peer, counter)) {
+                if container.is_unknown() {
+                    return Err(LoroEncodeError::UnknownContainer);
+                }
+                retained_containers.insert(key);
+            }
+        }
+    }
+    state_kv.retain_keys(&retained_containers);
+    Ok(())
+}
+
+/// Builds the container-state copy required by a full-history snapshot.
+///
+/// `state` MUST already represent `version`.
+/// The returned copy retains alive containers and deleted normal containers
+/// required by the retained history.
+///
+/// # Errors
+///
+/// Returns an encoding error for invalid container state, malformed keys,
+/// or unsupported retained containers.
+fn prepare_snapshot_container_state(
+    state: &mut DocState,
+    version: &VersionVector,
+) -> Result<KvWrapper, LoroEncodeError> {
+    let alive_containers = state.ensure_all_alive_containers()?;
+    if has_unknown_container(alive_containers.iter().copied()) {
+        return Err(LoroEncodeError::UnknownContainer);
+    }
+
+    let alive_container_keys = alive_indices_to_bytes(state, &alive_containers);
+    state.store.flush();
+    let state_kv = state.store.get_kv_clone();
+    retain_containers_at_version(&state_kv, alive_container_keys, version)?;
+    Ok(state_kv)
 }
 
 pub(crate) fn encode_snapshot_at<W: std::io::Write>(
@@ -904,15 +957,16 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
             }
         }
 
-        let alive_containers = state.ensure_all_alive_containers()?;
-        if has_unknown_container(alive_containers.iter().copied()) {
-            break 'block Err(LoroEncodeError::UnknownContainer);
-        }
-
-        let alive_c_bytes = alive_indices_to_bytes(&state, &alive_containers);
-        state.store.flush();
-        let state_kv = state.store.get_kv_clone();
-        state_kv.retain_keys(&alive_c_bytes);
+        let Some(version) = oplog.dag.frontiers_to_vv(frontiers) else {
+            break 'block Err(LoroEncodeError::FrontiersNotFound(format!(
+                "frontiers: {:?} when export in SnapshotAt mode",
+                frontiers
+            )));
+        };
+        let state_kv = match prepare_snapshot_container_state(&mut state, &version) {
+            Ok(state_kv) => state_kv,
+            Err(error) => break 'block Err(error),
+        };
         let bytes = state_kv.export();
         _encode_snapshot(
             &Snapshot {
@@ -928,9 +982,7 @@ pub(crate) fn encode_snapshot_at<W: std::io::Write>(
     let restore_result = doc
         ._checkout_without_emitting(&version_before_start, false, false)
         .map_err(LoroEncodeError::from);
-    if !was_detached {
-        doc.set_detached(false);
-    }
+    doc.set_detached(was_detached);
     doc.app_state().lock().take_events();
 
     match result {
@@ -972,6 +1024,61 @@ mod tests {
         let checksum = xxhash_rust::xxh32::xxh32(&blob[20..], crate::encoding::XXH_SEED);
         blob[16..20].copy_from_slice(&checksum.to_le_bytes());
         blob
+    }
+
+    #[test]
+    fn snapshot_at_alive_walk_error_restores_source() {
+        let document = LoroDoc::new_auto_commit();
+        document.set_peer_id(42).unwrap();
+        let child = document
+            .get_map("parent-a")
+            .insert_container("child", MapHandler::new_detached())
+            .unwrap();
+        child.insert("value", 1).unwrap();
+        document.commit_then_renew();
+        let target = document.oplog_frontiers();
+        document.get_map("unrelated").insert("later", 2).unwrap();
+        document.commit_then_renew();
+        let head = document.oplog_frontiers();
+        let mut sections = shallow_sections(&document.export(ExportMode::Snapshot).unwrap());
+        let state = crate::utils::kv_wrapper::KvWrapper::new_mem();
+        state.import(sections.state_bytes.take().unwrap()).unwrap();
+
+        let other = LoroDoc::new_auto_commit();
+        other.set_peer_id(42).unwrap();
+        let other_child = other
+            .get_map("parent-b")
+            .insert_container("child", MapHandler::new_detached())
+            .unwrap();
+        other_child.insert("value", 1).unwrap();
+        assert_eq!(child.id(), other_child.id());
+        let other_sections = shallow_sections(&other.export(ExportMode::Snapshot).unwrap());
+        let other_state = crate::utils::kv_wrapper::KvWrapper::new_mem();
+        other_state
+            .import(other_sections.state_bytes.unwrap())
+            .unwrap();
+        let child_key = child.id().to_bytes();
+        state.insert(&child_key, other_state.get(&child_key).unwrap());
+        sections.state_bytes = Some(state.export());
+        let snapshot = assemble_snapshot_blob(&sections);
+
+        for detached in [false, true] {
+            let imported = LoroDoc::new_auto_commit();
+            imported.import(&snapshot).unwrap();
+            if detached {
+                imported.detach();
+            }
+            let unaffected = imported.get_map("unrelated").get_value();
+            let error = imported
+                .export(ExportMode::SnapshotAt {
+                    version: std::borrow::Cow::Borrowed(&target),
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("snapshot state encodes parent"));
+            assert_eq!(imported.state_frontiers(), head);
+            assert_eq!(imported.is_detached(), detached);
+            assert_eq!(imported.get_map("unrelated").get_value(), unaffected);
+        }
     }
 
     /// Decode the style values of a text container straight out of exported
