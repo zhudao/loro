@@ -60,6 +60,11 @@ metadata of deleted roots and dead containers, so comparing lamports against
 the state is not sound for concurrent ops. Containers with no concurrent old
 ops keep the fast path; they are not marked `source_not_in_op_context`.
 
+On a shallow doc the history cache seeds a map's shallow-root entries only
+when that map is first resolved (`ContainerHistoryCache::ensure_shallow_map_seeded`),
+so the first concurrent map import costs O(that map), not O(every map in the
+shallow root). Regression and perf test: `crates/loro/tests/shallow_lazy_map_checkout_index.rs`.
+
 Anything else (a text, list, movable list, tree or unknown container with ops
 on both sides) falls back to the DAG's conservative answer exactly as before.
 So does a shallow doc whose concurrent old history reaches below the shallow
@@ -72,6 +77,36 @@ ops in `from` cannot be scanned for containers. The regression test is
 Map diffs in `Checkout`/`Import` mode only look up the keys written inside the
 replayed span, and skip replayed ops that both versions already contain, so
 their cost follows the update instead of the map size.
+
+## Winner metadata, not just values
+
+Map and MovableList states store the winning op's lamport/peer (map entry,
+movable-list `value_id`) next to the value. A checkout must move that metadata
+even when both versions hold an equal value written by different ops (a value
+rewritten after the target, e.g. by `revert_to`).
+
+`MapDiffCalculator` (Checkout/Import) compares the winners at `from` and `to`
+by op id only (`MapHistoryCache::changed_winners_for_keys`): the same winner is
+skipped without reading any value, and a different winner is emitted with the
+`to` value. The `from` value is never fetched, because the state applying the
+diff is already at `from` (the isolated-import fast path diffs from the empty
+version, where every winner is new). `MapState` writes each entry with one
+`insert` and reports a change only when the previous value differs, so an
+equal-value entry is a silent metadata update and events still only report
+value changes. `MovableListState` does the same for element values. This keeps
+equal-value checkouts at the cost of `main` before the fix: the added state
+write per key is paid for by the dropped `from` value lookup (loro-dev/loro#1124;
+benchmark: `crates/loro/examples/map_equal_value_bench.rs`).
+
+Skipping those entries left the later op's metadata in the checked-out state.
+Shallow and state-only exports build their root state through such a checkout,
+so the root state carried a lamport/peer that is not in the root version. On
+import, `ensure_shallow_map_seeded` inserted that entry into the map checkout
+index, where it compared equal to the retained later op (the index is keyed by
+container, key, lamport and peer) and was dropped, so `checkout(root)` lost the
+key whenever its root-time writer was trimmed. `get_last_editor` after a
+checkout was wrong for the same reason. Regression tests:
+`crates/loro/tests/shallow_checkout_equal_value.rs`.
 
 ## Diff modes
 

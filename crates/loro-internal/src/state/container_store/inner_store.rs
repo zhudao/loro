@@ -2,12 +2,13 @@ use crate::{
     arena::SharedArena,
     configure::Configure,
     container::idx::ContainerIdx,
-    state::{container_store::FRONTIERS_KEY, ContainerCreationContext},
+    state::{container_store::FRONTIERS_KEY, ContainerCreationContext, ContainerState},
     utils::kv_wrapper::KvWrapper,
     version::Frontiers,
 };
 use bytes::Bytes;
-use loro_common::{ContainerID, LoroResult, LoroValue};
+use loro_common::{ContainerID, ContainerType, LoroResult, LoroValue};
+use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
 
 use super::ContainerWrapper;
@@ -338,6 +339,32 @@ impl InnerStore {
         Ok(None)
     }
 
+    /// Tree counterpart of [`Self::try_get_parent_and_value_ephemeral`]: the encoded parent and
+    /// the meta map ids of every node, deleted nodes included.
+    pub(crate) fn try_get_parent_and_tree_meta_ids_ephemeral(
+        &mut self,
+        idx: ContainerIdx,
+        ctx: ContainerCreationContext<'_>,
+    ) -> LoroResult<Option<(Option<ContainerID>, Vec<ContainerID>)>> {
+        if let Some(entry) = self.get_entry_mut(idx) {
+            let parent = entry.parent().cloned();
+            let ids = entry.try_get_tree_meta_ids_ephemeral(idx, ctx)?;
+            return Ok(Some((parent, ids)));
+        }
+
+        let id = self.arena.get_container_id(idx).unwrap();
+        let key = id.to_bytes();
+        if let Some(value) = self.kv.get(&key) {
+            let mut container = ContainerWrapper::try_new_from_bytes(value)?;
+            let parent = container.parent().cloned();
+            container.decode_state(idx, ctx)?;
+            let ids = container.try_get_state().unwrap().get_child_containers();
+            return Ok(Some((parent, ids)));
+        }
+
+        Ok(None)
+    }
+
     /// Read the parent encoded in a container wrapper without retaining a wrapper loaded only
     /// for this probe.
     ///
@@ -364,6 +391,39 @@ impl InnerStore {
 
         let key = id.to_bytes();
         self.kv.contains_key(&key)
+    }
+
+    /// Tree and MovableList containers, found without decoding any other
+    /// container. A kv key starts with the container type byte, with the high
+    /// bit set for root ids (see `ContainerID::encode`), so each type is a key range.
+    pub(crate) fn tree_and_movable_list_idxs(&mut self) -> Vec<ContainerIdx> {
+        let mut keys: Vec<Bytes> = Vec::new();
+        for ty in [ContainerType::Tree, ContainerType::MovableList] {
+            for root_bit in [0u8, 0b1000_0000] {
+                let lo = ty.to_u8() | root_bit;
+                keys.extend(
+                    self.kv
+                        .scan_range_entries(&[lo], &[lo + 1])
+                        .into_iter()
+                        .map(|(k, _)| k),
+                );
+            }
+        }
+        let mut out: FxHashSet<ContainerIdx> = FxHashSet::default();
+        self.arena.with_guards(|guards| {
+            for k in keys {
+                out.insert(guards.register_container(&ContainerID::from_bytes(&k)));
+            }
+        });
+        // Loaded entries can be newer than kv or absent from it.
+        for (slot, entry) in self.store.iter().enumerate() {
+            if let Some(c) = entry {
+                if matches!(c.kind(), ContainerType::Tree | ContainerType::MovableList) {
+                    out.insert(ContainerIdx::from_index_and_type(slot as u32, c.kind()));
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     pub(crate) fn iter_all_containers_mut(
