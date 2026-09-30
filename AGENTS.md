@@ -34,10 +34,21 @@ Loro is a Rust CRDT workspace with JS/WASM packaging and a MoonBit codec.
   and delete `start_id`s: [context/richtext-insert-positions.md](context/richtext-insert-positions.md).
 - Tree diff cache transitions and why their lamport window comes from the two
   versions, not the replay base: [context/tree-checkout-window.md](context/tree-checkout-window.md).
+- loro.js tree diff item order, index counting, apply resolution, and batch dry-run:
+  [context/loro-js-tree-diff.md](context/loro-js-tree-diff.md).
 - User-facing Loro usage, sync, editor integration, and performance guidance:
   [skills/loro/SKILL.md](skills/loro/SKILL.md).
 - Pure TypeScript runtime indexes, complexity contracts, benchmarks, and remaining gaps:
   [context/loro-js-performance.md](context/loro-js-performance.md).
+- loro.js vs Rust randomized Text differential tests and the Rust behaviors they
+  work around: [context/loro-js-rust-differential.md](context/loro-js-rust-differential.md).
+- loro.js rich-text style anchors, entity positions, and Rust's insert/delete/mark
+  position rules: [context/loro-js-richtext-anchors.md](context/loro-js-richtext-anchors.md).
+- loro.js multi-peer differential fuzzing against replay, checkout, event, and
+  Rust/WASM oracles: [context/loro-js-differential-fuzz.md](context/loro-js-differential-fuzz.md).
+- loro.js MovableList model, the MovableList Rust differential suite
+  (`loro-js/tests/differential/`), and known loro.js/Rust divergences:
+  [context/loro-js-movable-list.md](context/loro-js-movable-list.md).
 - WASM panic/OOM reporting channels, `__wbindgen_start` glue invariant, and
   trap-testing recipes:
   [context/wasm-error-reporting.md](context/wasm-error-reporting.md).

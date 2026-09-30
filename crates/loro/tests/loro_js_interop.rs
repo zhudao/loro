@@ -39,6 +39,24 @@ const TS_LEGACY_TREE_MOVE_SNAPSHOT: &[u8] =
     include_bytes!("../../../loro-js/tests/fixtures/rust/legacy-tree-move-snapshot.ts.blob");
 const TS_LEGACY_TREE_MOVE_SHALLOW_SNAPSHOT: &[u8] =
     include_bytes!("../../../loro-js/tests/fixtures/rust/legacy-tree-move-shallow.ts.blob");
+const TS_RICHTEXT_BASE: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/richtext-base.ts.blob");
+const TS_RICHTEXT_LEFT: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/richtext-left.ts.blob");
+const TS_RICHTEXT_RIGHT: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/richtext-right.ts.blob");
+const TS_RICHTEXT_SNAPSHOT: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/richtext-snapshot.ts.blob");
+const TS_RICHTEXT_EXPECTED_JSON: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/richtext.expected.json");
+const TS_MOVABLE_SNAPSHOT: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/movable-snapshot.ts.blob");
+const RUST_MOVABLE_UPDATES: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/movable-snapshot-updates.blob");
+const RUST_MOVABLE_PEER3: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/movable-snapshot-peer3.blob");
+const RUST_MOVABLE_PEER4: &[u8] =
+    include_bytes!("../../../loro-js/tests/fixtures/rust/movable-snapshot-peer4.blob");
 const TS_CURSOR: &[u8] = include_bytes!("../../../loro-js/tests/fixtures/rust/cursor.ts.blob");
 const TS_AWARENESS: &[u8] =
     include_bytes!("../../../loro-js/tests/fixtures/rust/awareness.ts.blob");
@@ -154,6 +172,83 @@ fn imports_typescript_shallow_snapshot_and_checks_out_its_root() {
     assert_eq!(
         doc.get_deep_value().to_json_value(),
         serde_json::json!({ "text": "01234" })
+    );
+}
+
+/// A Quill delta with null attributes dropped and equal neighbors merged, so
+/// deltas compare by content rather than by how each runtime splits them.
+fn normalized_delta(value: serde_json::Value) -> serde_json::Value {
+    let mut output: Vec<serde_json::Value> = Vec::new();
+    for item in value.as_array().expect("a delta is an array") {
+        let insert = item["insert"].as_str().expect("a text insert").to_string();
+        let attributes: serde_json::Map<String, serde_json::Value> = item
+            .get("attributes")
+            .and_then(|attributes| attributes.as_object())
+            .map(|attributes| {
+                attributes
+                    .iter()
+                    .filter(|(_, value)| !value.is_null())
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(previous) = output.last_mut() {
+            let previous_attributes = previous
+                .get("attributes")
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            if previous_attributes == serde_json::Value::Object(attributes.clone()) {
+                let merged = format!("{}{}", previous["insert"].as_str().unwrap(), insert);
+                previous["insert"] = merged.into();
+                continue;
+            }
+        }
+        let mut entry = serde_json::json!({ "insert": insert });
+        entry["attributes"] = serde_json::Value::Object(attributes);
+        output.push(entry);
+    }
+    serde_json::Value::Array(output)
+}
+
+fn richtext_delta(doc: &LoroDoc) -> serde_json::Value {
+    normalized_delta(doc.get_text("text").get_richtext_value().to_json_value())
+}
+
+#[test]
+fn imports_typescript_rich_text_with_anchor_positions() {
+    let expected: serde_json::Value =
+        serde_json::from_slice(TS_RICHTEXT_EXPECTED_JSON).expect("valid rich-text fixture");
+    let expected_delta = normalized_delta(expected["delta"].clone());
+
+    let doc = LoroDoc::new();
+    for update in [TS_RICHTEXT_BASE, TS_RICHTEXT_LEFT, TS_RICHTEXT_RIGHT] {
+        doc.import(update)
+            .expect("Rust should import TypeScript rich-text updates");
+    }
+    assert_eq!(richtext_delta(&doc), expected_delta);
+
+    let snapshot = LoroDoc::new();
+    snapshot
+        .import(TS_RICHTEXT_SNAPSHOT)
+        .expect("Rust should import a TypeScript rich-text snapshot");
+    assert_eq!(richtext_delta(&snapshot), expected_delta);
+    let frontiers: Vec<ID> = expected["base"]["frontiers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| {
+            ID::new(
+                id["peer"].as_str().unwrap().parse().unwrap(),
+                id["counter"].as_i64().unwrap() as i32,
+            )
+        })
+        .collect();
+    snapshot
+        .checkout(&frontiers.into())
+        .expect("the snapshot history should check out");
+    assert_eq!(
+        richtext_delta(&snapshot),
+        normalized_delta(expected["base"]["delta"].clone())
     );
 }
 
@@ -280,4 +375,37 @@ fn imports_legacy_typescript_tree_snapshots_with_unordered_siblings() {
             doc.get_deep_value().to_json_value()
         );
     }
+}
+
+fn movable_list_metadata(doc: &LoroDoc) -> Vec<(Option<u64>, Option<u64>, Option<u64>)> {
+    let list = doc.get_movable_list("list");
+    (0..list.len())
+        .map(|index| {
+            (
+                list.get_creator_at(index),
+                list.get_last_mover_at(index),
+                list.get_last_editor_at(index),
+            )
+        })
+        .collect()
+}
+
+/// loro.js writes a MovableList snapshot with its list item, element and
+/// last-set IDs, so later edits converge with a replica that has the history.
+#[test]
+fn imports_typescript_movable_list_snapshot_with_its_metadata() {
+    let expected = LoroDoc::new();
+    expected.import(RUST_MOVABLE_UPDATES).unwrap();
+    let doc = LoroDoc::new();
+    doc.import(TS_MOVABLE_SNAPSHOT)
+        .expect("Rust should import a MovableList snapshot produced by loro.js");
+    assert_eq!(doc.get_deep_value(), expected.get_deep_value());
+    assert_eq!(movable_list_metadata(&doc), movable_list_metadata(&expected));
+
+    for update in [RUST_MOVABLE_PEER4, RUST_MOVABLE_PEER3] {
+        doc.import(update).unwrap();
+        expected.import(update).unwrap();
+    }
+    assert_eq!(doc.get_deep_value(), expected.get_deep_value());
+    assert_eq!(movable_list_metadata(&doc), movable_list_metadata(&expected));
 }

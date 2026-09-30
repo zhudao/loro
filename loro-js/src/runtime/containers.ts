@@ -1,4 +1,4 @@
-import { bytesToHex } from "../codec/bytes";
+import { bytesEqual, bytesToHex } from "../codec/bytes";
 import {
   containerTypeFromHistoricalByte,
   containerTypeToHistoricalByte,
@@ -7,7 +7,8 @@ import { PostcardReader, PostcardWriter } from "../codec/postcard";
 import type { ContainerId as CodecContainerId, Id as CodecId } from "../codec/types";
 import { formatContainerId, formatTreeId, parseContainerId } from "./ids";
 import type { LoroDoc } from "./document";
-import { fractionalIndexBetween } from "./fractional-index";
+import { fractionalIndexBetween, fractionalIndexesBetween } from "./fractional-index";
+import { MovableListState, type MovableElement } from "./movable-list";
 import { OrderedIndex } from "./ordered-index";
 import { SequenceIndex, SequenceSpan } from "./sequence-index";
 import type { SequenceIdRun } from "./sequence-index";
@@ -53,23 +54,6 @@ export interface SequenceElement {
   deletedBy?: CodecId[] | undefined;
   deletedByPeer?: bigint | undefined;
   deletedByCounter?: number | undefined;
-  valueHistory?: SequenceValueMeta[] | undefined;
-  moveHistory?: SequenceMoveMeta[] | undefined;
-}
-
-export interface SequenceValueMeta {
-  readonly id: CodecId;
-  readonly lamport: number;
-  readonly value: RuntimeValue;
-}
-
-export interface SequenceMoveMeta {
-  readonly id: CodecId;
-  readonly lamport: number;
-  readonly beforePrevious: CodecId | undefined;
-  readonly beforeNext: CodecId | undefined;
-  readonly afterPrevious: CodecId | undefined;
-  readonly afterNext: CodecId | undefined;
 }
 
 export type CausalVersion = ReadonlyMap<bigint, number>;
@@ -88,18 +72,17 @@ interface ListState extends SequenceContainerState {
   readonly detachedCounter: number;
 }
 
-interface MovableListState extends ListState {
-  readonly valueHistoryComplete: boolean;
-  readonly moveHistoryComplete: boolean;
+interface MovableListSwapState extends SequenceContainerState {
+  readonly movable: MovableListState;
 }
 
 interface TextState extends SequenceContainerState {
   readonly sequence: SequenceIndex<TextElement>;
   readonly detachedCounter: number;
-  readonly detachedStyleCounter: number;
   readonly attributeHistoryComplete: boolean;
-  readonly styleIndex: TextStyleIndex<TextStyleMeta>;
+  readonly styleIndex: TextStyleIndex<TextStyle>;
   readonly styleVersion: CausalVersion | undefined;
+  readonly anchorStarts: Map<bigint, number[]>;
 }
 
 interface ParentLink {
@@ -107,6 +90,7 @@ interface ParentLink {
   readonly binding?:
     | { readonly kind: "map"; readonly key: string }
     | { readonly kind: "sequence"; readonly element: SequenceElement }
+    | { readonly kind: "movable"; readonly element: MovableElement }
     | { readonly kind: "tree"; readonly record: TreeNodeRecord };
 }
 
@@ -140,7 +124,7 @@ export abstract class LoroContainer {
   }
 
   isDeleted(): boolean {
-    return this._doc?._isContainerDeleted(this) ?? false;
+    return this._doc?._isContainerUnreachable(this) ?? false;
   }
 
   subscribe(listener: (event: LoroEventBatch) => void): Subscription {
@@ -540,9 +524,6 @@ export class LoroList<T = unknown> extends LoroContainer {
         deleted: false,
         originLeft: undefined,
         originRight: undefined,
-        ...(this instanceof LoroMovableList
-          ? { valueHistory: [{ id, lamport, value }] }
-          : {}),
       };
     });
     this._sequence.insertAtVisible(position, elements);
@@ -566,19 +547,9 @@ export class LoroList<T = unknown> extends LoroContainer {
         deleted: false,
         originLeft: undefined,
         originRight: undefined,
-        ...(this instanceof LoroMovableList
-          ? { valueHistory: [{ id, lamport: elementLamport, value }] }
-          : {}),
       };
     });
-    insertFugueElements(
-      this._sequence,
-      position,
-      elements,
-      causalVersion,
-      // Moves break the origin-tree preorder used by the direct-child index.
-      !(this instanceof LoroMovableList),
-    );
+    insertFugueElements(this._sequence, position, elements, causalVersion);
     this._bindChildren(elements);
   }
 
@@ -633,6 +604,8 @@ export class LoroList<T = unknown> extends LoroContainer {
 
 export interface TextElement extends SequenceElement {
   value: string;
+  /** Set on a zero-width rich-text style anchor. */
+  anchor?: TextAnchor | undefined;
   attributes?: Map<string, RuntimeValue> | undefined;
   attributeMeta?: Map<string, TextStyleMeta> | undefined;
   attributeHistory?: Map<string, TextStyleMeta[]> | undefined;
@@ -748,8 +721,6 @@ class TextSequenceSpan extends SequenceSpan<TextElement> {
   #attributes: Map<number, Map<string, RuntimeValue>> | undefined;
   #attributeMeta: Map<number, Map<string, TextStyleMeta>> | undefined;
   #attributeHistory: Map<number, Map<string, TextStyleMeta[]>> | undefined;
-  #valueHistory: Map<number, SequenceValueMeta[]> | undefined;
-  #moveHistory: Map<number, SequenceMoveMeta[]> | undefined;
 
   static fromText(
     text: string,
@@ -805,8 +776,6 @@ class TextSequenceSpan extends SequenceSpan<TextElement> {
         offset,
         element.attributeHistory,
       );
-      span.#valueHistory = setOffsetMap(span.#valueHistory, offset, element.valueHistory);
-      span.#moveHistory = setOffsetMap(span.#moveHistory, offset, element.moveHistory);
       span.retain(offset, element);
     }
     span.#deletedBits >>>= 0;
@@ -923,8 +892,6 @@ class TextSequenceSpan extends SequenceSpan<TextElement> {
     output.#attributes = copyOffsetMap(this.#attributes, start, end);
     output.#attributeMeta = copyOffsetMap(this.#attributeMeta, start, end);
     output.#attributeHistory = copyOffsetMap(this.#attributeHistory, start, end);
-    output.#valueHistory = copyOffsetMap(this.#valueHistory, start, end);
-    output.#moveHistory = copyOffsetMap(this.#moveHistory, start, end);
     return output;
   }
 
@@ -975,12 +942,6 @@ class TextSequenceSpan extends SequenceSpan<TextElement> {
       other.#attributeHistory,
       oldLength,
     );
-    this.#valueHistory = appendOffsetMap(
-      this.#valueHistory,
-      other.#valueHistory,
-      oldLength,
-    );
-    this.#moveHistory = appendOffsetMap(this.#moveHistory, other.#moveHistory, oldLength);
     return true;
   }
 
@@ -1094,22 +1055,6 @@ class TextSequenceSpan extends SequenceSpan<TextElement> {
     value: Map<string, TextStyleMeta[]> | undefined,
   ): void {
     this.#attributeHistory = setOffsetMap(this.#attributeHistory, offset, value);
-  }
-
-  valueHistoryAt(offset: number): SequenceValueMeta[] | undefined {
-    return this.#valueHistory?.get(offset);
-  }
-
-  setValueHistoryAt(offset: number, value: SequenceValueMeta[] | undefined): void {
-    this.#valueHistory = setOffsetMap(this.#valueHistory, offset, value);
-  }
-
-  moveHistoryAt(offset: number): SequenceMoveMeta[] | undefined {
-    return this.#moveHistory?.get(offset);
-  }
-
-  setMoveHistoryAt(offset: number, value: SequenceMoveMeta[] | undefined): void {
-    this.#moveHistory = setOffsetMap(this.#moveHistory, offset, value);
   }
 
   #number(offset: number, column: number): number {
@@ -1337,22 +1282,6 @@ class PackedTextElement implements TextElement, CodecId {
     this.#span.setAttributeHistoryAt(this.#offset, value);
   }
 
-  get valueHistory(): SequenceValueMeta[] | undefined {
-    return this.#span.valueHistoryAt(this.#offset);
-  }
-
-  set valueHistory(value: SequenceValueMeta[] | undefined) {
-    this.#span.setValueHistoryAt(this.#offset, value);
-  }
-
-  get moveHistory(): SequenceMoveMeta[] | undefined {
-    return this.#span.moveHistoryAt(this.#offset);
-  }
-
-  set moveHistory(value: SequenceMoveMeta[] | undefined) {
-    this.#span.setMoveHistoryAt(this.#offset, value);
-  }
-
   _retarget(span: TextSequenceSpan, offset: number): void {
     this.#span = span;
     this.#offset = offset;
@@ -1404,15 +1333,39 @@ export interface TextStyleMeta {
   readonly value: RuntimeValue;
 }
 
+/**
+ * A rich-text mark. As in Rust, its start and end anchors are zero-width
+ * elements of the text sequence, and the style covers every element between
+ * them, including elements inserted there later. See
+ * context/loro-js-richtext-anchors.md.
+ */
+export interface TextStyle extends TextStyleMeta {
+  readonly key: string;
+  /**
+   * The mark op's end entity position in its causal view; the end anchor goes
+   * to `end + 1` once the start anchor is in place.
+   */
+  readonly end: number;
+}
+
+export interface TextAnchor {
+  readonly style: TextStyle;
+  readonly isEnd: boolean;
+}
+
+/** Style info byte of detached marks: Rust's `TextStyleInfoFlag::BOLD`. */
+const DETACHED_STYLE_INFO = 0x84;
+
 export class LoroText extends LoroContainer {
   _sequence = createTextSequence();
   _detachedCounter = 0;
-  _detachedStyleCounter = 0;
   _attributeHistoryComplete = true;
-  _styleIndex = new TextStyleIndex<TextStyleMeta>();
+  _styleIndex = new TextStyleIndex<TextStyle>();
   _styleVersion: CausalVersion | undefined;
+  /** Start-anchor counters by peer, ascending; the end anchor is the next counter. */
+  #anchorStarts = new Map<bigint, number[]>();
   readonly #attributeValuesCache = new WeakMap<
-    ReadonlyMap<string, TextStyleMeta>,
+    ReadonlyMap<string, TextStyle>,
     ReadonlyMap<string, RuntimeValue>
   >();
 
@@ -1424,7 +1377,11 @@ export class LoroText extends LoroContainer {
   /** Rebuilds fragmented physical text spans without changing CRDT history. */
   compact(): void {
     this._ensureHydrated();
-    this._sequence.compact((elements) => TextSequenceSpan.fromElements(elements));
+    this._sequence.compact((elements) =>
+      elements.some((element) => element.anchor !== undefined)
+        ? undefined
+        : TextSequenceSpan.fromElements(elements),
+    );
   }
 
   kind(): "Text" {
@@ -1448,10 +1405,10 @@ export class LoroText extends LoroContainer {
     if (!Number.isSafeInteger(line) || line < 0 || line >= this.lineCount) {
       return undefined;
     }
-    const unicodePosition = this._sequence.visibleIndexAfterLineBreaks(line);
-    return unicodePosition === undefined
+    const entity = this._sequence.visibleIndexAfterLineBreaks(line);
+    return entity === undefined
       ? undefined
-      : this._sequence.metricOffsetAtVisibleIndex(unicodePosition, "utf16");
+      : this._sequence.metricOffsetAtVisibleIndex(entity, "utf16");
   }
 
   /** Returns the zero-based line containing a UTF-16 position. */
@@ -1460,10 +1417,10 @@ export class LoroText extends LoroContainer {
     if (!Number.isSafeInteger(position) || position < 0 || position > this.length) {
       return undefined;
     }
-    const unicodePosition = this.convertPos(position, "utf16", "unicode");
-    return unicodePosition === undefined
+    const entity = this.#entityAt(position);
+    return entity === undefined
       ? undefined
-      : this._sequence.lineBreakOffsetAtVisibleIndex(unicodePosition);
+      : this._sequence.lineBreakOffsetAtVisibleIndex(entity);
   }
 
   /** Returns a line without its LF or CRLF terminator. */
@@ -1481,6 +1438,7 @@ export class LoroText extends LoroContainer {
     return this._stringRange(0, this._sequence.visibleLength);
   }
 
+  /** Text of the visible entity range; style anchors contribute nothing. */
   _stringRange(start: number, end: number): string {
     this._ensureHydrated();
     const chunks: string[] = [];
@@ -1540,6 +1498,7 @@ export class LoroText extends LoroContainer {
         if (!(span instanceof TextSequenceSpan)) {
           for (let offset = spanStart; offset < spanEnd; offset += 1) {
             const element = span.elementAt(offset);
+            if (element.anchor !== undefined) continue;
             if (!append(element.value, element.id.peer, element.id.counter)) {
               return false;
             }
@@ -1575,13 +1534,15 @@ export class LoroText extends LoroContainer {
           previousRunCounter,
         );
       },
-      (element) => append(element.value, element.id.peer, element.id.counter),
+      (element) =>
+        element.anchor !== undefined ||
+        append(element.value, element.id.peer, element.id.counter),
     );
     if (!stopped && chunk.length > 0) callback(chunk.join(""));
   }
 
   insert(pos: number, text: string): void {
-    const unicodePosition = this._validateInsertPosition(pos);
+    const entity = this.#insertPosition(pos);
     if (text.length === 0) return;
     if (this._doc === undefined) {
       const span = TextSequenceSpan.fromText(
@@ -1592,10 +1553,11 @@ export class LoroText extends LoroContainer {
         undefined,
       );
       this._detachedCounter += span.length;
-      this._sequence.insertSpanAtVisible(unicodePosition, span);
+      this._sequence.insertSpanAtVisible(entity, span);
+      this.#inheritGapStyles(span.idAt(0), span.length);
       return;
     }
-    this._doc._textInsert(this, unicodePosition, text);
+    this._doc._textInsert(this, entity, text);
   }
 
   push(text: string): void {
@@ -1611,14 +1573,21 @@ export class LoroText extends LoroContainer {
   delete(pos: number, len: number): void {
     validateRange(pos, len, this.length);
     if (len === 0) return;
-    const start = this._unicodePosition(pos);
-    const end = this._unicodePosition(pos + len);
+    this.#requireBoundary(pos);
+    this.#requireBoundary(pos + len);
     if (this._doc === undefined) {
-      for (const element of this._sequence.visibleRange(start, end))
-        this._sequence.setDeleted(element, true);
+      for (const { run } of this._deleteRuns(pos, pos + len)) {
+        for (let offset = 0; offset < run.length; offset += 1) {
+          const element = this._sequence.findById({
+            peer: run.start.peer,
+            counter: run.start.counter + offset,
+          });
+          if (element !== undefined) this._sequence.setDeleted(element, true);
+        }
+      }
       return;
     }
-    this._doc._textDelete(this, start, end - start);
+    this._doc._textDelete(this, pos, len);
   }
 
   deleteUtf8(index: number, length: number): void {
@@ -1631,14 +1600,14 @@ export class LoroText extends LoroContainer {
 
   slice(start: number, end: number): string {
     validateRange(start, end - start, this.length);
-    const unicodeStart = this._unicodePosition(start);
-    const unicodeEnd = this._unicodePosition(end);
-    return this._stringRange(unicodeStart, unicodeEnd);
+    return this._stringRange(this.#requireBoundary(start), this.#requireBoundary(end));
   }
 
   charAt(pos: number): string {
     if (pos === this.length) return "";
-    return this._sequence.atVisible(this._unicodePosition(pos))?.value ?? "";
+    this.#requireBoundary(pos);
+    const entity = this._sequence.visibleIndexOfMetricUnit(pos, "utf16");
+    return entity === undefined ? "" : (this._sequence.atVisible(entity)?.value ?? "");
   }
 
   splice(pos: number, len: number, text: string): string {
@@ -1648,65 +1617,71 @@ export class LoroText extends LoroContainer {
     return removed;
   }
 
+  /**
+   * Marks a UTF-16 range like Rust's `TextHandler::mark`: both ends go where
+   * text inserted there would go, and a mark that would not change any
+   * position's value (or an unmark of a key the range never had) is skipped.
+   */
   mark(range: { start: number; end: number }, key: string, value: unknown): void {
-    validateRange(range.start, range.end - range.start, this.length);
-    const start = this._unicodePosition(range.start);
-    const end = this._unicodePosition(range.end);
+    this._ensureHydrated();
+    const { start, end } = range;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= end) {
+      throw new RangeError("mark start must be less than its end");
+    }
+    validateRange(start, end - start, this.length);
+    const entityStart = this.#insertPosition(start);
+    const entityEnd = this.#insertPosition(end);
+    const normalized = normalizeDetachedValue(value);
+    if (this.#markIsRedundant(entityStart, entityEnd, key, normalized)) return;
     if (this._doc === undefined) {
-      this._applyMark(start, end, key, normalizeDetachedValue(value));
+      this.#markDetached(entityStart, entityEnd, key, normalized);
       return;
     }
-    this._doc._textMark(this, start, end, key, value);
+    this._doc._textMark(this, entityStart, entityEnd, key, value);
   }
 
   unmark(range: { start: number; end: number }, key: string): void {
-    validateRange(range.start, range.end - range.start, this.length);
-    const start = this._unicodePosition(range.start);
-    const end = this._unicodePosition(range.end);
-    if (
-      !this._styleIndex.rangeHasKey(this._styleRuns(start, end), key, this._styleVersion)
-    ) {
-      return;
-    }
     this.mark(range, key, null);
   }
 
+  /**
+   * Applies a Quill delta like Rust's `apply_delta`: inserted text without an
+   * attribute explicitly drops the style it would inherit, and every attribute
+   * is marked after the whole delta is applied.
+   */
   applyDelta(delta: readonly Delta<string>[]): void {
     let position = 0;
     const marks: {
       readonly start: number;
       readonly end: number;
-      readonly attributes: Readonly<Record<string, Value>>;
+      readonly attributes: readonly (readonly [string, unknown])[];
     }[] = [];
     for (const operation of delta) {
       if ("insert" in operation) {
-        this.insert(position, operation.insert);
         const length = operation.insert.length;
-        if (operation.attributes !== undefined) {
-          marks.push({
-            start: position,
-            end: position + length,
-            attributes: operation.attributes,
-          });
+        if (length === 0) continue;
+        if (position > this.length) {
+          throw new RangeError(`delta position ${position} is out of range`);
         }
+        const attributes = operation.attributes ?? {};
+        const overrides = this.#insertOverrides(position, attributes);
+        this.insert(position, operation.insert);
+        marks.push({ start: position, end: position + length, attributes: overrides });
         position += length;
       } else if ("delete" in operation) {
         this.delete(position, operation.delete);
       } else {
-        if (operation.attributes !== undefined) {
-          marks.push({
-            start: position,
-            end: position + operation.retain,
-            attributes: operation.attributes,
-          });
+        const end = position + operation.retain;
+        if (end > this.length) {
+          throw new RangeError(`delta range ${position}..${end} is out of range`);
         }
-        position += operation.retain;
+        const entries = Object.entries(operation.attributes ?? {});
+        if (entries.length > 0) marks.push({ start: position, end, attributes: entries });
+        position = end;
       }
     }
     for (const { start, end, attributes } of marks) {
-      for (const [key, value] of Object.entries(attributes)) {
-        this.mark({ start, end }, key, value);
-      }
+      for (const [key, value] of attributes) this.mark({ start, end }, key, value);
     }
   }
 
@@ -1717,10 +1692,11 @@ export class LoroText extends LoroContainer {
   sliceDelta(start: number, end: number): Delta<string>[] {
     this._ensureHydrated();
     validateRange(start, end - start, this.length);
-    const unicodeStart = this._unicodePosition(start);
-    const unicodeEnd = this._unicodePosition(end);
     return textElementsToDelta(
-      this._sequence.visibleRange(unicodeStart, unicodeEnd),
+      this._sequence.visibleRange(
+        this.#requireBoundary(start),
+        this.#requireBoundary(end),
+      ),
       this.#attributeResolver(),
     );
   }
@@ -1738,47 +1714,29 @@ export class LoroText extends LoroContainer {
   convertPos(index: number, from: TextPosType, to: TextPosType): number | undefined {
     this._ensureHydrated();
     if (!isTextPosType(from) || !isTextPosType(to)) return undefined;
-    const visibleLength = this._sequence.visibleLength;
-    const directMetric =
-      from === "unicode" ||
-      (from === "utf16" && this._sequence.visibleUtf16Length === visibleLength) ||
-      (from === "utf8" && this._sequence.visibleUtf8Length === visibleLength);
-    const unicodeIndex = directMetric
-      ? Number.isSafeInteger(index) && index >= 0 && index <= visibleLength
-        ? index
-        : undefined
-      : this._sequence.visibleIndexAtMetricOffset(index, from);
-    if (unicodeIndex === undefined) return undefined;
-    if (
-      to === "unicode" ||
-      (to === "utf16" && this._sequence.visibleUtf16Length === visibleLength) ||
-      (to === "utf8" && this._sequence.visibleUtf8Length === visibleLength)
-    ) {
-      return unicodeIndex;
-    }
-    return this._sequence.metricOffsetAtVisibleIndex(unicodeIndex, to);
+    const entity = this.#entityFrom(index, from);
+    return entity === undefined ? undefined : this.#offsetAt(entity, to);
   }
 
+  /**
+   * Matches Rust: an empty text or a position at the end yields an ID-less
+   * cursor (left side when empty, right side at the end); otherwise the cursor
+   * names the scalar that starts at the UTF-16 position. The encoded origin is
+   * Rust's too: the Unicode position, or the UTF-16 length at the end.
+   */
   getCursor(pos: number, side: Side = 0): Cursor | undefined {
     if (!Number.isSafeInteger(pos) || pos < 0) return undefined;
-    if (pos >= this.length) {
-      return new Cursor(
-        this.id,
-        this._sequence.atVisible(this._sequence.visibleLength - 1)?.id,
-        1,
-        this.length,
-      );
-    }
+    const length = this.length;
+    if (length === 0) return new Cursor(this.id, undefined, side === 0 ? -1 : side, 0);
+    if (pos >= length) return new Cursor(this.id, undefined, 1, length);
+    const element = this.#elementAt(pos);
     const unicodePosition = this.convertPos(pos, "utf16", "unicode");
-    if (unicodePosition === undefined) return undefined;
-    return new Cursor(this.id, this._sequence.atVisible(unicodePosition)!.id, side, pos);
+    if (element === undefined || unicodePosition === undefined) return undefined;
+    return new Cursor(this.id, element.id, side, unicodePosition);
   }
 
   getEditorOf(pos: number): string | undefined {
-    const unicodePosition = this.convertPos(pos, "utf16", "unicode");
-    return unicodePosition === undefined
-      ? undefined
-      : this._sequence.atVisible(unicodePosition)?.id.peer.toString();
+    return this.#elementAt(pos)?.id.peer.toString();
   }
 
   update(text: string, _options?: TextUpdateOptions): void {
@@ -1797,6 +1755,7 @@ export class LoroText extends LoroContainer {
     return this.toString();
   }
 
+  /** Visible elements in order, style anchors included. */
   _visibleElements(): TextElement[] {
     this._ensureHydrated();
     return this._sequence.visible();
@@ -1812,23 +1771,32 @@ export class LoroText extends LoroContainer {
     return this._sequence.atVisible(position);
   }
 
-  _insertVisible(
-    position: number,
-    characters: readonly string[],
-    ids: readonly CodecId[],
-    lamports: readonly number[],
-  ): void {
-    this._sequence.insertAtVisible(
-      position,
-      characters.map((value, index) => ({
-        value,
-        id: ids[index]!,
-        lamport: lamports[index]!,
-        deleted: false,
-        originLeft: undefined,
-        originRight: undefined,
-      })),
-    );
+  /**
+   * Appends snapshot state: text scalars and style anchors in document order,
+   * all visible. Styles cover the elements between their anchors.
+   */
+  _appendElements(elements: readonly TextElement[]): void {
+    if (elements.length === 0) return;
+    const base = this._sequence.allLength;
+    this._sequence.insertAtPhysical(base, elements);
+    const starts = new Map<TextStyle, number>();
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index]!;
+      const anchor = element.anchor;
+      if (anchor === undefined) continue;
+      this.#registerAnchor(element);
+      if (!anchor.isEnd) {
+        starts.set(anchor.style, base + index);
+        continue;
+      }
+      const start = starts.get(anchor.style);
+      if (start === undefined) continue;
+      this._styleIndex.add(
+        this._sequence.physicalIdRuns(start, base + index + 1),
+        anchor.style.key,
+        anchor.style,
+      );
+    }
   }
 
   _insertFugue(
@@ -1838,37 +1806,13 @@ export class LoroText extends LoroContainer {
     lamport: number,
     causalVersion: CausalVersion,
   ): void {
-    const current = this._sequence.isFullyIncluded(causalVersion);
-    const authored = current ? undefined : this._sequence.causalView(causalVersion);
-    const authoredLength = current ? this._sequence.visibleLength : authored!.length;
-    const authoredPosition = Math.min(position, authoredLength);
-    const currentContext = current
-      ? this._sequence.visibleInsertionContext(authoredPosition)
-      : undefined;
-    const authoredAt = (index: number): TextElement | undefined =>
-      current ? this._sequence.atVisible(index) : authored!.at(index);
-    const authoredLeft = currentContext?.left ?? authoredAt(authoredPosition - 1);
     const insertion = fugueInsertion(
       this._sequence,
       position,
       startId,
       causalVersion,
       true,
-      currentContext ?? { current: false, left: authoredLeft },
     );
-    let inherited: Map<string, TextStyleMeta> | undefined;
-    if (!this._styleIndex.isEmpty) {
-      inherited = new Map();
-      for (const [key, meta] of this._attributeMetasAt(authoredLeft, causalVersion)) {
-        if ((meta.info & 0b100) !== 0) inherited.set(key, meta);
-      }
-      for (const [key, meta] of this._attributeMetasAt(
-        authoredAt(authoredPosition),
-        causalVersion,
-      )) {
-        if ((meta.info & 0b010) !== 0) inherited.set(key, meta);
-      }
-    }
     const firstCodePoint = text.codePointAt(0)!;
     const singleScalar =
       text.length === 1 || (text.length === 2 && firstCodePoint > 0xffff);
@@ -1897,12 +1841,118 @@ export class LoroText extends LoroContainer {
       recordFugueInsertionRun(this._sequence, insertion, startId);
       insertedLength = span.length;
     }
-    if (inherited !== undefined && inherited.size > 0) {
-      const insertedRun = [{ start: { ...startId }, length: insertedLength }];
-      for (const [key, meta] of inherited) {
-        this._styleIndex.add(insertedRun, key, meta);
+    this.#inheritGapStyles(startId, insertedLength, insertion.insertIndex);
+  }
+
+  /** Inserts a mark's start anchor at its entity position in the causal view. */
+  _applyStyleStart(
+    position: number,
+    style: TextStyle,
+    lamport: number,
+    causalVersion: CausalVersion,
+  ): void {
+    this.#insertAnchor(
+      position,
+      {
+        value: "",
+        id: { peer: style.startId.peer, counter: style.startId.counter },
+        lamport,
+        deleted: false,
+        originLeft: undefined,
+        originRight: undefined,
+        anchor: { style, isEnd: false },
+      },
+      causalVersion,
+    );
+  }
+
+  /**
+   * Inserts a mark's end anchor at `end + 1` in the causal view (which now
+   * contains the start anchor) and applies the style to everything between.
+   */
+  _applyStyleEnd(
+    id: CodecId,
+    lamport: number,
+    causalVersion: CausalVersion,
+  ): TextStyle | undefined {
+    const start = this._sequence.findById({ peer: id.peer, counter: id.counter - 1 });
+    const anchor = start?.anchor;
+    if (start === undefined || anchor === undefined || anchor.isEnd) return undefined;
+    const style = anchor.style;
+    const end: TextElement = {
+      value: "",
+      id: { peer: id.peer, counter: id.counter },
+      lamport,
+      deleted: false,
+      originLeft: undefined,
+      originRight: undefined,
+      anchor: { style, isEnd: true },
+    };
+    this.#insertAnchor(style.end + 1, end, causalVersion);
+    this.#applyStyleRange(start, end, style);
+    if (this._styleVersion !== undefined) {
+      // A detached document edited in place keeps showing its own new style.
+      const next = new Map(this._styleVersion);
+      next.set(id.peer, Math.max(next.get(id.peer) ?? 0, id.counter + 1));
+      this._styleVersion = next;
+    }
+    return style;
+  }
+
+  /** ID runs of every element a style covers, its anchors included. */
+  _styleMemberRuns(style: TextStyle): SequenceIdRun[] {
+    const start = this._sequence.findById(style.startId);
+    const end = this._sequence.findById({
+      peer: style.startId.peer,
+      counter: style.startId.counter + 1,
+    });
+    if (start === undefined || end === undefined) return [];
+    const from = this._sequence.physicalIndexOf(start);
+    const to = this._sequence.physicalIndexOf(end);
+    if (from === undefined || to === undefined || from > to) return [];
+    return this._sequence.physicalIdRuns(from, to + 1);
+  }
+
+  /** Runs of the elements whose attribute an applied style changes. */
+  _styleChangeRuns(style: TextStyle): SequenceIdRun[] {
+    return this._styleIndex.winningRuns(
+      this._styleMemberRuns(style),
+      style.key,
+      style,
+      this._styleVersion,
+      styleValuesEqual,
+    );
+  }
+
+  /**
+   * Undoes a style like Rust's undo of its op: wherever the style changed the
+   * resolved value (from `before` to `after`, the versions around its op), the
+   * text gets the `before` value back (`null` drops the attribute).
+   */
+  _undoStyle(style: TextStyle, before: CausalVersion, after: CausalVersion): void {
+    const changes = this._styleIndex
+      .transitions(this._styleMemberRuns(style), style.key, before, after)
+      .filter(
+        ({ before: previous, after: next }) =>
+          !styleValuesEqual(previous?.value ?? null, next?.value ?? null),
+      )
+      .flatMap(({ run, before: previous }) =>
+        this._sequence
+          .visibleMetricRangesForIdRuns([run], "utf16")
+          .map((range) => ({ range, value: previous?.value ?? null })),
+      )
+      .sort((left, right) => left.range.start - right.range.start);
+    for (const { range, value } of changes) {
+      if (range.start < range.end) {
+        this.mark({ start: range.start, end: range.end }, style.key, value);
       }
     }
+  }
+
+  /** The anchored style whose start anchor has this ID. */
+  _styleAt(startId: CodecId): TextStyle | undefined {
+    const anchor = this._sequence.findById(startId)?.anchor;
+    return anchor === undefined || anchor.isEnd ? undefined : anchor.style;
   }
 
   _deleteIdSpan(startId: CodecId, length: number, deletedBy?: CodecId): void {
@@ -1915,54 +1965,126 @@ export class LoroText extends LoroContainer {
     this._sequence.deleteIdSpan(startId, length, deletedBy);
   }
 
-  _applyMark(
-    start: number,
-    end: number,
-    key: string,
-    value: RuntimeValue,
-    meta?: TextStyleMeta,
-    causalVersion?: CausalVersion,
+  /**
+   * Resolves the elements a delete operation removes. Rust's tracker deletes the
+   * visible elements at `position` in the operation's causal view and uses
+   * `startId` only to name them, so the position wins when the two disagree
+   * (Rust's WASM build can record a `startId` that is off by the UTF-16 length
+   * of astral characters). The recorded IDs are used only when the position
+   * range does not fit the causal view.
+   */
+  _deleteTargets(
+    position: number,
+    length: number,
+    startId: CodecId,
+    causalVersion: CausalVersion,
+  ): SequenceIdRun[] {
+    const recorded = [{ start: startId, length }];
+    const current = this._sequence.isFullyIncluded(causalVersion);
+    if (current && length === 1) {
+      const element = this._sequence.atVisible(position);
+      if (
+        element === undefined ||
+        (element.id.peer === startId.peer && element.id.counter === startId.counter)
+      ) {
+        return recorded;
+      }
+      return [{ start: element.id, length: 1 }];
+    }
+    const runs = current
+      ? this._sequence.visibleIdRuns(position, position + length)
+      : this._sequence.causalView(causalVersion).idRuns(position, position + length);
+    let resolved = 0;
+    for (const run of runs) resolved += run.length;
+    return resolved === length ? runs : recorded;
+  }
+
+  /**
+   * Deletes resolved target runs. Operation counters follow Rust: a forward
+   * delete's k-th counter removes the k-th target, a reversed delete's k-th
+   * counter removes the k-th target from the right.
+   */
+  _deleteTargetRuns(
+    runs: readonly SequenceIdRun[],
+    reversed: boolean,
+    deletedBy: CodecId,
   ): void {
-    const appliedMeta =
-      meta ??
-      ({
-        startId: { peer: -1n, counter: this._detachedStyleCounter },
-        lamport: this._detachedStyleCounter++,
-        info: 0,
-        value,
-      } satisfies TextStyleMeta);
-    this._styleIndex.add(this._styleRuns(start, end, causalVersion), key, appliedMeta);
-    if (this._styleVersion !== undefined) {
-      const next = new Map(this._styleVersion);
-      next.set(
-        appliedMeta.startId.peer,
-        Math.max(
-          next.get(appliedMeta.startId.peer) ?? 0,
-          appliedMeta.startId.counter + 1,
-        ),
-      );
-      this._styleVersion = next;
+    const total = runs.reduce((sum, run) => sum + run.length, 0);
+    let offset = 0;
+    for (const run of runs) {
+      const counter = reversed
+        ? deletedBy.counter + total - offset - run.length
+        : deletedBy.counter + offset;
+      this._deleteIdSpan(run.start, reversed ? -run.length : run.length, {
+        peer: deletedBy.peer,
+        counter,
+      });
+      offset += run.length;
     }
   }
 
-  _styleRuns(start: number, end: number, causalVersion?: CausalVersion): SequenceIdRun[] {
-    if (causalVersion === undefined || this._sequence.isFullyIncluded(causalVersion)) {
-      return this._sequence.visibleIdRuns(start, end);
+  /**
+   * Text runs covering a UTF-16 range, like Rust's `get_text_entity_ranges`:
+   * each run is consecutive in both entity position and ID. Style anchors are
+   * never deleted and split runs. Positions are entity indexes in the current
+   * state.
+   */
+  _deleteRuns(start: number, end: number): { position: number; run: SequenceIdRun }[] {
+    if (start >= end) return [];
+    const sequence = this._sequence;
+    if (sequence.visibleZeroWidthLength === 0) {
+      const first = this.#entityAt(start);
+      const stop = this.#entityAt(end);
+      if (first === undefined || stop === undefined) return [];
+      let position = first;
+      return sequence.visibleIdRuns(first, stop).map((run) => {
+        const entry = { position, run };
+        position += run.length;
+        return entry;
+      });
     }
-    return this._sequence.causalView(causalVersion).idRuns(start, end);
+    const first = sequence.visibleIndexOfMetricUnit(start, "utf16");
+    const last = sequence.visibleIndexOfMetricUnit(end - 1, "utf16");
+    if (first === undefined || last === undefined) return [];
+    const output: { position: number; run: SequenceIdRun }[] = [];
+    let position = first;
+    for (const run of sequence.visibleIdRuns(first, last + 1)) {
+      const peer = run.start.peer;
+      let counter = run.start.counter;
+      const runEnd = counter + run.length;
+      for (const anchor of this.#anchorCounters(peer, counter, runEnd)) {
+        if (anchor > counter) {
+          output.push({
+            position,
+            run: { start: { peer, counter }, length: anchor - counter },
+          });
+          position += anchor - counter;
+        }
+        position += 1;
+        counter = anchor + 1;
+      }
+      if (counter < runEnd) {
+        output.push({
+          position,
+          run: { start: { peer, counter }, length: runEnd - counter },
+        });
+        position += runEnd - counter;
+      }
+    }
+    return output;
   }
 
   _attributeHistoryAt(
     element: TextElement,
     key: string,
-  ): readonly TextStyleMeta[] | undefined {
+  ): readonly TextStyle[] | undefined {
     return this._styleIndex.historyAt(element.id, key);
   }
 
   _attributeMetasAt(
     element: TextElement | undefined,
     version: CausalVersion | undefined = this._styleVersion,
-  ): ReadonlyMap<string, TextStyleMeta> {
+  ): ReadonlyMap<string, TextStyle> {
     return element === undefined
       ? new Map()
       : this._styleIndex.metasAt(element.id, version);
@@ -1970,7 +2092,7 @@ export class LoroText extends LoroContainer {
 
   _attributeMetasResolver(
     version: CausalVersion | undefined = this._styleVersion,
-  ): (element: TextElement) => ReadonlyMap<string, TextStyleMeta> {
+  ): (element: TextElement) => ReadonlyMap<string, TextStyle> {
     const metasAt = this._styleIndex.resolver(version);
     return (element) => metasAt(element.id);
   }
@@ -1983,13 +2105,27 @@ export class LoroText extends LoroContainer {
     this._styleVersion = version === undefined ? undefined : new Map(version);
   }
 
+  _ensureLineIndex(): void {
+    this._ensureHydrated();
+    this._sequence.enableLineBreaks();
+  }
+
+  _reset(): void {
+    this._sequence.reset();
+    this._detachedCounter = 0;
+    this._attributeHistoryComplete = true;
+    this._styleIndex.reset();
+    this._styleVersion = undefined;
+    this.#anchorStarts.clear();
+  }
+
   #attributeResolver(): (element: TextElement) => ReadonlyMap<string, RuntimeValue> {
     const metasAt = this._attributeMetasResolver();
     return (element) => this.#attributeValues(metasAt(element));
   }
 
   #attributeValues(
-    metas: ReadonlyMap<string, TextStyleMeta>,
+    metas: ReadonlyMap<string, TextStyle>,
   ): ReadonlyMap<string, RuntimeValue> {
     const cached = this.#attributeValuesCache.get(metas);
     if (cached !== undefined) return cached;
@@ -2001,36 +2137,296 @@ export class LoroText extends LoroContainer {
     return attributes;
   }
 
-  _validateInsertPosition(position: number): number {
-    this._ensureHydrated();
-    const unicodePosition = this.convertPos(position, "utf16", "unicode");
-    if (unicodePosition === undefined) {
-      throw new RangeError(`text position ${position} is out of range`);
-    }
-    return unicodePosition;
+  /** An entity index at a UTF-16 boundary; any one within a run of anchors. */
+  #entityAt(position: number): number | undefined {
+    return this.#entityFrom(position, "utf16");
   }
 
-  _unicodePosition(position: number): number {
+  #entityFrom(index: number, from: TextPosType): number | undefined {
     this._ensureHydrated();
-    const unicodePosition = this.convertPos(position, "utf16", "unicode");
-    if (unicodePosition === undefined) {
+    const sequence = this._sequence;
+    const length = sequence.visibleLength;
+    if (sequence.visibleZeroWidthLength === 0) {
+      const direct =
+        from === "unicode" ||
+        (from === "utf16" && sequence.visibleUtf16Length === length) ||
+        (from === "utf8" && sequence.visibleUtf8Length === length);
+      if (direct) {
+        return Number.isSafeInteger(index) && index >= 0 && index <= length
+          ? index
+          : undefined;
+      }
+    }
+    return from === "unicode"
+      ? sequence.visibleIndexOfWidthElement(index)
+      : sequence.visibleIndexAtMetricOffset(index, from);
+  }
+
+  #offsetAt(entity: number, to: TextPosType): number | undefined {
+    const sequence = this._sequence;
+    if (to === "unicode") {
+      return sequence.visibleZeroWidthLength === 0
+        ? entity
+        : entity - sequence.zeroWidthBeforeVisibleIndex(entity)!;
+    }
+    if (
+      sequence.visibleZeroWidthLength === 0 &&
+      (to === "utf16" ? sequence.visibleUtf16Length : sequence.visibleUtf8Length) ===
+        sequence.visibleLength
+    ) {
+      return entity;
+    }
+    return sequence.metricOffsetAtVisibleIndex(entity, to);
+  }
+
+  #requireBoundary(position: number): number {
+    this._ensureHydrated();
+    const entity = this.#entityAt(position);
+    if (entity === undefined) {
       throw new RangeError(`text position ${position} is not on a UTF-16 boundary`);
     }
-    return unicodePosition;
+    return entity;
   }
 
-  _ensureLineIndex(): void {
+  /** The text scalar that starts at a UTF-16 position. */
+  #elementAt(position: number): TextElement | undefined {
     this._ensureHydrated();
-    this._sequence.enableLineBreaks();
+    if (this.#entityAt(position) === undefined) return undefined;
+    const entity = this._sequence.visibleIndexOfMetricUnit(position, "utf16");
+    return entity === undefined ? undefined : this._sequence.atVisible(entity);
   }
 
-  _reset(): void {
-    this._sequence.reset();
-    this._detachedCounter = 0;
-    this._detachedStyleCounter = 0;
-    this._attributeHistoryComplete = true;
-    this._styleIndex.reset();
-    this._styleVersion = undefined;
+  /**
+   * The entity index where text inserted at a UTF-16 position goes: Rust's
+   * `find_best_insert_pos`. Among the style anchors at that position, the text
+   * goes before the first anchor that must stay after it (see
+   * `anchorStaysAfterInsert`), or after all of them.
+   */
+  #insertPosition(position: number): number {
+    // Hydrates a lazily loaded text; its anchors decide where the text goes.
+    const entity = this.#entityAt(position);
+    if (entity === undefined) {
+      throw new RangeError(`text position ${position} is out of range`);
+    }
+    const sequence = this._sequence;
+    if (sequence.visibleZeroWidthLength === 0) return entity;
+    let index =
+      position === 0 ? 0 : sequence.visibleIndexOfMetricUnit(position - 1, "utf16")! + 1;
+    sequence.forEachVisibleRange(index, sequence.visibleLength, (element) => {
+      const anchor = element.anchor;
+      if (anchor === undefined || anchorStaysAfterInsert(anchor)) return false;
+      index += 1;
+      return undefined;
+    });
+    return index;
+  }
+
+  /**
+   * Whether a mark would change nothing, as Rust checks before writing one:
+   * every entity position of the range already resolves the key to the value,
+   * or it is an unmark and no position has the key at all.
+   */
+  #markIsRedundant(
+    start: number,
+    end: number,
+    key: string,
+    value: RuntimeValue,
+  ): boolean {
+    const runs = this._sequence.visibleIdRuns(start, end);
+    const version = this._styleVersion;
+    if (
+      this._styleIndex.everyWinner(runs, key, version, (meta) =>
+        styleValuesEqual(meta.value, value),
+      )
+    ) {
+      return true;
+    }
+    return value === null && !this._styleIndex.someHasKey(runs, key, version);
+  }
+
+  /** Detached text marks like Rust's `mark_for_detached`, with local anchors. */
+  #markDetached(start: number, end: number, key: string, value: RuntimeValue): void {
+    const counter = this._detachedCounter;
+    this._detachedCounter += 2;
+    const style: TextStyle = {
+      startId: { peer: 0n, counter },
+      lamport: counter,
+      info: DETACHED_STYLE_INFO,
+      value,
+      key,
+      end,
+    };
+    const startAnchor: TextElement = {
+      value: "",
+      id: { peer: 0n, counter },
+      lamport: counter,
+      deleted: false,
+      originLeft: undefined,
+      originRight: undefined,
+      anchor: { style, isEnd: false },
+    };
+    const endAnchor: TextElement = {
+      value: "",
+      id: { peer: 0n, counter: counter + 1 },
+      lamport: counter + 1,
+      deleted: false,
+      originLeft: undefined,
+      originRight: undefined,
+      anchor: { style, isEnd: true },
+    };
+    this._sequence.insertAtVisible(end, [endAnchor]);
+    this._sequence.insertAtVisible(start, [startAnchor]);
+    this.#registerAnchor(startAnchor);
+    this.#registerAnchor(endAnchor);
+    this.#inheritGapStyles(startAnchor.id, 1);
+    this.#inheritGapStyles(endAnchor.id, 1);
+    this.#applyStyleRange(startAnchor, endAnchor, style);
+  }
+
+  /**
+   * Rust's `insert_with_txn_and_attr`: the styles text inserted at a position
+   * would get, compared with the requested attributes. Returns the marks that
+   * make the inserted text carry exactly those attributes.
+   */
+  #insertOverrides(
+    position: number,
+    attributes: Readonly<Record<string, Value>>,
+  ): [string, unknown][] {
+    const entity = this.#insertPosition(position);
+    const inherited = new Map<string, RuntimeValue>();
+    if (entity > 0 && entity < this._sequence.visibleLength) {
+      // Rust's `get_styles_for_insert`: the styles shared by both visible
+      // neighbors, resolved per key.
+      const left = this._styleIndex.membershipAt(
+        this._sequence.atVisible(entity - 1)!.id,
+      );
+      const right = this._styleIndex.membershipAt(this._sequence.atVisible(entity)!.id);
+      if (left !== undefined && right !== undefined) {
+        const version = this._styleVersion;
+        for (const [key, history] of intersectHistories(left, right)) {
+          for (let index = history.length - 1; index >= 0; index -= 1) {
+            const style = history[index]!;
+            if (
+              version === undefined ||
+              style.startId.counter + 1 < (version.get(style.startId.peer) ?? 0)
+            ) {
+              inherited.set(key, style.value);
+              break;
+            }
+          }
+        }
+      }
+    }
+    const overrides: [string, unknown][] = [];
+    for (const [key, value] of inherited) {
+      const requested = attributes[key];
+      if (
+        Object.hasOwn(attributes, key) &&
+        styleValuesEqual(value, normalizeDetachedValue(requested))
+      ) {
+        continue;
+      }
+      overrides.push([key, requested ?? null]);
+    }
+    for (const [key, value] of Object.entries(attributes)) {
+      if (!inherited.has(key)) overrides.push([key, value]);
+    }
+    return overrides;
+  }
+
+  #insertAnchor(
+    position: number,
+    element: TextElement,
+    causalVersion: CausalVersion,
+  ): void {
+    const insertion = fugueInsertion(
+      this._sequence,
+      position,
+      element.id,
+      causalVersion,
+      true,
+    );
+    element.originLeft = insertion.originLeft;
+    element.originRight = insertion.originRight;
+    this._sequence.insertAtPhysical(insertion.insertIndex, [element]);
+    recordFugueInsertion(this._sequence, insertion, [element.id]);
+    this.#registerAnchor(element);
+    this.#inheritGapStyles(element.id, 1, insertion.insertIndex);
+  }
+
+  #registerAnchor(element: TextElement): void {
+    if (element.anchor === undefined || element.anchor.isEnd) return;
+    let starts = this.#anchorStarts.get(element.id.peer);
+    if (starts === undefined) {
+      starts = [];
+      this.#anchorStarts.set(element.id.peer, starts);
+    }
+    const counter = element.id.counter;
+    let low = 0;
+    let high = starts.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (starts[middle]! < counter) low = middle + 1;
+      else high = middle;
+    }
+    if (starts[low] !== counter) starts.splice(low, 0, counter);
+  }
+
+  /** Counters of the style anchors of `peer` in `[start, end)`, ascending. */
+  #anchorCounters(peer: bigint, start: number, end: number): number[] {
+    const starts = this.#anchorStarts.get(peer);
+    if (starts === undefined) return [];
+    let low = 0;
+    let high = starts.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (starts[middle]! + 1 < start) low = middle + 1;
+      else high = middle;
+    }
+    const output: number[] = [];
+    for (let index = low; index < starts.length && starts[index]! < end; index += 1) {
+      const counter = starts[index]!;
+      if (counter >= start) output.push(counter);
+      if (counter + 1 >= start && counter + 1 < end) output.push(counter + 1);
+    }
+    return output;
+  }
+
+  /**
+   * Gives newly inserted elements every style that covers their physical gap:
+   * the styles shared by the physical neighbors, which is exactly the set of
+   * styles whose start anchor precedes and whose end anchor follows the gap.
+   */
+  #inheritGapStyles(startId: CodecId, length: number, insertIndex?: number): void {
+    if (this._styleIndex.isEmpty) return;
+    const sequence = this._sequence;
+    let index = insertIndex;
+    if (index === undefined) {
+      const first = sequence.findByIdRaw(startId);
+      index = first === undefined ? undefined : sequence.physicalIndexOf(first);
+      if (index === undefined) return;
+    }
+    if (index === 0) return;
+    const left = sequence.atPhysicalRaw(index - 1);
+    const right = sequence.atPhysicalRaw(index + length);
+    if (left === undefined || right === undefined) return;
+    const leftStyles = this._styleIndex.membershipAt(left.id);
+    const rightStyles = this._styleIndex.membershipAt(right.id);
+    if (leftStyles === undefined || rightStyles === undefined) return;
+    const shared =
+      leftStyles === rightStyles
+        ? leftStyles
+        : intersectHistories(leftStyles, rightStyles);
+    if (shared.size > 0) {
+      this._styleIndex.addMembership([{ start: startId, length }], shared);
+    }
+  }
+
+  #applyStyleRange(start: TextElement, end: TextElement, style: TextStyle): void {
+    const from = this._sequence.physicalIndexOf(start);
+    const to = this._sequence.physicalIndexOf(end);
+    if (from === undefined || to === undefined || from > to) return;
+    this._styleIndex.add(this._sequence.physicalIdRuns(from, to + 1), style.key, style);
   }
 
   /** Installs `state`, or an empty state, and returns the replaced state. */
@@ -2038,18 +2434,18 @@ export class LoroText extends LoroContainer {
     const previous: TextState = {
       sequence: this._sequence,
       detachedCounter: this._detachedCounter,
-      detachedStyleCounter: this._detachedStyleCounter,
       attributeHistoryComplete: this._attributeHistoryComplete,
       styleIndex: this._styleIndex,
       styleVersion: this._styleVersion,
+      anchorStarts: this.#anchorStarts,
     };
     const next = state as TextState | undefined;
     this._sequence = next?.sequence ?? createTextSequence();
     this._detachedCounter = next?.detachedCounter ?? 0;
-    this._detachedStyleCounter = next?.detachedStyleCounter ?? 0;
     this._attributeHistoryComplete = next?.attributeHistoryComplete ?? true;
-    this._styleIndex = next?.styleIndex ?? new TextStyleIndex<TextStyleMeta>();
+    this._styleIndex = next?.styleIndex ?? new TextStyleIndex<TextStyle>();
     this._styleVersion = next?.styleVersion;
+    this.#anchorStarts = next?.anchorStarts ?? new Map();
     return previous;
   }
 }
@@ -2064,22 +2460,192 @@ function createTextSequence(): SequenceIndex<TextElement> {
   );
 }
 
+/**
+ * Rust's `prefer_insert_before` plus its first rule: text inserted at an
+ * anchor's position goes before a start anchor of an unmark (a null or false
+ * value), before a start anchor whose style does not expand before, and before
+ * an end anchor whose style expands after.
+ */
+function anchorStaysAfterInsert(anchor: TextAnchor): boolean {
+  const { style, isEnd } = anchor;
+  if (isEnd) return (style.info & 0b100) !== 0;
+  return style.value === null || style.value === false || (style.info & 0b010) === 0;
+}
+
+function intersectHistories<Meta>(
+  left: ReadonlyMap<string, readonly Meta[]>,
+  right: ReadonlyMap<string, readonly Meta[]>,
+): Map<string, Meta[]> {
+  const shared = new Map<string, Meta[]>();
+  for (const [key, history] of left) {
+    const other = right.get(key);
+    if (other === undefined) continue;
+    const members = new Set(other);
+    const common = history.filter((meta) => members.has(meta));
+    if (common.length > 0) shared.set(key, common);
+  }
+  return shared;
+}
+
+/** Deep equality of style values; `undefined` equals `null`. */
+function styleValuesEqual(left: unknown, right: unknown): boolean {
+  if (left === undefined) left = null;
+  if (right === undefined) right = null;
+  if (left === right) return true;
+  if (left instanceof Uint8Array && right instanceof Uint8Array) {
+    return (
+      left.length === right.length && left.every((byte, index) => byte === right[index])
+    );
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return (
+      left.length === right.length &&
+      left.every((item, index) => styleValuesEqual(item, right[index]))
+    );
+  }
+  if (
+    typeof left === "object" &&
+    typeof right === "object" &&
+    left !== null &&
+    right !== null &&
+    !Array.isArray(left) &&
+    !Array.isArray(right) &&
+    !(left instanceof Uint8Array) &&
+    !(right instanceof Uint8Array) &&
+    !isContainer(left) &&
+    !isContainer(right)
+  ) {
+    const leftEntries = Object.entries(left);
+    const rightRecord = right as Record<string, unknown>;
+    return (
+      leftEntries.length === Object.keys(rightRecord).length &&
+      leftEntries.every(
+        ([key, value]) =>
+          Object.hasOwn(rightRecord, key) && styleValuesEqual(value, rightRecord[key]),
+      )
+    );
+  }
+  return false;
+}
+
 export class LoroMovableList<T = unknown> extends LoroList<T> {
-  _valueHistoryComplete = true;
-  _moveHistoryComplete = true;
+  _state: MovableListState = new MovableListState((element) =>
+    this._bindElement(element),
+  );
+  /** Values of a list that is not attached to a document. */
+  _detachedValues: RuntimeValue[] = [];
+
+  constructor() {
+    super();
+    // A MovableList keeps positions and elements in `_state`; the inherited
+    // element sequence stays empty. Fail loudly if a list-only path reads it.
+    Object.defineProperty(this, "_sequence", {
+      // Hidden from generic walks (`Object.entries`), which must not trip it.
+      enumerable: false,
+      get(): never {
+        throw new Error("LoroMovableList has no element sequence; use _state");
+      },
+    });
+  }
 
   kind(): "MovableList" {
     return "MovableList";
   }
 
+  override get _elements(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  override get length(): number {
+    if (this._doc === undefined) return this._detachedValues.length;
+    this._ensureHydrated();
+    return this._state.length;
+  }
+
+  override get(index: number): T | undefined {
+    if (this._doc === undefined) {
+      return cloneRuntimeValue(this._detachedValues[index]) as T | undefined;
+    }
+    this._ensureHydrated();
+    return cloneRuntimeValue(this._state.elementAt(index)?.value) as T | undefined;
+  }
+
+  override toArray(): T[] {
+    return this._rawValues().map((value) => cloneRuntimeValue(value)) as T[];
+  }
+
+  override toJSON(): unknown[] {
+    return this._rawValues().map((value) => runtimeValueToJson(value));
+  }
+
+  override getShallowValue(): unknown[] {
+    return this._rawValues().map((value) => runtimeValueToShallow(value));
+  }
+
+  override insert(pos: number, value: T): void {
+    this._validateInsertPosition(pos);
+    if (isContainer(value))
+      throw new TypeError("use insertContainer() to attach a child container");
+    if (this._doc === undefined) {
+      this._detachedValues.splice(pos, 0, normalizeDetachedValue(value));
+      return;
+    }
+    this._doc._listInsert(this, pos, value);
+  }
+
+  override delete(pos: number, len: number): void {
+    validateRange(pos, len, this.length);
+    if (len === 0) return;
+    if (this._doc === undefined) {
+      this._detachedValues.splice(pos, len);
+      return;
+    }
+    this._doc._sequenceDelete(this, pos, len);
+  }
+
+  override insertContainer<C extends Container>(pos: number, child: C): C {
+    this._validateInsertPosition(pos);
+    if (this._doc === undefined) {
+      this._detachedValues.splice(pos, 0, child);
+      child._parentLink = { container: this };
+      return child;
+    }
+    return this._doc._listInsertContainer(this, pos, child);
+  }
+
+  /** The ID of the list item (position) at `pos`, which a cursor also anchors. */
+  override getIdAt(pos: number): { peer: string; counter: number } | undefined {
+    if (this._doc === undefined) return undefined;
+    this._ensureHydrated();
+    const id = this._state.positionAt(pos)?.id;
+    return id === undefined
+      ? undefined
+      : { peer: id.peer.toString(), counter: id.counter };
+  }
+
+  /** Like Rust, a cursor anchors the list item ID, which a move leaves behind. */
+  override getCursor(pos: number, side: Side = 0): Cursor | undefined {
+    if (!Number.isSafeInteger(pos) || pos < 0 || this._doc === undefined)
+      return undefined;
+    this._ensureHydrated();
+    const length = this._state.length;
+    if (length === 0) return new Cursor(this.id, undefined, side === 0 ? -1 : side, 0);
+    if (pos >= length) return new Cursor(this.id, undefined, 1, length);
+    return new Cursor(this.id, this._state.positionAt(pos)!.id, side, pos);
+  }
+
   move(from: number, to: number): void {
+    // Like Rust's attached `mov`, moving an index onto itself is a no-op even
+    // when it is out of range.
+    if (this._doc !== undefined && from === to && Number.isSafeInteger(from)) return;
     validateIndex(from, this.length);
     if (!Number.isSafeInteger(to) || to < 0 || to >= this.length) {
       throw new RangeError(`movable-list destination ${to} is out of range`);
     }
     if (from === to) return;
     if (this._doc === undefined) {
-      this._applyMove(from, to);
+      const [value] = this._detachedValues.splice(from, 1);
+      this._detachedValues.splice(to, 0, value!);
       return;
     }
     this._doc._movableMove(this, from, to);
@@ -2094,7 +2660,7 @@ export class LoroMovableList<T = unknown> extends LoroList<T> {
     if (isContainer(value))
       throw new TypeError("use setContainer() to attach a child container");
     if (this._doc === undefined) {
-      this._sequence.atVisible(pos)!.value = normalizeDetachedValue(value);
+      this._detachedValues[pos] = normalizeDetachedValue(value);
       return;
     }
     this._doc._movableSet(this, pos, value);
@@ -2103,139 +2669,95 @@ export class LoroMovableList<T = unknown> extends LoroList<T> {
   setContainer<C extends Container>(pos: number, child: C): C {
     validateIndex(pos, this.length);
     if (this._doc === undefined) {
-      const element = this._sequence.atVisible(pos)!;
-      element.value = child;
-      this._bindChildren([element]);
+      this._detachedValues[pos] = child;
+      child._parentLink = { container: this };
       return child;
     }
     return this._doc._movableSetContainer(this, pos, child);
   }
 
   getCreatorAt(pos: number): string | undefined {
-    return this._sequence.atVisible(pos)?.id.peer.toString();
+    if (this._doc === undefined) return undefined;
+    this._ensureHydrated();
+    return this._state.elementAt(pos)?.peer.toString();
   }
 
   getLastMoverAt(pos: number): string | undefined {
-    return this._sequence.atVisible(pos)?.id.peer.toString();
+    if (this._doc === undefined) return undefined;
+    this._ensureHydrated();
+    return this._state.positionAt(pos)?.id.peer.toString();
   }
 
   getLastEditorAt(pos: number): string | undefined {
-    return this._sequence.atVisible(pos)?.id.peer.toString();
+    if (this._doc === undefined) return undefined;
+    this._ensureHydrated();
+    return this._state.elementAt(pos)?.valueWriter.peer.toString();
   }
 
-  _applyMove(
-    from: number,
-    to: number,
-    operation?: Pick<SequenceMoveMeta, "id" | "lamport">,
-    replaceExisting = false,
-  ): void {
-    const element = this._sequence.atVisible(from);
-    if (element === undefined) return;
-    const beforePrevious = this._sequence.previousVisible(element)?.id;
-    const beforeNext = this._sequence.nextVisible(element)?.id;
-    this._sequence.moveVisible(from, to);
-    if (operation === undefined) return;
-    const meta: SequenceMoveMeta = {
-      ...operation,
-      beforePrevious,
-      beforeNext,
-      afterPrevious: this._sequence.previousVisible(element)?.id,
-      afterNext: this._sequence.nextVisible(element)?.id,
-    };
-    let history = element.moveHistory;
-    if (history === undefined) {
-      history = [];
-      element.moveHistory = history;
-    }
-    const index = lowerBoundSequenceMoveMeta(history, meta);
-    const existing = history[index];
-    if (
-      existing !== undefined &&
-      existing.id.peer === meta.id.peer &&
-      existing.id.counter === meta.id.counter
-    ) {
-      if (replaceExisting) history[index] = meta;
-    } else {
-      history.splice(index, 0, meta);
-    }
+  /** Current values without cloning, attached or not. */
+  _rawValues(): RuntimeValue[] {
+    if (this._doc === undefined) return this._detachedValues;
+    this._ensureHydrated();
+    return this._state.visibleElements().map((element) => element.value);
   }
 
-  _moveToAnchors(
-    element: SequenceElement,
-    previousId: CodecId | undefined,
-    nextId: CodecId | undefined,
-  ): void {
-    if (element.deleted) return;
-    if (nextId === undefined) {
-      if (this._sequence.nextVisible(element) !== undefined) {
-        this._sequence.moveBefore(element, undefined);
-      }
-      return;
-    }
-    const next = this._sequence.findById(nextId);
-    if (next !== undefined && !next.deleted && next !== element) {
-      this._sequence.moveBefore(element, next);
-      return;
-    }
-    const previous =
-      previousId === undefined ? undefined : this._sequence.findById(previousId);
-    if (previous !== undefined && !previous.deleted && previous !== element) {
-      const successor = this._sequence.nextVisible(previous);
-      if (successor !== element) this._sequence.moveBefore(element, successor);
-      return;
-    }
-    if (previousId === undefined) {
-      const first = this._sequence.atVisible(0);
-      if (first !== undefined && first !== element) {
-        this._sequence.moveBefore(element, first);
-      }
-    }
+  override _visibleElements(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
   }
 
-  _applySet(
-    element: SequenceElement,
-    value: RuntimeValue,
-    meta?: SequenceValueMeta,
-  ): void {
-    if (meta === undefined) {
-      element.value = value;
-      this._bindChildren([element]);
-      return;
+  override _visibleElementsRange(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  override _visibleElementAt(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  override _valuesRange(start: number, end: number): unknown[] {
+    if (this._doc === undefined) {
+      return this._detachedValues
+        .slice(start, end)
+        .map((value) => cloneRuntimeValue(value));
     }
-    let history = element.valueHistory;
-    if (history === undefined) {
-      history = [];
-      element.valueHistory = history;
+    this._ensureHydrated();
+    return this._state
+      .visibleElementsRange(start, end)
+      .map((element) => cloneRuntimeValue(element.value));
+  }
+
+  override _insertVisible(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  override _insertFugue(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  override _deleteIdSpan(): never {
+    throw new Error("LoroMovableList has no element sequence; use _state");
+  }
+
+  _bindElement(element: MovableElement): void {
+    if (element.value instanceof LoroContainer) {
+      element.value._setParentBinding(this, { kind: "movable", element });
     }
-    const index = lowerBoundSequenceValueMeta(history, meta);
-    const existing = history[index];
-    if (
-      existing === undefined ||
-      existing.id.peer !== meta.id.peer ||
-      existing.id.counter !== meta.id.counter
-    ) {
-      history.splice(index, 0, meta);
-    }
-    const winner = history.at(-1)!;
-    element.value = winner.value;
-    this._bindChildren([element]);
   }
 
   override _reset(): void {
-    super._reset();
-    this._valueHistoryComplete = true;
-    this._moveHistoryComplete = true;
+    this._state.reset();
+    this._detachedValues = [];
   }
 
+  /** Installs `state`, or an empty state, and returns the replaced state. */
   override _swapState(state?: SequenceContainerState): SequenceContainerState {
-    const previous: MovableListState = {
-      ...(super._swapState(state) as ListState),
-      valueHistoryComplete: this._valueHistoryComplete,
-      moveHistoryComplete: this._moveHistoryComplete,
+    const previous: MovableListSwapState = {
+      sequence: this._state.positions as unknown as SequenceIndex<SequenceElement>,
+      movable: this._state,
     };
-    const next = state as MovableListState | undefined;
-    this._valueHistoryComplete = next?.valueHistoryComplete ?? true;
-    this._moveHistoryComplete = next?.moveHistoryComplete ?? true;
+    this._state =
+      (state as MovableListSwapState | undefined)?.movable ??
+      new MovableListState((element) => this._bindElement(element));
+    for (const element of this._state.allElements()) this._bindElement(element);
     return previous;
   }
 }
@@ -2346,7 +2868,20 @@ export class LoroTree<
 
   isNodeDeleted(target: TreeID): boolean {
     this._ensureHydrated();
-    return this._nodes.get(target)?.deleted ?? false;
+    const record = this._nodes.get(target);
+    return record !== undefined && this._isNodeHidden(record);
+  }
+
+  /** Whether the node or one of its ancestors is deleted. */
+  _isNodeHidden(record: TreeNodeRecord): boolean {
+    let current: TreeNodeRecord | undefined = record;
+    // A parent chain longer than the node count can only be a cycle.
+    for (let steps = 0; steps <= this._nodes.size; steps += 1) {
+      if (current === undefined || current.deleted) return true;
+      if (current.parent === undefined) return false;
+      current = this._nodes.get(formatTreeId(current.parent));
+    }
+    return true;
   }
 
   enableFractionalIndex(jitter = 0): void {
@@ -2370,15 +2905,34 @@ export class LoroTree<
     return record === undefined ? undefined : new LoroTreeNode(this, record.id);
   }
 
+  /**
+   * Alive nodes in breadth-first order from the roots, like Rust. With
+   * `withDeleted`, the deleted nodes and their subtrees follow.
+   */
   getNodes(options: { withDeleted?: boolean } = {}): LoroTreeNode<T>[] {
     this._ensureHydrated();
-    return [...this._nodes.values()]
-      .filter((record) => options.withDeleted === true || !record.deleted)
-      .map((record) => new LoroTreeNode<T>(this, record.id));
+    const records = this._subtreeRecords(this._childrenOf(undefined));
+    if (options.withDeleted === true) {
+      const deleted = [...this._nodes.values()].filter((record) => record.deleted);
+      for (const record of this._subtreeRecords(deleted)) records.push(record);
+    }
+    return records.map((record) => new LoroTreeNode<T>(this, record.id));
   }
 
+  /** Every node, including deleted ones, as in Rust. */
   nodes(): LoroTreeNode<T>[] {
-    return this.getNodes();
+    this._ensureHydrated();
+    return [...this._nodes.values()].map(
+      (record) => new LoroTreeNode<T>(this, record.id),
+    );
+  }
+
+  _subtreeRecords(starts: readonly TreeNodeRecord[]): TreeNodeRecord[] {
+    const output = [...starts];
+    for (let index = 0; index < output.length; index += 1) {
+      for (const child of this._childrenOf(output[index]!.id)) output.push(child);
+    }
+    return output;
   }
 
   roots(): LoroTreeNode<T>[] {
@@ -2406,6 +2960,25 @@ export class LoroTree<
     return this._childrenOf(undefined).map((record, index) =>
       this._recordToShallowValue(record, index),
     );
+  }
+
+  /** How many current children of `parent` sort before `key`, in O(log n). */
+  _childRank(
+    parent: CodecId | undefined,
+    key: Pick<TreeNodeRecord, "position" | "writer" | "id">,
+  ): number {
+    this._ensureHydrated();
+    return (
+      this._children
+        .get(treeParentKey(parent))
+        ?._lowerBoundBy((record) => compareTreeRecords(record, key as TreeNodeRecord)) ??
+      0
+    );
+  }
+
+  _childCount(parent: CodecId | undefined): number {
+    this._ensureHydrated();
+    return this._children.get(treeParentKey(parent))?.size ?? 0;
   }
 
   _childrenOf(parent: CodecId | undefined): TreeNodeRecord[] {
@@ -2439,11 +3012,18 @@ export class LoroTree<
     );
   }
 
+  /**
+   * Port of Rust's `generate_fi_at`: the position for a node placed at
+   * `index` among `parent`'s children, not counting `exclude`. When both
+   * neighbors share a position there is no index between them, so the right
+   * neighbor and every following sibling with that position get new
+   * positions in `rearranged`, in order.
+   */
   _positionFor(
     parent: CodecId | undefined,
     index?: number,
     exclude?: CodecId,
-  ): Uint8Array {
+  ): { position: Uint8Array; rearranged: { id: CodecId; position: Uint8Array }[] } {
     const children = this._children.get(treeParentKey(parent));
     const excluded =
       exclude === undefined ? undefined : this._nodes.get(formatTreeId(exclude));
@@ -2464,10 +3044,29 @@ export class LoroTree<
           ? siblingIndex + 1
           : siblingIndex,
       );
-    return fractionalIndexBetween(
-      position === 0 ? undefined : siblingAt(position - 1)!.position,
-      position === length ? undefined : siblingAt(position)!.position,
-    );
+    const left = position === 0 ? undefined : siblingAt(position - 1)!.position;
+    const right = position === length ? undefined : siblingAt(position)!;
+    if (left === undefined || right === undefined || !bytesEqual(left, right.position)) {
+      return { position: fractionalIndexBetween(left, right?.position), rearranged: [] };
+    }
+    const reset = [right];
+    let nextRight: Uint8Array | undefined;
+    for (let sibling = position + 1; sibling < length; sibling += 1) {
+      const record = siblingAt(sibling)!;
+      if (!bytesEqual(record.position, left)) {
+        nextRight = record.position;
+        break;
+      }
+      reset.push(record);
+    }
+    const positions = fractionalIndexesBetween(left, nextRight, reset.length + 1);
+    return {
+      position: positions[0]!,
+      rearranged: reset.map((record, offset) => ({
+        id: record.id,
+        position: positions[offset + 1]!,
+      })),
+    };
   }
 
   _setRecord(record: TreeNodeRecord): void {
@@ -2609,12 +3208,28 @@ export class LoroTreeNode<T extends Record<string, unknown> = Record<string, unk
   }
 
   moveAfter(target: LoroTreeNode<T>): void {
+    // Rust's mov_after: the index is counted without this node.
     const parent = target.parent();
-    this.move(parent, target.index() + 1);
+    let index = target.index() + 1;
+    if (this.#hasParent(parent) && this.index() < index) index -= 1;
+    this.move(parent, index);
   }
 
   moveBefore(target: LoroTreeNode<T>): void {
-    this.move(target.parent(), target.index());
+    const parent = target.parent();
+    let index = target.index();
+    if (this.#hasParent(parent) && index >= 1 && this.index() < index) index -= 1;
+    this.move(parent, index);
+  }
+
+  #hasParent(parent: LoroTreeNode<T> | undefined): boolean {
+    const record = this.#record();
+    return (
+      !record.deleted &&
+      (parent === undefined
+        ? record.parent === undefined
+        : record.parent !== undefined && formatTreeId(record.parent) === parent.id)
+    );
   }
 
   parent(): LoroTreeNode<T> | undefined {
@@ -2644,7 +3259,7 @@ export class LoroTreeNode<T extends Record<string, unknown> = Record<string, unk
   }
 
   isDeleted(): boolean {
-    return this.#record().deleted;
+    return this.#tree._isNodeHidden(this.#record());
   }
 
   getLastMoveId(): { peer: string; counter: number } {
@@ -2856,6 +3471,9 @@ function containerValueWithId(container: Container): unknown {
     };
     return container._childrenOf(undefined).map(visit);
   }
+  if (container instanceof LoroMovableList) {
+    return container._rawValues().map((value) => runtimeValueDeepWithId(value));
+  }
   return container
     ._visibleElements()
     .map((element) => runtimeValueDeepWithId(element.value));
@@ -2909,12 +3527,13 @@ function normalizeDetachedValue(value: unknown): RuntimeValue {
   throw new TypeError(`unsupported Loro value type: ${typeof value}`);
 }
 
-function insertFugueElements<T extends SequenceElement>(
+export function insertFugueElements<T extends SequenceElement>(
   sequence: SequenceIndex<T>,
   position: number,
   inserted: T[],
   causalVersion: CausalVersion,
   useOriginIndex = true,
+  positionHint?: FuguePositionHint<T>,
 ): void {
   if (inserted.length === 0) return;
 
@@ -2924,6 +3543,7 @@ function insertFugueElements<T extends SequenceElement>(
     inserted[0]!.id,
     causalVersion,
     useOriginIndex,
+    positionHint,
   );
   const { insertIndex, originLeft, originRight } = insertion;
 
@@ -2949,6 +3569,12 @@ interface FugueOriginEntry {
 interface FugueOriginIndex {
   structureVersion: number;
   readonly explicitChildren: Map<string, FugueOriginEntry[]>;
+  /**
+   * Sorted counters, per peer, of the elements that are not the implicit child
+   * of their predecessor ID. Every other element is linked to `counter - 1`, so
+   * an origin-left walk can jump from any element to the head of its run.
+   */
+  readonly explicitCounters: Map<bigint, number[]>;
 }
 
 interface FugueInsertionResult {
@@ -2958,7 +3584,7 @@ interface FugueInsertionResult {
   readonly indexUpdate?: FugueOriginIndex | undefined;
 }
 
-interface FuguePositionHint<T extends SequenceElement> {
+export interface FuguePositionHint<T extends SequenceElement> {
   readonly current: boolean;
   readonly left: T | undefined;
   readonly startIndex?: number | undefined;
@@ -3115,6 +3741,7 @@ function indexedFugueInsertion<T extends SequenceElement>(
   const parentRightIndex = directRightParentIndex(sequence, originLeft, originRight);
   let insertIndex = startIndex;
   let scanning = false;
+  let afterLastChild = false;
   for (let childIndex = 0; childIndex < candidates.length; childIndex += 1) {
     const { entry: other } = candidates[childIndex]!;
     if (sameOptionalId(other.originRight, originRight)) {
@@ -3133,7 +3760,38 @@ function indexedFugueInsertion<T extends SequenceElement>(
     }
 
     if (!scanning) {
-      insertIndex = candidates[childIndex + 1]?.index ?? originRightIndex;
+      const next = candidates[childIndex + 1];
+      insertIndex = next?.index ?? originRightIndex;
+      afterLastChild = next === undefined;
+    }
+  }
+
+  // Sibling subtrees are contiguous, so the gap between two direct children
+  // belongs to the earlier one. After the last child, the interval can also
+  // hold concurrent elements whose origin is left of `originLeft`; the scan
+  // stops before them, so the insertion must too.
+  const lastChild = candidates.at(-1);
+  if (afterLastChild && originLeft !== undefined && lastChild !== undefined) {
+    const left = sequence.findByIdRaw(originLeft);
+    const leftIndex = left === undefined ? undefined : sequence.physicalIndexOf(left);
+    if (leftIndex === undefined) return undefined;
+    const inSubtree = (index: number): boolean =>
+      fugueDescendsFrom(
+        sequence,
+        originIndex,
+        sequence.atPhysicalRaw(index)!.id,
+        originLeft,
+        leftIndex,
+      );
+    if (!inSubtree(originRightIndex - 1)) {
+      let low = lastChild.index + 1;
+      let high = originRightIndex - 1;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (inSubtree(middle)) low = middle + 1;
+        else high = middle;
+      }
+      insertIndex = low;
     }
   }
 
@@ -3143,6 +3801,54 @@ function indexedFugueInsertion<T extends SequenceElement>(
     originRight,
     indexUpdate: originIndex,
   };
+}
+
+/**
+ * Whether `ancestor`, at physical index `ancestorIndex`, is on the origin-left
+ * chain of `id`. Ancestors precede their descendants, so the walk stops at the
+ * first origin left of `ancestorIndex`; runs of implicit children are skipped
+ * through `explicitCounters`.
+ */
+function fugueDescendsFrom<T extends SequenceElement>(
+  sequence: SequenceIndex<T>,
+  index: FugueOriginIndex,
+  id: CodecId,
+  ancestor: CodecId,
+  ancestorIndex: number,
+): boolean {
+  let current = id;
+  for (;;) {
+    const counters = index.explicitCounters.get(current.peer);
+    let head = current.counter;
+    if (counters !== undefined) {
+      let low = 0;
+      let high = counters.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (counters[middle]! <= current.counter) low = middle + 1;
+        else high = middle;
+      }
+      if (low > 0) head = counters[low - 1]!;
+    }
+    if (
+      ancestor.peer === current.peer &&
+      head <= ancestor.counter &&
+      ancestor.counter < current.counter
+    ) {
+      return true;
+    }
+    const parent = sequence.findByIdRaw({
+      peer: current.peer,
+      counter: head,
+    })?.originLeft;
+    if (parent === undefined) return false;
+    if (parent.peer === ancestor.peer && parent.counter === ancestor.counter) return true;
+    const element = sequence.findByIdRaw(parent);
+    const parentIndex =
+      element === undefined ? undefined : sequence.physicalIndexOf(element);
+    if (parentIndex === undefined || parentIndex < ancestorIndex) return false;
+    current = parent;
+  }
 }
 
 function getFugueOriginIndex<T extends SequenceElement>(
@@ -3158,6 +3864,7 @@ function getFugueOriginIndex<T extends SequenceElement>(
   const rebuilt: FugueOriginIndex = {
     structureVersion: sequence.structureVersion,
     explicitChildren: new Map(),
+    explicitCounters: new Map(),
   };
   sequence.forEachPhysicalRaw((element) => {
     recordFugueOriginEntry(rebuilt, element.id, element.originLeft, element.originRight);
@@ -3226,6 +3933,21 @@ function recordFugueOriginEntry(
   ) {
     return;
   }
+  const counters = index.explicitCounters.get(id.peer);
+  if (counters === undefined) {
+    index.explicitCounters.set(id.peer, [id.counter]);
+  } else if (counters.at(-1)! < id.counter) {
+    counters.push(id.counter);
+  } else {
+    let low = 0;
+    let high = counters.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (counters[middle]! < id.counter) low = middle + 1;
+      else high = middle;
+    }
+    if (counters[low] !== id.counter) counters.splice(low, 0, id.counter);
+  }
   const key = optionalSequenceIdKey(originLeft);
   const children = index.explicitChildren.get(key);
   const entry = {
@@ -3274,49 +3996,6 @@ function compareWriters(left: LastWriter, right: LastWriter): number {
     left.lamport - right.lamport ||
     (left.peer < right.peer ? -1 : left.peer > right.peer ? 1 : 0)
   );
-}
-
-function compareSequenceValueMeta(
-  left: SequenceValueMeta,
-  right: SequenceValueMeta,
-): number {
-  return compareWriters(
-    { peer: left.id.peer, lamport: left.lamport },
-    { peer: right.id.peer, lamport: right.lamport },
-  );
-}
-
-function lowerBoundSequenceValueMeta(
-  history: readonly SequenceValueMeta[],
-  meta: SequenceValueMeta,
-): number {
-  let low = 0;
-  let high = history.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if (compareSequenceValueMeta(history[middle]!, meta) < 0) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
-function lowerBoundSequenceMoveMeta(
-  history: readonly SequenceMoveMeta[],
-  meta: SequenceMoveMeta,
-): number {
-  let low = 0;
-  let high = history.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    const current = history[middle]!;
-    const order = compareWriters(
-      { peer: current.id.peer, lamport: current.lamport },
-      { peer: meta.id.peer, lamport: meta.lamport },
-    );
-    if (order < 0) low = middle + 1;
-    else high = middle;
-  }
-  return low;
 }
 
 function validateRange(position: number, length: number, total: number): void {
@@ -3395,6 +4074,7 @@ function textElementsToDelta(
     values = [];
   };
   for (const element of elements) {
+    if (element.anchor !== undefined) continue;
     const nextAttributes = attributesAt(element);
     if (values.length > 0 && !textAttributesEqual(attributes, nextAttributes)) {
       flush();
@@ -3423,6 +4103,7 @@ function isTextPosType(value: string): value is TextPosType {
 }
 
 function utf8CodePointLength(value: string): number {
+  if (value.length === 0) return 0;
   const codePoint = value.codePointAt(0) ?? 0;
   if (codePoint <= 0x7f) return 1;
   if (codePoint <= 0x7ff) return 2;
