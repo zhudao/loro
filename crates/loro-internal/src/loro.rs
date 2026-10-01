@@ -27,7 +27,7 @@ use crate::{
     id::PeerID,
     json::JsonChange,
     op::InnerContent,
-    oplog::{loro_dag::FrontiersNotIncluded, OpLog},
+    oplog::{loro_dag::FrontiersNotIncluded, ImportedValues, OpLog},
     state::DocState,
     subscription::{LocalUpdateCallback, Observer, Subscriber},
     undo::DiffBatch,
@@ -166,7 +166,7 @@ impl LoroDoc {
     pub fn fork(&self) -> Self {
         if self.is_detached() {
             return self
-                .fork_at(&self.state_frontiers())
+                .fork_at_inner(&self.state_frontiers(), false)
                 .expect("fork_at on detached doc should not fail");
         }
 
@@ -660,6 +660,7 @@ impl LoroDoc {
                 } else {
                     self.import_changes_and_apply_delta_to_state_if_needed(
                         |oplog| encoding::decode_oplog_changes(oplog, parsed),
+                        ImportedValues::Exact,
                         origin,
                     )
 
@@ -671,6 +672,7 @@ impl LoroDoc {
             }
             EncodeMode::FastUpdates => self.import_changes_and_apply_delta_to_state_if_needed(
                 |oplog| encoding::decode_oplog_changes(oplog, parsed),
+                ImportedValues::Exact,
                 origin,
             ),
             EncodeMode::Auto => {
@@ -723,7 +725,7 @@ impl LoroDoc {
                     },
                     diff_mode,
                 ) {
-                    oplog.rollback_owned_import(owns_rollback, &state);
+                    oplog.rollback_owned_import(owns_rollback, &mut state);
                     return Err(e);
                 }
             }
@@ -741,7 +743,7 @@ impl LoroDoc {
                     if keep_prefix {
                         oplog.commit_owned_import_rollback(owns_rollback);
                     } else {
-                        oplog.rollback_owned_import(owns_rollback, &self.state.lock());
+                        oplog.rollback_owned_import(owns_rollback, &mut self.state.lock());
                     }
                     Err(e)
                 }
@@ -753,7 +755,7 @@ impl LoroDoc {
                     Ok(result)
                 }
                 Err(e) => {
-                    oplog.rollback_owned_import(owns_rollback, &self.state.lock());
+                    oplog.rollback_owned_import(owns_rollback, &mut self.state.lock());
                     Err(e)
                 }
             }
@@ -764,14 +766,18 @@ impl LoroDoc {
     pub(crate) fn import_changes_and_apply_delta_to_state_if_needed(
         &self,
         decode_changes: impl FnOnce(&mut OpLog) -> Result<Vec<Change>, LoroError>,
+        values: ImportedValues,
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
         let mut oplog = self.oplog.lock();
+        oplog.check_history_parsable()?;
         let arena_checkpoint = oplog.arena.checkpoint_for_rollback();
-        let changes = match decode_changes(&mut oplog) {
+        let changes = match decode_changes(&mut oplog)
+            .and_then(|changes| oplog.check_and_trim_known_part_of_changes(changes, values))
+        {
             Ok(changes) => changes,
             Err(e) => {
-                oplog.rollback_arena(arena_checkpoint, &self.state.lock());
+                oplog.rollback_arena(arena_checkpoint, &mut self.state.lock());
                 return Err(e);
             }
         };
@@ -780,7 +786,7 @@ impl LoroDoc {
         if preflight.has_deps_before_shallow_root
             && (self.is_detached() || !preflight.applies_to_dag)
         {
-            oplog.rollback_arena(arena_checkpoint, &self.state.lock());
+            oplog.rollback_arena(arena_checkpoint, &mut self.state.lock());
             return Err(LoroError::ImportUpdatesThatDependsOnOutdatedVersion);
         }
 
@@ -795,7 +801,7 @@ impl LoroDoc {
             let result = encoding::apply_decoded_changes_to_oplog(&mut oplog, changes);
             if owns_rollback {
                 if let Err(e) = oplog.validate_movable_list_elem_refs_in_import_scope() {
-                    oplog.rollback_import(&self.state.lock());
+                    oplog.rollback_import(&mut self.state.lock());
                     return Err(e);
                 }
                 oplog.commit_import_rollback();
@@ -811,7 +817,7 @@ impl LoroDoc {
             let pending_root_containers = pending_root_containers_to_materialize(&oplog, &changes);
             let result = encoding::apply_decoded_changes_to_oplog(&mut oplog, changes);
             if result.has_deps_before_shallow_root {
-                oplog.rollback_arena(arena_checkpoint, &self.state.lock());
+                oplog.rollback_arena(arena_checkpoint, &mut self.state.lock());
                 return Err(LoroError::ImportUpdatesThatDependsOnOutdatedVersion);
             }
 
@@ -846,11 +852,11 @@ impl LoroDoc {
             // pending changes hold movable-list ops, so other imports skip the scan.
             if rollback_enabled {
                 if let Err(e) = oplog.validate_movable_list_elem_refs_in_import_scope() {
-                    oplog.rollback_import(&self.state.lock());
+                    oplog.rollback_import(&mut self.state.lock());
                     return Err(e);
                 }
             }
-            let mut diff = DiffCalculator::new(false);
+            let mut calc = DiffCalculator::new(false);
             // Applying may have unlocked pending changes; the isolated fast path is only valid
             // when exactly the candidate batch was appended on top of the old version.
             let isolated_batch = isolated_batch.filter(|(component_vv, _)| {
@@ -867,7 +873,7 @@ impl LoroDoc {
                 #[cfg(test)]
                 ISOLATED_FAST_PATH_HITS.with(|hits| hits.set(hits.get() + 1));
                 let component_frontiers = oplog.dag.vv_to_frontiers(&component_vv);
-                let (diff, _) = diff.calc_diff_internal(
+                let (diff, _) = calc.calc_diff_internal(
                     &oplog,
                     &VersionVector::default(),
                     &Frontiers::default(),
@@ -877,7 +883,7 @@ impl LoroDoc {
                 );
                 (diff, DiffMode::Import)
             } else {
-                diff.calc_diff_internal(
+                calc.calc_diff_internal(
                     &oplog,
                     &old_vv,
                     &old_frontiers,
@@ -904,12 +910,13 @@ impl LoroDoc {
                 diff_mode,
             ) {
                 if rollback_enabled {
-                    oplog.rollback_import(&state);
+                    oplog.rollback_import(&mut state);
                     return Err(e);
                 }
 
                 panic!("state apply returned Err for import without rollback guard: {e}");
             }
+            materialize_touched_roots(&mut state, &calc, &oplog.arena);
         }
 
         if result.has_deps_before_shallow_root {
@@ -950,6 +957,7 @@ impl LoroDoc {
         self.with_barrier(|| {
             let result = self.import_changes_and_apply_delta_to_state_if_needed(
                 |oplog| crate::encoding::json_schema::decode_json_changes(json, &oplog.arena),
+                ImportedValues::Lossy,
                 Default::default(),
             );
             self.emit_events();
@@ -1369,7 +1377,7 @@ impl LoroDoc {
         let diff = self.diff_events(&f, target, true)?;
         // This doc kept the state of the mergeable children the target re-activates, so apply
         // their actual changes rather than the full states `diff` reports.
-        self._apply_diff(
+        self.apply_diff_all_or_nothing(
             DiffBatch::from_changes(diff),
             &mut Default::default(),
             false,
@@ -1389,6 +1397,7 @@ impl LoroDoc {
     }
 
     /// With `changes_only`, only [`DiffBatch::from_changes`] of the result is meaningful.
+    // Both callers return a `Result`, so a history that cannot be parsed is rejected here.
     fn diff_events(
         &self,
         a: &Frontiers,
@@ -1399,6 +1408,7 @@ impl LoroDoc {
             // Check whether a and b are valid before checkout so this returns a normal error
             // instead of panicking on shallow docs.
             let oplog = self.oplog.lock();
+            oplog.check_history_parsable()?;
             let validate_frontiers = |frontiers: &Frontiers| -> LoroResult<()> {
                 for id in frontiers.iter() {
                     if !oplog.dag.contains(id) {
@@ -1462,9 +1472,192 @@ impl LoroDoc {
     /// A mergeable child that the batch re-activates is aligned with this doc's hidden state
     /// only if `diff.full_state` is set (batches from [`LoroDoc::diff`]); otherwise its entry
     /// is applied as an increment. See [`DiffBatch::full_state`].
+    ///
+    /// All or nothing: when it returns `Err`, the doc, its history and its subscribers are as
+    /// before the call, and uncommitted edits made before it are kept. See
+    /// `context/apply-diff-atomicity.md`.
     pub fn apply_diff(&self, diff: DiffBatch) -> LoroResult<()> {
         let align = diff.full_state;
-        self._apply_diff(diff, &mut Default::default(), true, align)
+        self.apply_diff_all_or_nothing(diff, &mut Default::default(), true, align)
+    }
+
+    /// [`Self::_apply_diff`], rolled back when it fails (loro-dev/loro#1154). Undo uses
+    /// `_apply_diff` directly and keeps what applied. See `context/apply-diff-atomicity.md`.
+    pub(crate) fn apply_diff_all_or_nothing(
+        &self,
+        diff: DiffBatch,
+        container_remap: &mut FxHashMap<ContainerID, ContainerID>,
+        skip_unreachable: bool,
+        align_revived_mergeable: bool,
+    ) -> LoroResult<()> {
+        if !self.can_edit() {
+            return Err(LoroError::EditWhenDetached);
+        }
+
+        let scope = self.begin_apply_diff_scope();
+        let result = self._apply_diff(
+            diff,
+            container_remap,
+            skip_unreachable,
+            align_revived_mergeable,
+        );
+        if let Some(scope) = scope {
+            if result.is_ok() {
+                self.end_apply_diff_scope(scope);
+            } else {
+                self.rollback_apply_diff_scope(scope);
+            }
+        }
+        result
+    }
+
+    /// Marks where the batch starts in the transaction it will run in.
+    ///
+    /// Returns `None`, and the batch runs without a rollback, when there is no transaction
+    /// to run it in (the batch then fails before it applies anything) or another thread's
+    /// batch runs in it.
+    fn begin_apply_diff_scope(&self) -> Option<u64> {
+        static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let mut guard = self.txn.lock();
+        if guard.is_none() && !cfg!(target_arch = "wasm32") && self.can_edit() {
+            // Like the handlers' `with_txn`, which the batch's first op would call
+            drop(guard);
+            self.start_auto_commit();
+            guard = self.txn.lock();
+        }
+        let txn = guard.as_mut()?;
+        if txn.has_rollback_scope() {
+            return None;
+        }
+        let id = NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        txn.begin_rollback_scope(id);
+        self.state.lock().begin_local_rollback(id);
+        Some(id)
+    }
+
+    fn end_apply_diff_scope(&self, scope: u64) {
+        let mut guard = self.txn.lock();
+        if let Some(txn) = guard.as_mut() {
+            txn.end_rollback_scope(scope);
+        }
+        self.state.lock().end_local_rollback(scope);
+    }
+
+    /// Undo the ops of a failed batch, keeping the ops the transaction held before it.
+    /// Emits nothing.
+    ///
+    /// The transaction's ops are inserted into the op log as a change, under an import
+    /// rollback scope, so that the diff calculator can compute the checkout from the batch's
+    /// last op back to the version before the batch; then the scope is rolled back and the
+    /// ops before the batch are put back into the DAG's version as pending local ops.
+    fn rollback_apply_diff_scope(&self, scope: u64) {
+        let mut guard = self.txn.lock();
+        let Some(txn) = guard
+            .as_mut()
+            .filter(|txn| txn.rollback_scope_is_intact(scope))
+        else {
+            // Another thread committed the transaction or applied ops in it while the batch
+            // ran. Undoing it would drop their edits, so the batch stays partly applied.
+            warn!("apply_diff failed while another thread edited the doc; not rolled back");
+            if let Some(txn) = guard.as_mut() {
+                txn.end_rollback_scope(scope);
+            }
+            self.state.lock().end_local_rollback(scope);
+            return;
+        };
+
+        let batch = txn.roll_back_scope(scope);
+        let mut oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        if batch.batch_start < batch.batch_end {
+            let peer = batch.peer;
+            let txn_ops_before = (batch.batch_start - batch.txn_start_counter) as usize;
+            let before_batch = if txn_ops_before == 0 {
+                batch.deps.clone()
+            } else {
+                Frontiers::from_id(ID::new(peer, batch.batch_start - 1))
+            };
+            #[cfg(debug_assertions)]
+            {
+                // Only the txn's ops changed the DAG's version since it began: anything else
+                // (an import, a checkout) commits the txn first.
+                let mut expected = batch.dag_frontiers_at_start.clone();
+                expected.update_frontiers_on_new_change(
+                    ID::new(peer, batch.batch_end - 1),
+                    &batch.deps,
+                );
+                assert_eq!(&expected, oplog.dag.frontiers());
+                assert_eq!(oplog.dag.vv().get(&peer), Some(&batch.batch_end));
+            }
+            oplog.dag.discard_pending_txn(
+                batch.dag_frontiers_at_start,
+                peer,
+                batch.txn_start_counter,
+            );
+            oplog.begin_import_rollback();
+            oplog.insert_new_change(
+                Change {
+                    id: ID::new(peer, batch.txn_start_counter),
+                    lamport: batch.txn_start_lamport,
+                    deps: batch.deps.clone(),
+                    timestamp: batch.timestamp,
+                    commit_msg: None,
+                    ops: batch.ops,
+                },
+                false,
+            );
+
+            let batch_last = state.frontiers.clone();
+            debug_assert_eq!(
+                batch_last,
+                Frontiers::from_id(ID::new(peer, batch.batch_end - 1))
+            );
+            let from = oplog
+                .dag
+                .frontiers_to_vv(&batch_last)
+                .expect("the batch's ops are in the DAG");
+            let to = oplog
+                .dag
+                .frontiers_to_vv(&before_batch)
+                .expect("the version before the batch is in the DAG");
+            let (diff, diff_mode) = DiffCalculator::new(false).calc_diff_internal(
+                &oplog,
+                &from,
+                &batch_last,
+                &to,
+                &before_batch,
+                None,
+            );
+            // `DocState::apply_diff` refuses to run inside a transaction, and records nothing
+            // without its event recorder.
+            state.abort_txn();
+            let recorder = state.take_event_recorder();
+            state
+                .apply_diff(
+                    InternalDocDiff {
+                        origin: Default::default(),
+                        by: EventTriggerKind::Checkout,
+                        diff: Cow::Owned(diff),
+                        new_version: Cow::Owned(before_batch),
+                    },
+                    diff_mode,
+                )
+                .expect("undoing the ops of a failed apply_diff from the state");
+            state.restore_event_recorder(recorder);
+            state.resume_txn();
+            oplog.rollback_import_keeping_arena(&state);
+            if txn_ops_before > 0 {
+                oplog.dag.update_version_on_new_local_op(
+                    &batch.deps,
+                    ID::new(peer, batch.txn_start_counter),
+                    batch.txn_start_lamport,
+                    txn_ops_before,
+                );
+                oplog.refresh_visible_op_count();
+            }
+        }
+        state.finish_local_rollback(scope, batch.peer, batch.batch_start);
     }
 
     /// Apply a diff to the current state.
@@ -1505,8 +1698,9 @@ impl LoroDoc {
             } else {
                 FullStatePlan::default()
             };
-        // There is no rollback for the local ops applied below, so reject the
-        // diff before touching the doc if it needs an unknown container.
+        // Undo applies its diff without a rollback (`apply_diff` and
+        // `revert_to` roll back a failed batch), so reject the diff before
+        // touching the doc if it needs an unknown container.
         let predicted_skips = self.check_apply_diff_creates_no_unknown_container(
             &diff,
             align_revived_mergeable.then_some(&plan),
@@ -2264,6 +2458,9 @@ impl LoroDoc {
     /// This will make the current [DocState] detached from the latest version of [OpLog].
     /// Any further import will not be reflected on the [DocState], until user call [LoroDoc::attach()]
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
+        // Checked here and not in `_checkout_without_emitting`: undo, `checkout_to_latest`
+        // and the exporters call that and cannot return this error.
+        self.oplog.lock().check_history_parsable()?;
         let was_detached = self.is_detached();
         let (options, guard) = self.implicit_commit_then_stop();
         let result = self._checkout_without_emitting(frontiers, true, true);
@@ -2382,6 +2579,12 @@ impl LoroDoc {
             },
             diff_mode,
         )?;
+        // Only at the latest version: every root the calculator has seen is then in
+        // the history of the target version. Checking out an older version keeps
+        // whatever roots the state already had.
+        if after == oplog.vv() {
+            materialize_touched_roots(&mut state, &calc, &oplog.arena);
+        }
 
         Ok(())
     }
@@ -2400,7 +2603,9 @@ impl LoroDoc {
     ///
     /// After `a.merge(b)` and `b.merge(a)`, `a` and `b` will have the same content if they are in attached mode.
     pub fn merge(&self, other: &Self) -> LoroResult<ImportStatus> {
-        let updates = other.export(ExportMode::updates(&self.oplog_vv())).unwrap();
+        let updates = other
+            .export(ExportMode::updates(&self.oplog_vv()))
+            .map_err(LoroError::from)?;
         self.import(&updates)
     }
 
@@ -2745,7 +2950,21 @@ impl LoroDoc {
 
     #[instrument(skip(self))]
     pub fn export(&self, mode: ExportMode) -> Result<Vec<u8>, LoroEncodeError> {
+        self.export_inner(mode, true)
+    }
+
+    /// With `reject_partial_history`, the export fails if a change block that cannot be
+    /// parsed was found, before or during the export, instead of returning bytes that
+    /// silently miss those changes. `fork` passes `false`: it has no error to return.
+    pub(crate) fn export_inner(
+        &self,
+        mode: ExportMode,
+        reject_partial_history: bool,
+    ) -> Result<Vec<u8>, LoroEncodeError> {
         self.with_barrier(|| {
+            if reject_partial_history {
+                self.oplog.lock().check_history_parsable()?;
+            }
             let ans = match mode {
                 ExportMode::Snapshot => export_fast_snapshot(self)?,
                 ExportMode::Updates { from } => export_fast_updates(self, &from),
@@ -2759,6 +2978,9 @@ impl LoroDoc {
                 },
                 ExportMode::SnapshotAt { version } => export_snapshot_at(self, &version)?,
             };
+            if reject_partial_history {
+                self.oplog.lock().check_history_parsable()?;
+            }
             Ok(ans)
         })
     }
@@ -2823,6 +3045,23 @@ impl LoroDoc {
         let (s, enable) = self.pre_commit_subs.inner().insert((), callback);
         enable();
         s
+    }
+}
+
+/// A root container touched by any op in a doc's history is part of its value, even
+/// when the ops add up to an empty value: the peer that wrote them created the root's
+/// state with its first local op. A replay whose net diff for the root is empty never
+/// creates that state, so create it here (loro-dev/loro#1156).
+///
+/// `calc` must have computed diffs whose ranges all lie in the history of the state's
+/// new version.
+fn materialize_touched_roots(state: &mut DocState, calc: &DiffCalculator, arena: &SharedArena) {
+    for idx in calc.touched_containers() {
+        if let Some(id) = arena.idx_to_id(idx) {
+            if id.is_root() && !id.is_mergeable() && !state.store.contains_id(&id) {
+                state.ensure_container(&id);
+            }
+        }
     }
 }
 
@@ -3216,7 +3455,7 @@ impl BatchImportGuard<'_> {
                 // still at its pre-batch version; undoing the batch in the `OpLog`
                 // makes the two agree again, which is what lets the doc stay attached.
                 tracing::warn!("import_batch cannot reattach, rolling the batch back: {e}");
-                doc.oplog.lock().rollback_import(&doc.state.lock());
+                doc.oplog.lock().rollback_import(&mut doc.state.lock());
                 // The shared diff calculator cached ranges against the rolled-back
                 // history; drop that cache instead of reusing stale entries.
                 *doc.diff_calculator.lock() = DiffCalculator::new(true);

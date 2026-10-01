@@ -396,17 +396,29 @@ pub(crate) fn export_shallow_snapshot_inner(
             // containers deleted before the root, so filter it with the same
             // retention rule the other paths use instead of trusting its key
             // set. The root never changes, so the result is computed once.
-            // A fork copies the root verbatim: it publishes nothing, and it
-            // must not fail on a root that is merely inconsistent.
+            // A root the walk cannot judge (an inconsistent parent header, or
+            // a state that does not decode) is kept verbatim, as exporters
+            // before #1123 did: nothing referenced is dropped, and the export
+            // still succeeds. A fork always copies the root verbatim: it
+            // publishes nothing.
             if cached_root == CachedShallowRoot::Prune {
-                let pruned = shallow_root.pruned_root.get_or_try_init(|| {
-                    prune_cached_root(
+                let pruned = shallow_root.pruned_root.get_or_init(|| {
+                    match prune_cached_root(
                         &shallow_root_state_bytes,
                         &shallow_root_kv,
                         &shallow_root.shallow_root_frontiers,
                         &root_vv,
-                    )
-                })?;
+                    ) {
+                        Ok(pruned) => pruned,
+                        Err(err) => {
+                            tracing::warn!(
+                                ?err,
+                                "cached shallow root cannot be checked; exporting it verbatim"
+                            );
+                            None
+                        }
+                    }
+                });
                 if let Some(pruned) = pruned {
                     for key in &pruned.removed {
                         shallow_root_kv.remove(key);
@@ -620,8 +632,9 @@ fn retain_created_after_root(
 /// case: every stored container is reached, counting placeholders for
 /// containers created after the root as reached. Otherwise the full walk
 /// (`ensure_all_alive_containers`) also runs; its `Err` on an inconsistent root
-/// is propagated rather than dropping containers that are still referenced,
-/// and only keys that both leave unreached are removed.
+/// is returned rather than dropping containers that are still referenced (the
+/// caller then exports the root verbatim), and only keys that both leave
+/// unreached are removed.
 fn prune_cached_root(
     root_state_bytes: &Bytes,
     root_kv: &KvWrapper,
@@ -944,14 +957,17 @@ fn calc_shallow_doc_start(
         let mut processed = false;
         if let Some(op) = oplog.get_op_that_includes(id) {
             if let crate::op::InnerContent::List(InnerListOp::StyleStart { .. }) = &op.content {
-                // StyleStart and StyleEnd operations must be kept together in the GC snapshot.
-                // Splitting them could lead to an weird document state that cannot be
-                // properly encoded. To ensure they stay together, we advance the frontier by
-                // one step to include both operations.
-
-                // > Id.counter + 1 is guaranteed to be the StyleEnd Op
-                ans.push(id.inc(1));
-                processed = true;
+                // StyleStart and StyleEnd operations are kept together in the GC snapshot
+                // when both exist, so we advance the frontier by one step to include both
+                // operations. (Id.counter + 1 is guaranteed to be the StyleEnd Op.)
+                //
+                // When this doc's history ends at the StyleStart, the end op does not
+                // exist here; the root keeps the lone start anchor, which the state
+                // encoding supports (loro-dev/loro#1165).
+                if oplog.vv().includes_id(id.inc(1)) {
+                    ans.push(id.inc(1));
+                    processed = true;
+                }
             }
         }
 
@@ -1717,30 +1733,27 @@ mod tests {
         kv.keys()
     }
 
-    /// Every export of a doc whose cached root has a forged header must either
-    /// fail or keep the doc's content; it must never drop referenced data.
-    fn assert_exports_keep_content(doc: &LoroDoc, expected: &LoroValue, case: &str) -> usize {
-        let mut errors = 0;
+    /// Every export of a doc whose cached root has a forged header must succeed
+    /// and keep the doc's content: the root is exported verbatim, and no
+    /// referenced data is dropped.
+    fn assert_exports_keep_content(doc: &LoroDoc, expected: &LoroValue, case: &str) {
         for mode in [
             ExportMode::shallow_snapshot(&doc.shallow_since_frontiers()),
             ExportMode::Snapshot,
         ] {
-            match doc.export(mode) {
-                Ok(bytes) => {
-                    let again = LoroDoc::new();
-                    again.import(&bytes).unwrap();
-                    assert_eq!(
-                        &again.get_deep_value(),
-                        expected,
-                        "{case}: export lost data"
-                    );
-                }
-                Err(_) => errors += 1,
-            }
+            let bytes = doc
+                .export(mode)
+                .unwrap_or_else(|e| panic!("{case}: export failed: {e}"));
+            let again = LoroDoc::new();
+            again.import(&bytes).unwrap();
+            assert_eq!(
+                &again.get_deep_value(),
+                expected,
+                "{case}: export lost data"
+            );
         }
         // A fork copies the cached root verbatim and must not panic.
         assert_eq!(&doc.fork().get_deep_value(), expected, "{case}: fork");
-        errors
     }
 
     #[test]
@@ -1792,7 +1805,6 @@ mod tests {
             ("inner text", row_body, None),
         ];
         let mut cases = 0;
-        let mut errors = 0;
         for (name, target, child) in targets {
             let mut parents = vec![
                 ("decoy root", Some(decoy.clone())),
@@ -1810,13 +1822,11 @@ mod tests {
                 let shallow = LoroDoc::new();
                 shallow.import(&forged).unwrap();
                 assert_eq!(shallow.get_deep_value(), expected, "{case}: import");
-                errors += assert_exports_keep_content(&shallow, &expected, &case);
+                assert_exports_keep_content(&shallow, &expected, &case);
                 cases += 1;
             }
         }
         assert_eq!(cases, 24);
-        // Every forged root is inconsistent, so the full walk rejects it.
-        assert_eq!(errors, 2 * cases);
     }
 
     #[test]
