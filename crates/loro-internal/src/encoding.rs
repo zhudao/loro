@@ -6,12 +6,14 @@ mod shallow_snapshot;
 pub(crate) mod value;
 pub(crate) mod value_register;
 pub(crate) use outdated_encode_reordered::{
-    decode_op, encode_op, get_op_prop, EncodedDeleteStartId, IterableEncodedDeleteStartId,
+    decode_op, encode_op, get_op_prop, DecodedBlockBuffers, EncodedDeleteStartId,
+    IterableEncodedDeleteStartId,
 };
 use outdated_encode_reordered::{import_changes_to_oplog, ImportChangesResult};
 pub(crate) use value::OwnedValue;
 
 use crate::change::Change;
+use crate::oplog::ImportedValues;
 use crate::version::{Frontiers, VersionRange};
 use crate::LoroDoc;
 use crate::{oplog::OpLog, LoroError, VersionVector};
@@ -233,8 +235,12 @@ pub struct ImportStatus {
 pub(crate) fn decode_oplog(
     oplog: &mut OpLog,
     parsed: ParsedHeaderAndBody,
+    values: ImportedValues,
 ) -> Result<ImportStatus, LoroError> {
-    let changes = decode_oplog_changes(oplog, parsed)?;
+    let changes = decode_oplog_changes(oplog, parsed, values)?;
+    // Outdated decoders do not go through `import_changes_and_apply`. Compare
+    // here so a restored outdated import still honors the caller's mode.
+    let changes = oplog.check_and_trim_known_part_of_changes(changes, values)?;
     let result = apply_decoded_changes_to_oplog(oplog, changes)?;
     if result.has_deps_before_shallow_root {
         return Err(LoroError::ImportUpdatesThatDependsOnOutdatedVersion);
@@ -246,13 +252,14 @@ pub(crate) fn decode_oplog(
 pub(crate) fn decode_oplog_changes(
     oplog: &mut OpLog,
     parsed: ParsedHeaderAndBody,
+    values: ImportedValues,
 ) -> Result<Vec<Change>, LoroError> {
     let ParsedHeaderAndBody { mode, body, .. } = parsed;
     match mode {
         EncodeMode::OutdatedRle | EncodeMode::OutdatedSnapshot => {
             Err(LoroError::ImportUnsupportedEncodingMode)
         }
-        EncodeMode::FastSnapshot => fast_snapshot::decode_oplog(oplog, body),
+        EncodeMode::FastSnapshot => fast_snapshot::decode_oplog(oplog, body, values),
         EncodeMode::FastUpdates => fast_snapshot::decode_updates(oplog, body.to_vec().into()),
         EncodeMode::Auto => unreachable!(),
     }
@@ -441,7 +448,7 @@ pub(crate) fn export_state_only_snapshot(
     })
 }
 
-fn encode_with(
+pub(crate) fn encode_with(
     mode: EncodeMode,
     f: &mut dyn FnMut(&mut Vec<u8>) -> Result<(), LoroEncodeError>,
 ) -> Result<Vec<u8>, LoroEncodeError> {

@@ -61,6 +61,8 @@ use std::{
 };
 use tracing::{debug_span, info_span, instrument, warn};
 
+use crate::utils::subscription::DeferredPanic;
+
 impl Default for LoroDoc {
     fn default() -> Self {
         Self::new()
@@ -126,10 +128,16 @@ impl LoroDoc {
         F: FnOnce() -> R,
     {
         let (options, guard) = self.implicit_commit_then_stop();
-        let result = f();
+        // `f` may call user code, e.g. subscribers of an import's events. If it
+        // panics, release the txn lock first, so the panic does not poison it.
+        // A panic inside Loro may have poisoned another lock, which makes the
+        // renewal panic too; `DeferredPanic` keeps the first one.
+        let mut panic = DeferredPanic::default();
+        let result = panic.run(f);
         drop(guard);
-        self.renew_txn_if_auto_commit(options);
-        result
+        panic.run(|| self.renew_txn_if_auto_commit(options));
+        panic.resume();
+        result.unwrap()
     }
 
     pub fn new() -> Self {
@@ -330,11 +338,33 @@ impl LoroDoc {
     ///   (except `origin`, which never carries across an empty commit).
     /// - When `preserve_on_empty` is false (explicit commits), commit options from an
     ///   empty transaction are swallowed and NOT carried over.
+    ///
+    /// A pre-commit callback that panics does not stop the commit; its panic is
+    /// raised after the txn lock is released, so the lock is not poisoned.
     #[instrument(skip_all)]
     fn commit_internal(
         &self,
         config: CommitOptions,
         preserve_on_empty: bool,
+    ) -> (
+        Option<CommitOptions>,
+        Option<LoroMutexGuard<'_, Option<Transaction>>>,
+    ) {
+        let mut panic = DeferredPanic::default();
+        let ans = self.commit_internal_inner(config, preserve_on_empty, &mut panic);
+        if !panic.has_panic() {
+            return ans;
+        }
+        drop(ans);
+        panic.resume();
+        unreachable!("resume raises the deferred panic")
+    }
+
+    fn commit_internal_inner(
+        &self,
+        config: CommitOptions,
+        preserve_on_empty: bool,
+        panic: &mut DeferredPanic,
     ) -> (
         Option<CommitOptions>,
         Option<LoroMutexGuard<'_, Option<Transaction>>>,
@@ -370,7 +400,7 @@ impl LoroDoc {
             }
 
             let id_span = txn.id_span();
-            let mut options = txn.commit().unwrap();
+            let mut options = txn.commit_deferring_panic(panic).unwrap();
             // Empty commit returns Some(options). We may preserve parts of it for implicit commits.
             if let Some(opts) = options.as_mut() {
                 // `origin` is an event-only label and never carries across an empty commit
@@ -612,7 +642,23 @@ impl LoroDoc {
         bytes: &[u8],
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
-        self.with_barrier(|| self._import_with(bytes, origin))
+        self.import_with_history_mode(bytes, origin, false)
+    }
+
+    /// Import binary bytes. `json_lossy` accepts only the equivalences a JSON hop
+    /// can introduce; the default binary path passes `false`.
+    pub fn import_with_history_mode(
+        &self,
+        bytes: &[u8],
+        origin: InternalString,
+        json_lossy: bool,
+    ) -> Result<ImportStatus, LoroError> {
+        let values = if json_lossy {
+            ImportedValues::JsonLossy
+        } else {
+            ImportedValues::Exact
+        };
+        self.with_barrier(|| self._import_with(bytes, origin, values))
     }
 
     #[tracing::instrument(skip_all)]
@@ -620,6 +666,7 @@ impl LoroDoc {
         &self,
         bytes: &[u8],
         origin: InternalString,
+        values: ImportedValues,
     ) -> Result<ImportStatus, LoroError> {
         ensure_cov::notify_cov("loro_internal::import");
         let parsed = parse_header_and_body(bytes, true)?;
@@ -637,7 +684,7 @@ impl LoroDoc {
                 );
                 let _e = s.enter();
                 self.update_oplog_and_apply_delta_to_state_if_needed(
-                    |oplog| oplog.decode(parsed),
+                    |oplog| oplog.decode(parsed, values),
                     origin,
                 )
             }
@@ -647,7 +694,7 @@ impl LoroDoc {
                     decode_snapshot(self, parsed.mode, parsed.body, origin)
                 } else {
                     self.update_oplog_and_apply_delta_to_state_if_needed(
-                        |oplog| oplog.decode(parsed),
+                        |oplog| oplog.decode(parsed, values),
                         origin,
                     )
                 }
@@ -659,8 +706,8 @@ impl LoroDoc {
                     decode_snapshot(self, parsed.mode, parsed.body, origin)
                 } else {
                     self.import_changes_and_apply_delta_to_state_if_needed(
-                        |oplog| encoding::decode_oplog_changes(oplog, parsed),
-                        ImportedValues::Exact,
+                        |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
+                        values,
                         origin,
                     )
 
@@ -671,8 +718,8 @@ impl LoroDoc {
                 }
             }
             EncodeMode::FastUpdates => self.import_changes_and_apply_delta_to_state_if_needed(
-                |oplog| encoding::decode_oplog_changes(oplog, parsed),
-                ImportedValues::Exact,
+                |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
+                values,
                 origin,
             ),
             EncodeMode::Auto => {
@@ -999,9 +1046,11 @@ impl LoroDoc {
             let mut state = self.state.lock();
             state.take_events()
         };
+        let mut panic = DeferredPanic::default();
         for event in events {
-            self.observer.emit(event);
+            panic.run(|| self.observer.emit(event));
         }
+        panic.resume();
     }
 
     pub(crate) fn drop_pending_events(&self) -> Vec<DocDiff> {
@@ -1018,7 +1067,7 @@ impl LoroDoc {
         self.with_barrier(|| {
             let result = self.import_changes_and_apply_delta_to_state_if_needed(
                 |oplog| crate::encoding::json_schema::decode_json_changes(json, &oplog.arena),
-                ImportedValues::Lossy,
+                ImportedValues::JsonLossy,
                 Default::default(),
             );
             self.emit_events();
@@ -2333,12 +2382,27 @@ impl LoroDoc {
     // PERF: opt
     #[tracing::instrument(skip_all)]
     pub fn import_batch(&self, bytes: &[Vec<u8>]) -> LoroResult<ImportStatus> {
+        self.import_batch_with_history_mode(bytes, false)
+    }
+
+    /// Like [`Self::import_batch`]. `json_lossy` is the same opt-in as
+    /// [`Self::import_with_history_mode`].
+    pub fn import_batch_with_history_mode(
+        &self,
+        bytes: &[Vec<u8>],
+        json_lossy: bool,
+    ) -> LoroResult<ImportStatus> {
+        let values = if json_lossy {
+            ImportedValues::JsonLossy
+        } else {
+            ImportedValues::Exact
+        };
         if bytes.is_empty() {
             return Ok(ImportStatus::default());
         }
 
         if bytes.len() == 1 {
-            return self.import(&bytes[0]);
+            return self.import_with_history_mode(&bytes[0], Default::default(), json_lossy);
         }
 
         let mut success = VersionRange::default();
@@ -2416,7 +2480,7 @@ impl LoroDoc {
             for (_meta, data) in meta_arr {
                 #[cfg(test)]
                 take_panic_at_batch_import_blob_for_test();
-                match guard.doc._import_with(data, Default::default()) {
+                match guard.doc._import_with(data, Default::default(), values) {
                     Ok(s) => {
                         for (peer, (start, end)) in s.success.iter() {
                             match success.0.entry(*peer) {
