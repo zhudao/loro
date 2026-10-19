@@ -420,7 +420,7 @@ extern "C" {
     pub type JsTravelChangeFunction;
     #[wasm_bindgen(typescript_type = "(string|number)[]")]
     pub type JsContainerPath;
-    #[wasm_bindgen(typescript_type = "(string) => boolean")]
+    #[wasm_bindgen(typescript_type = "(text: string) => boolean")]
     pub type JsTextIterCallback;
     #[wasm_bindgen(typescript_type = "Uint8Array[]")]
     pub type JsBinaryArray;
@@ -707,6 +707,38 @@ impl LoroDoc {
     #[wasm_bindgen(js_name = "setRecordTimestamp")]
     pub fn set_record_timestamp(&self, auto_record: bool) {
         self.doc.set_record_timestamp(auto_record);
+    }
+
+    /// Maximum number of lazily loaded container values retained by handler reads.
+    /// The default is 2048.
+    #[wasm_bindgen(js_name = "getDecodedValueCacheLimit")]
+    pub fn decoded_value_cache_limit(&self) -> usize {
+        self.doc.decoded_value_cache_limit()
+    }
+
+    /// Set how many lazily loaded container values handler reads may cache.
+    ///
+    /// The default is 2048. A larger finite limit trades memory for faster repeated
+    /// reads of large imported snapshots. Zero disables this cache. Lowering the
+    /// limit immediately evicts excess cached values without losing local edits.
+    ///
+    /// This counts cached values, not bytes or all document state: modified
+    /// containers and materialized tree state are outside this bound. Bulk reads
+    /// such as `doc.toJSON()` do not populate this cache.
+    ///
+    /// The setting is local to this document, is copied independently by forks,
+    /// and is not encoded in snapshots or updates. `limit` must be a finite
+    /// integer between 0 and 4294967295 (inclusive); Infinity is not supported.
+    #[wasm_bindgen(js_name = "setDecodedValueCacheLimit")]
+    pub fn set_decoded_value_cache_limit(&self, limit: f64) -> JsResult<()> {
+        if !limit.is_finite() || limit < 0.0 || limit.fract() != 0.0 || limit > u32::MAX as f64 {
+            return Err(JsError::new(
+                "Decoded value cache limit must be a finite integer between 0 and 4294967295",
+            )
+            .into());
+        }
+        self.doc.set_decoded_value_cache_limit(limit as usize);
+        Ok(())
     }
 
     /// If two continuous local changes are within (<=) the interval(**in seconds**), they will be merged into one change.
@@ -4961,7 +4993,8 @@ impl LoroTreeNode {
         LoroTree {
             handler: self.tree.clone(),
         }
-        .tree_node_to_js_obj(node, true)
+        .get_node_with_children(vec![node], true)
+        .map(|nodes| nodes.get(0))
     }
 
     // Using custom typescript for generic parameter on the returned node
@@ -5207,15 +5240,24 @@ impl LoroTree {
         resolve_meta: bool,
     ) -> JsResult<Array> {
         let ans = Array::new();
-        for v in value {
-            ans.push(&self.tree_node_to_js_obj(v, resolve_meta)?);
+        let mut pending = vec![(value, ans.clone())];
+        while let Some((nodes, output)) = pending.pop() {
+            let start = pending.len();
+            for mut node in nodes {
+                let obj = self.tree_node_to_shallow_js_obj(&node, resolve_meta)?;
+                let children = Array::new();
+                js_sys::Reflect::set(&obj, &"children".into(), &children)?;
+                output.push(&obj);
+                pending.push((std::mem::take(&mut node.children), children));
+            }
+            pending[start..].reverse();
         }
         Ok(ans)
     }
 
-    fn tree_node_to_js_obj(
+    fn tree_node_to_shallow_js_obj(
         &self,
-        v: TreeNodeWithChildren,
+        v: &TreeNodeWithChildren,
         resolve_meta: bool,
     ) -> JsResult<JsValue> {
         let id: JsValue = v.id.into();
@@ -5244,8 +5286,6 @@ impl LoroTree {
         } else {
             js_sys::Reflect::set(&obj, &"meta".into(), &map.into())?;
         }
-        let children = self.get_node_with_children(v.children, resolve_meta)?;
-        js_sys::Reflect::set(&obj, &"children".into(), &children)?;
         Ok(obj.into())
     }
 
@@ -5681,6 +5721,11 @@ impl UndoManager {
 
     /// Undo the last operation.
     ///
+    /// Consumes at most one history item, as defined by grouping and the merge
+    /// interval. Returns whether local operations were generated. A no-op item
+    /// is consumed and returns false without undoing earlier items. Use
+    /// `canUndo()` to check whether history remains.
+    ///
     /// Throws without changing the doc if the step would have to recreate a
     /// container of a type unknown to this version (created by a newer
     /// loro-crdt). That step, with every edit merged into it, is dropped and its
@@ -5692,6 +5737,10 @@ impl UndoManager {
     }
 
     /// Redo the last undone operation.
+    ///
+    /// Consumes at most one history item, including a no-op. Returns whether
+    /// local operations were generated. A false result does not imply that the
+    /// redo stack is empty; use `canRedo()` to check for remaining history.
     ///
     /// Throws like `undo` on steps that would recreate a container of an
     /// unknown type.
@@ -6588,7 +6637,7 @@ interface LoroDoc {
      * });
      * ```
      */
-    toJsonWithReplacer(replacer: (key: string | index, value: Value | Container) => Value | Container | undefined): Value;
+    toJsonWithReplacer(replacer: (key: string | number, value: Value | Container) => Value | Container | undefined): Value;
 
     /**
      * Calculate the differences between two frontiers
@@ -7918,7 +7967,7 @@ interface EphemeralStoreWasm<T extends Value = Value> {
     set(key: string, value: T): void;
     get(key: string): T | undefined;
     getAllStates(): Record<string, T>;
-    removeOutdated();
+    removeOutdated(): void;
     subscribeLocalUpdates(f: EphemeralLocalListener): () => void;
     subscribe(f: EphemeralListener): () => void;
 }

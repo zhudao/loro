@@ -71,6 +71,7 @@ import {
   type TextStyle,
   type TreeNodeRecord,
 } from "./containers";
+import { TreeMoves } from "./tree-moves";
 import { SequenceEventDiff } from "./event-diff";
 import {
   sameMovableListStates,
@@ -101,6 +102,7 @@ import {
   parseMergeableMarker,
 } from "./mergeable";
 import { OrderedIndex } from "./ordered-index";
+import { MovableListUndoState } from "./movable-list-undo";
 import type { SequenceIdRun } from "./sequence-index";
 import type {
   Change,
@@ -190,7 +192,6 @@ interface IndexedHistoryOperation {
 interface IndexedSubjectHistory {
   readonly byWriter: OrderedIndex<IndexedHistoryOperation>;
   readonly byPeer: Map<bigint, IndexedHistoryOperation[]>;
-  readonly placementsByPeer?: Map<bigint, IndexedHistoryOperation[]>;
 }
 
 interface EventRecording {
@@ -285,7 +286,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
   #historyFrontiers = new Map<string, CodecId>();
   #dependencyVersionCache = new WeakMap<DecodedChange, ReadonlyMap<bigint, number>>();
   #mapOperationHistory = new Map<string, Map<string, IndexedSubjectHistory>>();
-  #treeOperationHistory = new Map<string, Map<string, IndexedSubjectHistory>>();
   #containersWithOperations = new Set<string>();
   #containerKeys = new WeakMap<CodecContainerId, string>();
   #pendingHistory = new Map<string, HistoryRecord>();
@@ -313,6 +313,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
   #changeMergeInterval = 1000n;
   #nextCommitOptions: CommitOptions = {};
   #subscribers = new Set<(event: LoroEventBatch) => void>();
+  #localNoopCommitSubscribers = new Set<(event: LoroEventBatch) => void>();
   #localUpdateSubscribers = new Set<(bytes: Uint8Array) => void>();
   #containerSubscribers = new Map<string, Set<(event: LoroEventBatch) => void>>();
   #firstCommitSubscribers = new Set<(event: { peer: PeerID }) => void>();
@@ -1981,49 +1982,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     node: CodecId,
     version: VersionVector,
   ): TreePlacement | undefined {
-    const key = idKey(node);
-    const operations = this.#treeOperationHistory.get(tree.id)?.get(key);
-    if (operations === undefined) {
-      // No retained op (e.g. a shallow root node): its placement is unchanged.
-      const record = tree._nodes.get(formatTreeId(node));
-      return record === undefined
-        ? undefined
-        : {
-            deleted: record.deleted,
-            parent: record.parent,
-            position: record.position,
-            writer: record.writer,
-          };
-    }
-    const winner = latestIncludedOperation(operations, version);
-    if (winner === undefined) {
-      // A shallow history trims the ops before its root; until the first
-      // retained op, the node keeps its placement in the root state.
-      const rootNode = this.#shallowRootTreeNode(tree, formatTreeId(node));
-      return rootNode === undefined
-        ? undefined
-        : {
-            deleted: rootNode.deleted,
-            parent: rootNode.parent,
-            position: rootNode.position,
-            writer: rootNode.writer,
-          };
-    }
-    const content = winner.operation.content;
-    if (content.type !== "tree-create" && content.type !== "tree-move") {
-      return {
-        deleted: true,
-        parent: undefined,
-        position: EMPTY_BYTES,
-        writer: winner.writer,
-      };
-    }
-    return {
-      deleted: false,
-      parent: content.parent,
-      position: content.position,
-      writer: winner.writer,
-    };
+    return this.#ensureTreeMoves(tree, this.version()).placementAt(node, version);
   }
 
   /**
@@ -3241,6 +3200,16 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     return () => this.#subscribers.delete(listener);
   }
 
+  /** Undo history includes local commits whose operations cancel in the state diff. */
+  _subscribeUndo(listener: (event: LoroEventBatch) => void): Subscription {
+    const unsubscribe = this.subscribe(listener);
+    this.#localNoopCommitSubscribers.add(listener);
+    return () => {
+      unsubscribe();
+      this.#localNoopCommitSubscribers.delete(listener);
+    };
+  }
+
   subscribeLocalUpdates(listener: (bytes: Uint8Array) => void): Subscription {
     this.#localUpdateSubscribers.add(listener);
     return () => this.#localUpdateSubscribers.delete(listener);
@@ -3518,6 +3487,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     peer: PeerID,
     range: CounterSpan,
     isTracked: (id: CodecId) => boolean = (id) => id.peer === this.#peer,
+    movableUndo = new MovableListUndoState(),
   ): void {
     this.#commit({}, true);
     this.#materializeDeferredHistory();
@@ -3552,130 +3522,135 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       }
     }
     if (movableLists.size > 0) {
-      this.#undoMovableLists(parsedPeer, range, movableLists, tracked);
+      this.#undoMovableLists(parsedPeer, range, movableLists, movableUndo);
     }
     for (const { record, operation } of operations) {
       this.#undoOperation(record, operation, parsedPeer, range, tracked);
     }
   }
 
-  /**
-   * Undoes MovableList changes the way Rust's `undo_internal` does: apply the
-   * inverse diff of the span, transformed over what changed since, through
-   * `apply_delta`. Undoing a move or set therefore reinserts the old value as a
-   * new element, and moves a child container back.
-   */
+  /** Replays the same identity edits and neighbour anchors as Rust #1185. */
   #undoMovableLists(
     peer: bigint,
     range: CounterSpan,
     lists: ReadonlySet<LoroMovableList>,
-    isTracked: (id: CodecId) => boolean,
+    undo: MovableListUndoState,
   ): void {
-    const first = this.#recordContaining({ peer, counter: range.start });
-    if (first === undefined) return;
-    const deps =
-      range.start > first.change.id.counter
-        ? [{ peer, counter: range.start - 1 }]
-        : first.change.dependencies;
-    const spanEnd: Frontiers = [
-      { peer: peer.toString() as PeerID, counter: range.end - 1 },
-    ];
-    const inverse = new Map(this.diff(spanEnd, deps.map(formatOpId), false));
-    // Rust transforms the inverse only over changes this UndoManager did not
-    // make (its remote diff), so a list's inverse is transformed only when such
-    // a change touched that list.
-    const spanEndVersion = this.#versionForExistingFrontiers(spanEnd);
-    const untrackedLists = new Set<string>();
-    for (const { change } of this.#recordsInVersionRange(
-      spanEndVersion,
-      this.#historyVersion(),
-    )) {
+    const spans: {
+      start: number;
+      end: number;
+      deps: readonly CodecId[];
+      lists: Set<ContainerID>;
+    }[] = [];
+    const records = this.#historyByPeer.get(peer) ?? [];
+    for (
+      let i = Math.max(0, lowerBoundHistory(records, range.start + 1) - 1);
+      i < records.length;
+      i += 1
+    ) {
+      const { change } = records[i]!;
+      if (change.id.counter >= range.end) break;
+      const start = Math.max(range.start, change.id.counter);
+      const end = Math.min(range.end, change.id.counter + changeLength(change));
+      if (start >= end) continue;
+      const deps =
+        start > change.id.counter ? [{ peer, counter: start - 1 }] : change.dependencies;
+      let span = spans.at(-1);
+      if (
+        span === undefined ||
+        span.end !== start ||
+        deps.length !== 1 ||
+        deps[0]!.peer !== peer ||
+        deps[0]!.counter !== start - 1
+      ) {
+        span = { start, end, deps, lists: new Set() };
+        spans.push(span);
+      } else span.end = end;
       for (const operation of change.operations) {
-        const first = { peer: change.id.peer, counter: operation.counter };
-        const last = { ...first, counter: operation.counter + operation.length - 1 };
-        if (!isTracked(first) || !isTracked(last)) {
-          untrackedLists.add(this.#containerKey(operation.container));
+        if (operation.counter >= end || operation.counter + operation.length <= start)
+          continue;
+        const id = formatContainerId(operation.container);
+        const container = this.#containers.get(id);
+        if (container instanceof LoroMovableList && lists.has(container))
+          span.lists.add(id);
+      }
+    }
+    for (const span of spans.reverse()) {
+      const beforeVersion = this.#causalVersionAt(span.deps);
+      const endpoint = { peer, counter: span.end - 1 };
+      const afterVersion = this.#causalVersionAt([endpoint]);
+      const beforeIncludes = (id: CodecId): boolean =>
+        id.counter < (beforeVersion.get(id.peer) ?? 0);
+      const afterIncludes = (id: CodecId): boolean =>
+        id.counter < (afterVersion.get(id.peer) ?? 0);
+      const pairs = [...span.lists].flatMap((id) => {
+        const source = this.#containers.get(id) as LoroMovableList;
+        let list = source;
+        while (undo.containers.has(list.id))
+          list = undo.containers.get(list.id) as LoroMovableList;
+        if (this._isContainerDeleted(list)) return [];
+        this._ensureContainerHydrated(source);
+        if (this.#snapshotSequences.get(source.id)?.kind === "hydrated") {
+          this.#completeSnapshotSequence(
+            source,
+            source.id,
+            this.#checkoutVersion ?? this.#historyVersion(),
+          );
+        }
+        return [
+          {
+            list,
+            before: source._state.undoSnapshotAt(beforeIncludes),
+            after: source._state.undoSnapshotAt(afterIncludes),
+          },
+        ];
+      });
+      // Child copies still receive their historical full state from the
+      // inverse, rather than copying a child's later or hidden edits.
+      const needsChildren = pairs.some(({ before, after }) => {
+        const later = new Map(after.map((e) => [`${e.id.lamport}@${e.id.peer}`, e]));
+        return before.some(
+          (e) =>
+            e.value instanceof LoroContainer &&
+            (later.get(`${e.id.lamport}@${e.id.peer}`)?.valueWriter.lamport !==
+              e.valueWriter.lamport ||
+              later.get(`${e.id.lamport}@${e.id.peer}`)?.valueWriter.peer !==
+                e.valueWriter.peer),
+        );
+      });
+      const inverse = new Map(
+        needsChildren
+          ? this.diff([formatOpId(endpoint)], span.deps.map(formatOpId), false)
+          : [],
+      );
+      const remap = new Map(undo.containers);
+      for (const { list, before, after } of pairs) {
+        undo.apply(list, before, after, (position, value, set) => {
+          if (value instanceof LoroContainer) {
+            const child = createContainer(value.kind()) as Container;
+            const attached = set
+              ? list.setContainer(position, child)
+              : list.insertContainer(position, child);
+            remap.set(value.id, attached);
+          } else if (set) list.set(position, cloneRuntimeValue(value));
+          else list.insert(position, cloneRuntimeValue(value));
+        });
+      }
+      for (const [id, diff] of inverse) {
+        const child = remap.get(id);
+        if (child === undefined || child === undo.containers.get(id)) continue;
+        this.#applyContainerDiff(child, diff, remap, new Map());
+        const source = this.#containers.get(id);
+        if (source instanceof LoroMovableList && child instanceof LoroMovableList) {
+          undo.recordRecreatedList(
+            source._state.undoSnapshotAt(beforeIncludes),
+            child,
+            remap,
+          );
         }
       }
+      for (const [id, child] of remap) undo.containers.set(id, child);
     }
-    const since = new Map(
-      [...lists].some((list) => untrackedLists.has(list.id))
-        ? this.diff(spanEnd, this.frontiers(), false)
-        : [],
-    );
-    const remap = new Map<ContainerID, Container>();
-    for (const list of lists) {
-      if (this._isContainerDeleted(list)) continue;
-      const undo = inverse.get(list.id);
-      if (undo?.type !== "list") continue;
-      const later = untrackedLists.has(list.id) ? since.get(list.id) : undefined;
-      const delta =
-        later?.type === "list" ? transformListDelta(undo.diff, later.diff) : undo.diff;
-      this.#applyContainerDiff(
-        list,
-        { type: "list", diff: this.#withoutLiveChildInserts(list, delta, remap) },
-        remap,
-        new Map(),
-      );
-    }
-    // Reinserted child containers get their whole state from the inverse diff.
-    for (const [id, diff] of inverse) {
-      const child = remap.get(id);
-      if (child !== undefined) this.#applyContainerDiff(child, diff, remap, new Map());
-    }
-  }
-
-  /**
-   * Rust's `apply_delta` skips a `from_move` insert whose child still exists
-   * elsewhere in the list; undo transforms leave such inserts behind when a
-   * later change moved the child (context/movable-list-apply-diff.md). loro.js
-   * deltas carry no `from_move`, so for undo an inserted child that is still
-   * visible outside the delta's deleted ranges is dropped instead.
-   */
-  #withoutLiveChildInserts(
-    list: LoroMovableList,
-    delta: readonly Delta<unknown[]>[],
-    remap: ReadonlyMap<ContainerID, Container>,
-  ): Delta<unknown[]>[] {
-    const deleted: { readonly start: number; readonly end: number }[] = [];
-    let index = 0;
-    for (const item of delta) {
-      if ("retain" in item) index += item.retain;
-      else if ("delete" in item) {
-        deleted.push({ start: index, end: index + item.delete });
-        index += item.delete;
-      }
-    }
-    const live = (value: unknown): boolean => {
-      let id = diffContainerId(value);
-      let child = id === undefined ? undefined : this.#containers.get(id);
-      for (
-        let hops = 0;
-        child === undefined && id !== undefined && hops < 64;
-        hops += 1
-      ) {
-        id = remap.get(id)?.id;
-        child = id === undefined ? undefined : this.#containers.get(id);
-      }
-      if (child === undefined || child.parent() !== list) return false;
-      const binding = child._parentLink?.binding ?? recoverParentBinding(child, list);
-      if (binding?.kind !== "movable" || binding.element.value !== child) return false;
-      const position = list._state.indexOf(binding.element);
-      return (
-        position !== undefined &&
-        !deleted.some(({ start, end }) => position >= start && position < end)
-      );
-    };
-    const output: Delta<unknown[]>[] = [];
-    for (const item of delta) {
-      if (!("insert" in item)) {
-        output.push(item);
-        continue;
-      }
-      const kept = item.insert.filter((value) => !live(value));
-      if (kept.length > 0) output.push({ ...item, insert: kept });
-    }
-    return output;
   }
 
   _transformUndoCursors(cursors: readonly Cursor[]): Cursor[] {
@@ -3701,8 +3676,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     operation: DecodedOperation,
     peer: bigint,
     range: CounterSpan,
-    // Only the old MovableList move undo read this; MovableList undo now
-    // applies Rust's inverse diff (#undoMovableLists).
+    // MovableList changes use the separate identity replay above.
     _isTracked: (id: CodecId) => boolean,
   ): void {
     const container = this.#containers.get(formatContainerId(operation.container));
@@ -4080,17 +4054,12 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     const writer = operationWriter(record.change, operation);
     const node = tree._nodes.get(formatTreeId(content.subject));
     if (node === undefined || compareWriter(node.writer, writer) !== 0) return;
-    const previous = this.#previousTreeOperation(
-      operation.container,
-      content.subject,
-      writer,
-    );
-    if (previous === undefined || previous.operation.content.type === "tree-delete") {
+    const previous = this.#ensureTreeMoves(tree, this.version()).beforeMove({
+      peer: record.change.id.peer,
+      counter: operation.counter,
+    });
+    if (previous === undefined || previous.deleted) {
       this.#appendAndApply(tree, { type: "tree-delete", subject: content.subject }, 1);
-      return;
-    }
-    const previousContent = previous.operation.content;
-    if (previousContent.type !== "tree-create" && previousContent.type !== "tree-move") {
       return;
     }
     this.#appendAndApply(
@@ -4098,30 +4067,11 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       {
         type: "tree-move",
         subject: content.subject,
-        parent: previousContent.parent,
-        position: previousContent.position.slice(),
+        parent: previous.parent,
+        position: previous.position.slice(),
       },
       1,
     );
-  }
-
-  #previousTreeOperation(
-    containerId: CodecContainerId,
-    subject: CodecId,
-    before: LastWriter,
-  ): { record: HistoryRecord; operation: DecodedOperation } | undefined {
-    const operations = this.#treeOperationHistory
-      .get(formatContainerId(containerId))
-      ?.get(idKey(subject));
-    if (operations === undefined) return undefined;
-    const previous = operations.byWriter.at(
-      operations.byWriter._lowerBoundBy((operation) =>
-        compareWriter(operation.writer, before),
-      ) - 1,
-    );
-    return previous === undefined
-      ? undefined
-      : { record: previous.record, operation: previous.operation };
   }
 
   _mapSet(container: LoroMap, key: string, value: unknown): void {
@@ -4365,6 +4315,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     parent?: TreeID,
     index?: number,
   ): LoroTreeNode<TData> {
+    if (tree._moves === undefined) this.#ensureTreeMoves(tree, this.version());
     const pending = this.#ensurePending();
     const subject = { peer: this.#peer, counter: this.#nextOperationCounter(pending) };
     const parentId = parent === undefined ? undefined : parseTreeId(parent);
@@ -4393,6 +4344,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
   }
 
   _treeMove(tree: LoroTree, target: TreeID, parent?: TreeID, index?: number): void {
+    if (tree._moves === undefined) this.#ensureTreeMoves(tree, this.version());
     if (!tree.has(target)) throw new RangeError(`tree node ${target} does not exist`);
     if (parent !== undefined && !tree.has(parent)) {
       throw new RangeError(`tree parent ${parent} does not exist`);
@@ -4427,6 +4379,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
   }
 
   _treeDelete(tree: LoroTree, target: TreeID): void {
+    if (tree._moves === undefined) this.#ensureTreeMoves(tree, this.version());
     this.#appendAndApply(tree, { type: "tree-delete", subject: parseTreeId(target) }, 1);
   }
 
@@ -4633,6 +4586,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
         ? this.#movableEvents(pending, container)
         : undefined,
       true,
+      this.#hasEventSubscribers() ? pending : undefined,
     );
     this.#dirtySnapshotContainers.add(container.id);
     finishEvent?.();
@@ -5129,6 +5083,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     knownContainer?: LoroContainer,
     movableEvents?: MovableListEvents,
     local = false,
+    recording?: EventRecording,
   ): void {
     const container = knownContainer ?? this.#getOrCreateContainer(operation.container);
     if (this.#snapshotSequences.size !== 0) {
@@ -5285,43 +5240,15 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
         );
         return;
       case "tree-create":
-      case "tree-move": {
-        const tree = container as LoroTree;
-        const nodeKey = formatTreeId(content.subject);
-        let record = tree._nodes.get(nodeKey);
-        if (record === undefined) {
-          const dataId: CodecContainerId = {
-            kind: "normal",
-            ...content.subject,
-            containerType: CodecContainerType.Map,
-          };
-          const data = this.#getOrCreateContainer(dataId, tree) as LoroMap;
-          record = {
-            id: content.subject,
-            parent: content.parent,
-            position: content.position.slice(),
-            deleted: false,
-            writer,
-            lastMoveId: operationId,
-            data,
-          };
-          tree._setRecord(record);
-        } else if (compareWriter(record.writer, writer) <= 0) {
-          tree._updateRecord(
-            record,
-            content.parent,
-            content.position.slice(),
-            writer,
-            operationId,
-          );
-        }
-        return;
-      }
+      case "tree-move":
       case "tree-delete": {
-        const record = (container as LoroTree)._nodes.get(formatTreeId(content.subject));
-        if (record !== undefined && compareWriter(record.writer, writer) <= 0) {
-          (container as LoroTree)._deleteRecord(record, writer, operationId);
-        }
+        const tree = container as LoroTree;
+        const moves = (tree._moves ??= new TreeMoves(tree._nodes.values()));
+        this.#installTreeMoves(
+          tree,
+          moves.apply(content, operationId, writer),
+          recording,
+        );
         return;
       }
       case "future":
@@ -5361,7 +5288,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       historyFrontiers: new Map(this.#historyFrontiers),
       dependencyVersionCache: this.#dependencyVersionCache,
       mapOperationHistory: this.#mapOperationHistory,
-      treeOperationHistory: this.#treeOperationHistory,
       containersWithOperations: this.#containersWithOperations,
       pendingHistory: new Map(this.#pendingHistory),
       seenCommittedPeers: new Set(this.#seenCommittedPeers),
@@ -5397,7 +5323,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
         checkpoint.historyByPeer.clear();
         checkpoint.historyEndByPeer.clear();
         checkpoint.mapOperationHistory.clear();
-        checkpoint.treeOperationHistory.clear();
         checkpoint.containersWithOperations.clear();
       } else {
         for (let index = undo.length - 1; index >= 0; index -= 1) undo[index]!();
@@ -5411,7 +5336,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       this.#sortedHistoryCache = undefined;
       this.#dependencyVersionCache = checkpoint.dependencyVersionCache;
       this.#mapOperationHistory = checkpoint.mapOperationHistory;
-      this.#treeOperationHistory = checkpoint.treeOperationHistory;
       this.#containersWithOperations = checkpoint.containersWithOperations;
       this.#pendingHistory = checkpoint.pendingHistory;
       this.#seenCommittedPeers = checkpoint.seenCommittedPeers;
@@ -5699,6 +5623,8 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
           recording !== undefined && container instanceof LoroMovableList
             ? this.#movableEvents(recording, container)
             : undefined,
+          false,
+          recording,
         );
         if (only === undefined) this.#dirtySnapshotContainers.add(container.id);
         finishEvent?.();
@@ -6246,136 +6172,11 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     }
 
     for (const [tree, subjects] of treeSubjects) {
-      const history = this.#treeOperationHistory.get(tree.id);
-      for (const [historyKey, subject] of subjects) {
-        const nodeKey = formatTreeId(subject);
-        if (recording !== undefined) {
-          const state = this.#treeEventState(recording, tree);
-          if (!state.originals.has(nodeKey)) {
-            const record = tree._nodes.get(nodeKey);
-            state.originals.set(
-              nodeKey,
-              record === undefined || record.deleted
-                ? undefined
-                : this.#treeEventNode(tree, record),
-            );
-          }
-        }
-        const operations = history?.get(historyKey);
-        const winner = latestIncludedOperation(operations, target);
-        const existing = tree._nodes.get(nodeKey);
-        if (winner === undefined) {
-          // As for maps, a shallow root state keeps the placement whose op was
-          // trimmed from the retained history.
-          const rootNode = this.#shallowRootTreeNode(tree, nodeKey);
-          if (rootNode === undefined) {
-            if (existing !== undefined) tree._removeRecord(existing);
-          } else if (existing === undefined) {
-            tree._setRecord({
-              ...rootNode,
-              position: rootNode.position.slice(),
-              data: this.#getOrCreateContainer(
-                { kind: "normal", ...rootNode.id, containerType: CodecContainerType.Map },
-                tree,
-              ) as LoroMap,
-            });
-          } else if (rootNode.deleted) {
-            tree._deleteRecord(existing, rootNode.writer, rootNode.lastMoveId);
-          } else {
-            tree._updateRecord(
-              existing,
-              rootNode.parent,
-              rootNode.position.slice(),
-              rootNode.writer,
-              rootNode.lastMoveId,
-            );
-          }
-          continue;
-        }
-        const winnerContent = winner.operation.content;
-        const placement =
-          winnerContent.type === "tree-create" || winnerContent.type === "tree-move"
-            ? winner
-            : latestIncludedTreePlacement(operations, target, winner.writer);
-        if (placement === undefined) {
-          // A retained delete whose placement was trimmed from a shallow history.
-          const rootNode = this.#shallowRootTreeNode(tree, nodeKey);
-          if (rootNode === undefined || winnerContent.type !== "tree-delete") continue;
-          const deleteId = {
-            peer: winner.record.change.id.peer,
-            counter: winner.operation.counter,
-          };
-          if (existing === undefined) {
-            tree._setRecord({
-              ...rootNode,
-              position: rootNode.position.slice(),
-              deleted: true,
-              writer: winner.writer,
-              lastMoveId: deleteId,
-              data: this.#getOrCreateContainer(
-                { kind: "normal", ...rootNode.id, containerType: CodecContainerType.Map },
-                tree,
-              ) as LoroMap,
-            });
-          } else {
-            tree._updateRecord(
-              existing,
-              rootNode.parent,
-              rootNode.position.slice(),
-              rootNode.writer,
-              rootNode.lastMoveId,
-            );
-            tree._deleteRecord(existing, winner.writer, deleteId);
-          }
-          continue;
-        }
-        const placementContent = placement.operation.content;
-        if (
-          placementContent.type !== "tree-create" &&
-          placementContent.type !== "tree-move"
-        ) {
-          continue;
-        }
-        let record = tree._nodes.get(nodeKey);
-        const lastMoveId = {
-          peer: placement.record.change.id.peer,
-          counter: placement.operation.counter,
-        };
-        if (record === undefined) {
-          const data = this.#getOrCreateContainer(
-            {
-              kind: "normal",
-              ...placementContent.subject,
-              containerType: CodecContainerType.Map,
-            },
-            tree,
-          ) as LoroMap;
-          record = {
-            id: placementContent.subject,
-            parent: placementContent.parent,
-            position: placementContent.position.slice(),
-            deleted: false,
-            writer: placement.writer,
-            lastMoveId,
-            data,
-          };
-          tree._setRecord(record);
-        } else {
-          tree._updateRecord(
-            record,
-            placementContent.parent,
-            placementContent.position.slice(),
-            placement.writer,
-            lastMoveId,
-          );
-        }
-        if (winnerContent.type === "tree-delete") {
-          tree._deleteRecord(record, winner.writer, {
-            peer: winner.record.change.id.peer,
-            counter: winner.operation.counter,
-          });
-        }
-      }
+      const moves = tree._moves;
+      if (moves === undefined) throw new Error("tree move history was not prepared");
+      const changed = new Set<string>([...subjects.values()].map(formatTreeId));
+      for (const key of moves.transition(target)) changed.add(key);
+      this.#installTreeMoves(tree, changed, recording);
     }
 
     for (const [counter, adjustment] of counters) {
@@ -6441,6 +6242,121 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     });
   }
 
+  /** Reconstruct a hydrated tree's effective move history at `current`. */
+  #ensureTreeMoves(tree: LoroTree, current: VersionVector): TreeMoves {
+    if (tree._moves !== undefined) return tree._moves;
+    this._ensureContainerHydrated(tree);
+    const seed: Omit<TreeNodeRecord, "data">[] = [];
+    const root = this.#shallowRootContainerState(tree.id);
+    if (root?.kind === CodecContainerType.Tree) {
+      for (const node of root.nodes) {
+        const id = { peer: root.peers[Number(node.peerIndex)]!, counter: node.counter };
+        seed.push(this.#shallowRootTreeNode(tree, formatTreeId(id))!);
+      }
+    }
+    const moves = new TreeMoves(seed);
+    for (const { change } of this.#containerHistoryRecords(tree.id)) {
+      for (const operation of change.operations) {
+        const content = operation.content;
+        if (
+          this.#containerKey(operation.container) === tree.id &&
+          (content.type === "tree-create" ||
+            content.type === "tree-move" ||
+            content.type === "tree-delete") &&
+          operation.counter >= (this.#shallowRootVersion.get(change.id.peer) ?? 0)
+        ) {
+          moves.register(
+            content,
+            { peer: change.id.peer, counter: operation.counter },
+            operationWriter(change, operation),
+          );
+        }
+      }
+    }
+    moves.transition(current);
+    tree._moves = moves;
+    return moves;
+  }
+
+  #prepareTreeMoves(records: readonly HistoryRecord[], current: VersionVector): void {
+    const prepared = new Set<LoroTree>();
+    for (const { change } of records) {
+      for (const operation of change.operations) {
+        const content = operation.content;
+        if (
+          content.type !== "tree-create" &&
+          content.type !== "tree-move" &&
+          content.type !== "tree-delete"
+        )
+          continue;
+        const tree = this.#getOrCreateContainer(operation.container) as LoroTree;
+        if (!prepared.has(tree)) {
+          prepared.add(tree);
+          // Registrations are derived from history. A failed import must not
+          // leave cached entries whose IDs a later valid import can reuse.
+          this.#importUndo?.push(() => {
+            tree._moves = undefined;
+          });
+        }
+        this.#ensureTreeMoves(tree, current).register(
+          content,
+          { peer: change.id.peer, counter: operation.counter },
+          operationWriter(change, operation),
+        );
+      }
+    }
+  }
+
+  #installTreeMoves(
+    tree: LoroTree,
+    changed: ReadonlySet<string>,
+    recording?: EventRecording,
+  ): void {
+    const originals =
+      recording === undefined
+        ? undefined
+        : this.#treeEventState(recording, tree).originals;
+    // Capture every old sibling index before writing any new placements.
+    for (const key of changed) {
+      const record = tree._nodes.get(key);
+      if (originals !== undefined && !originals.has(key as TreeID)) {
+        originals.set(
+          key as TreeID,
+          record === undefined || record.deleted
+            ? undefined
+            : this.#treeEventNode(tree, record),
+        );
+      }
+    }
+    for (const key of changed) {
+      const next = tree._moves!.nodes.get(key);
+      const previous = tree._nodes.get(key);
+      if (next === undefined) {
+        if (previous !== undefined) tree._removeRecord(previous);
+      } else if (previous === undefined) {
+        tree._setRecord({
+          ...next,
+          data: this.#getOrCreateContainer(
+            { kind: "normal", ...next.id, containerType: CodecContainerType.Map },
+            tree,
+          ) as LoroMap,
+        });
+      } else if (
+        !idsEqual(previous.lastMoveId, next.lastMoveId) ||
+        previous.deleted !== next.deleted
+      ) {
+        tree._updateRecord(
+          previous,
+          next.parent,
+          next.position,
+          next.writer,
+          next.lastMoveId,
+        );
+        if (next.deleted) tree._deleteRecord(previous, next.writer, next.lastMoveId);
+      }
+    }
+  }
+
   /**
    * Readies snapshot-hydrated containers for importing `records` on top of
    * the state at `current`. That state has no tombstones and no MovableList
@@ -6454,6 +6370,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     records: readonly HistoryRecord[],
     current: VersionVector,
   ): void {
+    this.#prepareTreeMoves(records, current);
     if (this.#snapshotSequences.size === 0 && this.#deferredSnapshotState === undefined) {
       return;
     }
@@ -6520,6 +6437,7 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     records: readonly HistoryRecord[],
     current: VersionVector,
   ): Set<string> {
+    this.#prepareTreeMoves(records, current);
     const rebuilds = new Set<string>();
     const lazy = this.#deferredSnapshotState;
     if (lazy === undefined && this.#snapshotSequences.size === 0) return rebuilds;
@@ -7065,7 +6983,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       };
       let bySubject: Map<string, IndexedSubjectHistory> | undefined;
       let subject: string | undefined;
-      let treeOperation = false;
       if (content.type === "map-insert" || content.type === "map-delete") {
         const container = this.#containerKey(operation.container);
         const histories = this.#mapOperationHistory;
@@ -7076,21 +6993,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
           undo?.push(() => histories.delete(container));
         }
         subject = content.key;
-      } else if (
-        content.type === "tree-create" ||
-        content.type === "tree-move" ||
-        content.type === "tree-delete"
-      ) {
-        const container = this.#containerKey(operation.container);
-        const histories = this.#treeOperationHistory;
-        bySubject = histories.get(container);
-        if (bySubject === undefined) {
-          bySubject = new Map();
-          histories.set(container, bySubject);
-          undo?.push(() => histories.delete(container));
-        }
-        subject = idKey(content.subject);
-        treeOperation = true;
       }
       if (bySubject === undefined || subject === undefined) continue;
       let history = bySubject.get(subject);
@@ -7100,7 +7002,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
             compareWriter(left.writer, right.writer),
           ),
           byPeer: new Map(),
-          ...(treeOperation ? { placementsByPeer: new Map() } : {}),
         };
         bySubject.set(subject, history);
         const subjects = bySubject;
@@ -7121,19 +7022,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       peerOperations.splice(peerIndex, 0, indexed);
       const operations = peerOperations;
       undo?.push(() => operations.splice(peerIndex, 1));
-      if (content.type === "tree-create" || content.type === "tree-move") {
-        const placementsByPeer = subjectHistory.placementsByPeer!;
-        let placements = placementsByPeer.get(peer);
-        if (placements === undefined) {
-          placements = [];
-          placementsByPeer.set(peer, placements);
-          undo?.push(() => placementsByPeer.delete(peer));
-        }
-        const placementIndex = lowerBoundIndexedOperation(placements, operation.counter);
-        placements.splice(placementIndex, 0, indexed);
-        const placed = placements;
-        undo?.push(() => placed.splice(placementIndex, 1));
-      }
     }
   }
 
@@ -7302,7 +7190,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
     this.#historyFrontiers = staged.#historyFrontiers;
     this.#dependencyVersionCache = staged.#dependencyVersionCache;
     this.#mapOperationHistory = staged.#mapOperationHistory;
-    this.#treeOperationHistory = staged.#treeOperationHistory;
     this.#containersWithOperations = staged.#containersWithOperations;
     this.#containerKeys = staged.#containerKeys;
     // Pending changes stay pending: their dependencies were already checked
@@ -8834,7 +8721,6 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       diff,
       path: containerPath(this.#containers.get(target)!),
     }));
-    if (events.length === 0) return;
     const base = {
       by,
       ...(origin === undefined ? {} : { origin }),
@@ -8842,6 +8728,12 @@ export class LoroDoc<T extends Record<string, Container> = Record<string, Contai
       from: from.map(formatOpId),
       to: to.map(formatOpId),
     } satisfies LoroEventBatch;
+    if (events.length === 0) {
+      if (by === "local") {
+        for (const listener of this.#localNoopCommitSubscribers) listener(base);
+      }
+      return;
+    }
     for (const listener of this.#subscribers) listener(base);
     const relevantByTarget = new Map<string, LoroEvent[]>();
     for (const event of events) {
@@ -9150,68 +9042,6 @@ function movableTransitionOp(
     default:
       throw new Error(`${content.type} is not a movable-list operation`);
   }
-}
-
-/**
- * Transforms list delta `delta` to apply after `over` (both start from the same
- * list). At an equal position `delta`'s inserts go first, like Rust's
- * `transform(.., left_priority = true)` in undo.
- */
-function transformListDelta(
-  delta: readonly Delta<unknown[]>[],
-  over: readonly Delta<unknown[]>[],
-): Delta<unknown[]>[] {
-  type Part =
-    | { readonly kind: "retain" | "delete"; length: number }
-    | { readonly kind: "insert"; values: unknown[] };
-  const parts = (items: readonly Delta<unknown[]>[]): Part[] =>
-    items.map((item) =>
-      "insert" in item
-        ? { kind: "insert", values: [...item.insert] }
-        : "delete" in item
-          ? { kind: "delete", length: item.delete }
-          : { kind: "retain", length: item.retain },
-    );
-  const left = parts(delta);
-  const right = parts(over);
-  const output: Delta<unknown[]>[] = [];
-  const push = (item: Delta<unknown[]>): void => {
-    const last = output.at(-1);
-    if (last !== undefined && "retain" in last && "retain" in item) {
-      output[output.length - 1] = { retain: last.retain + item.retain };
-    } else if (last !== undefined && "delete" in last && "delete" in item) {
-      output[output.length - 1] = { delete: last.delete + item.delete };
-    } else {
-      output.push(item);
-    }
-  };
-  while (left.length > 0 || right.length > 0) {
-    const a = left[0];
-    const b = right[0];
-    if (a?.kind === "insert") {
-      push({ insert: a.values });
-      left.shift();
-      continue;
-    }
-    if (b?.kind === "insert") {
-      push({ retain: b.values.length });
-      right.shift();
-      continue;
-    }
-    if (a === undefined) break;
-    const length = Math.min(a.length, b?.length ?? Number.POSITIVE_INFINITY);
-    if (b === undefined || b.kind === "retain") {
-      push(a.kind === "delete" ? { delete: length } : { retain: length });
-    }
-    a.length -= length;
-    if (a.length === 0) left.shift();
-    if (b !== undefined) {
-      b.length -= length;
-      if (b.length === 0) right.shift();
-    }
-  }
-  while (output.length > 0 && "retain" in output.at(-1)!) output.pop();
-  return output;
 }
 
 /** Element IDs of each MovableList in a shallow root store, built on first use. */
@@ -9806,20 +9636,6 @@ function lowerBoundIndexedOperation(
   return low;
 }
 
-function lowerBoundWriter(
-  operations: readonly IndexedHistoryOperation[],
-  writer: LastWriter,
-): number {
-  let low = 0;
-  let high = operations.length;
-  while (low < high) {
-    const middle = (low + high) >>> 1;
-    if (compareWriter(operations[middle]!.writer, writer) < 0) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
 interface ShallowRootIndex {
   readonly maps: Map<
     string,
@@ -9839,30 +9655,6 @@ function latestIncludedOperation(
   let latest: IndexedHistoryOperation | undefined;
   for (const [peer, operations] of history.byPeer) {
     const index = lowerBoundIndexedOperation(operations, version.get(peer) ?? 0) - 1;
-    const operation = operations[index];
-    if (
-      operation !== undefined &&
-      (latest === undefined || compareWriter(latest.writer, operation.writer) < 0)
-    ) {
-      latest = operation;
-    }
-  }
-  return latest;
-}
-
-function latestIncludedTreePlacement(
-  history: IndexedSubjectHistory | undefined,
-  version: VersionVector,
-  before: LastWriter,
-): IndexedHistoryOperation | undefined {
-  if (history?.placementsByPeer === undefined) return undefined;
-  let latest: IndexedHistoryOperation | undefined;
-  for (const [peer, operations] of history.placementsByPeer) {
-    const index =
-      Math.min(
-        lowerBoundIndexedOperation(operations, version.get(peer) ?? 0),
-        lowerBoundWriter(operations, before),
-      ) - 1;
     const operation = operations[index];
     if (
       operation !== undefined &&
@@ -10568,7 +10360,6 @@ function unicodeScalarLength(value: string): number {
 
 /** Rust's `FractionalIndex::default()`, encoded for nodes under the deleted root. */
 const DEFAULT_TREE_POSITION = new Uint8Array([0x80]);
-const EMPTY_BYTES = new Uint8Array();
 
 function compareWriter(left: LastWriter, right: LastWriter): number {
   return (
