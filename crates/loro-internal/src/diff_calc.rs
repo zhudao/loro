@@ -1,4 +1,4 @@
-use std::{num::NonZeroU16, sync::Arc};
+use std::{num::NonZeroU32, sync::Arc};
 
 #[cfg(feature = "counter")]
 mod counter;
@@ -62,7 +62,7 @@ pub struct DiffCalculator {
     /// ContainerIdx -> (depth, calculator)
     ///
     /// if depth is None, we need to calculate it again
-    calculators: FxHashMap<ContainerIdx, (Option<NonZeroU16>, ContainerDiffCalculator)>,
+    calculators: FxHashMap<ContainerIdx, (Option<NonZeroU32>, ContainerDiffCalculator)>,
     retain_mode: DiffCalculatorRetainMode,
 }
 
@@ -118,7 +118,7 @@ pub(crate) struct DiffCalcVersionInfo<'a> {
     replay_base_vv: &'a VersionVector,
     /// The replay base is a critical version of `ancestry(from) ∪ ancestry(to)`:
     /// nothing above it is concurrent with anything below it. See
-    /// `OpLog::iter_from_replay_base_causally`.
+    /// `OpLog::try_iter_from_replay_base_causally`.
     replay_base_is_critical: bool,
 }
 
@@ -368,7 +368,7 @@ impl DiffCalculator {
         // we need to iterate from parents to children. i.e. from smaller depth to larger depth.
         let mut new_containers = FxHashSet::default();
         let mut container_id_to_depth = FxHashMap::default();
-        let mut all: Vec<(Option<NonZeroU16>, ContainerIdx)> = if let Some(set) = affected_set {
+        let mut all: Vec<(Option<NonZeroU32>, ContainerIdx)> = if let Some(set) = affected_set {
             // only visit the affected containers
             set.into_iter()
                 .map(|x| {
@@ -471,8 +471,8 @@ impl DiffCalculator {
     pub(crate) fn get_or_create_calc(
         &mut self,
         idx: ContainerIdx,
-        depth: Option<NonZeroU16>,
-    ) -> &mut (Option<NonZeroU16>, ContainerDiffCalculator) {
+        depth: Option<NonZeroU32>,
+    ) -> &mut (Option<NonZeroU32>, ContainerDiffCalculator) {
         self.calculators
             .entry(idx)
             .or_insert_with(|| match idx.get_type() {
@@ -596,8 +596,13 @@ fn replay_container_ops_from_empty(
     let empty_vv = VersionVector::default();
     let empty_frontiers = Frontiers::default();
     let target_frontiers = oplog.dag.vv_to_frontiers(vv);
-    let (_, iter) =
-        oplog.iter_from_replay_base_causally(&empty_vv, &empty_frontiers, vv, &target_frontiers);
+    let (_, iter) = oplog.iter_from_replay_base_causally_filtered(
+        &empty_vv,
+        &empty_frontiers,
+        vv,
+        &target_frontiers,
+        Some(idx),
+    );
 
     for (change, (start_counter, end_counter), vv) in iter {
         let iter_start = change
