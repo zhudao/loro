@@ -25,10 +25,13 @@ over graceful degradation.
   or op/value encoding.
 - `src/oplog/` and `src/dag/`: change storage, dependency ordering, pending
   changes, version vectors/frontiers, shallow roots, and history traversal.
+  Frontiers and version vectors from callers:
+  [../../context/version-input-contract.md](../../context/version-input-contract.md).
   `ChangeStore` is also read without the op log lock, so keep its lock order:
   [../../context/arena-parent-links.md](../../context/arena-parent-links.md).
-- Retained memory by component, what forces a full history parse, and why
-  `mem_parsed_kv` has no release path:
+- Retained memory by component, what forces a full history parse, why
+  `mem_parsed_kv` has no release path, and why replay callers must pass a `from`
+  that is exactly the vv of `from_frontiers`:
   [../../context/memory-analysis.md](../../context/memory-analysis.md).
 - `src/arena.rs`: container IDs, indices, and parent links. How a parent is
   found in a lazily loaded document, and the locking rules:
@@ -76,8 +79,9 @@ over graceful degradation.
 - Imported changes that reuse local op ids are checked against local history
   before anything is applied (`src/oplog/known_history.rs`):
   [../../context/import-peer-id-reuse.md](../../context/import-peer-id-reuse.md).
-- `import_batch` force-detach, its batch-wide rollback scope, and the
-  never-exit-detached invariant:
+- `import_batch` force-detach, its batch-wide rollback scope, the
+  never-exit-detached invariant, partial success, and `import_batch_detailed`
+  (both run `import_blobs_as_batch`):
   [../../context/import-batch-atomicity.md](../../context/import-batch-atomicity.md).
 
 ## Commands

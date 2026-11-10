@@ -264,6 +264,84 @@ pub const START_FRONTIERS_KEY: &[u8] = b"sf";
 pub const VV_KEY: &[u8] = b"vv";
 pub const FRONTIERS_KEY: &[u8] = b"fr";
 
+/// DAG nodes read from a change block without writing the store.
+///
+/// Debug checks use this so a truncated snapshot does not panic, cache a block, or record a
+/// parse failure ahead of the fallible read that reports the error.
+#[cfg(debug_assertions)]
+pub(crate) enum DebugHeaderNodes {
+    Found(Vec<AppDagNode>),
+    /// No loaded or stored block holds this id.
+    Missing,
+    /// The bytes are truncated or corrupt, or a lock could not be taken.
+    Unreadable,
+}
+
+#[cfg(debug_assertions)]
+fn debug_dag_nodes_from_changes(changes: &[Change]) -> Vec<AppDagNode> {
+    let mut dag_nodes = Vec::new();
+    for change in changes {
+        let new_node = AppDagNodeInner {
+            peer: change.id.peer,
+            cnt: change.id.counter,
+            lamport: change.lamport,
+            deps: change.deps.clone(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: change.atom_len(),
+        }
+        .into();
+        dag_nodes.push_rle_element(new_node);
+    }
+    dag_nodes
+}
+
+#[cfg(debug_assertions)]
+fn debug_dag_nodes_from_header(header: &ChangesBlockHeader) -> Result<Vec<AppDagNode>, ()> {
+    let mut dag_nodes = Vec::new();
+    for i in 0..header.n_changes {
+        let (Some(&start), Some(&end)) = (header.counters.get(i), header.counters.get(i + 1))
+        else {
+            return Err(());
+        };
+        let Some(len) = end.checked_sub(start).filter(|len| *len >= 0) else {
+            return Err(());
+        };
+        let (Some(&lamport), Some(deps)) = (header.lamports.get(i), header.deps_groups.get(i))
+        else {
+            return Err(());
+        };
+        let new_node = AppDagNodeInner {
+            peer: header.peer,
+            cnt: start,
+            lamport,
+            deps: deps.clone(),
+            vv: OnceCell::new(),
+            has_succ: false,
+            len: len as usize,
+        }
+        .into();
+        dag_nodes.push_rle_element(new_node);
+    }
+    Ok(dag_nodes)
+}
+
+#[cfg(debug_assertions)]
+fn debug_dag_nodes_of_block(block: &ChangesBlock) -> DebugHeaderNodes {
+    match &block.content {
+        ChangesBlockContent::Changes(changes) | ChangesBlockContent::Both(changes, _) => {
+            DebugHeaderNodes::Found(debug_dag_nodes_from_changes(changes))
+        }
+        ChangesBlockContent::Bytes(bytes) => match decode_header(&bytes.bytes) {
+            Ok(header) => match debug_dag_nodes_from_header(&header) {
+                Ok(nodes) => DebugHeaderNodes::Found(nodes),
+                Err(()) => DebugHeaderNodes::Unreadable,
+            },
+            Err(_) => DebugHeaderNodes::Unreadable,
+        },
+    }
+}
+
 impl ChangeStore {
     pub fn new_mem(a: &SharedArena, merge_interval: Arc<AtomicI64>) -> Self {
         Self {
@@ -310,12 +388,9 @@ impl ChangeStore {
             // PERF: this can be optimized by reusing the current encoded blocks
             // In the current method, it needs to parse and re-encode the blocks
             for c in self.iter_changes(span) {
-                let start = ((start_vv.get(&c.id.peer).copied().unwrap_or(0) - c.id.counter).max(0)
-                    as usize)
-                    .min(c.atom_len());
-                let end = ((latest_vv.get(&c.id.peer).copied().unwrap_or(0) - c.id.counter).max(0)
-                    as usize)
-                    .min(c.atom_len());
+                // From `span`, not `start_vv`: a caller's counter can be negative.
+                let start = ((span.counter.start - c.id.counter).max(0) as usize).min(c.atom_len());
+                let end = ((span.counter.end - c.id.counter).max(0) as usize).min(c.atom_len());
 
                 if start == end {
                     continue;
@@ -709,6 +784,65 @@ impl ChangeStore {
     pub fn get_last_dag_nodes_for_peer(&self, peer: PeerID) -> Option<Vec<AppDagNode>> {
         let block = self.get_the_last_block_of_peer(peer)?;
         Some(block.content.iter_dag_nodes())
+    }
+
+    /// Nodes for `id` from a cached block or the KV bytes. Does not insert blocks, parse
+    /// bodies, or record parse failures. A lock that cannot be taken is [`DebugHeaderNodes::Unreadable`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_read_dag_nodes(&self, id: ID) -> DebugHeaderNodes {
+        let cached = {
+            let Some(inner) = self.inner.try_lock() else {
+                return DebugHeaderNodes::Unreadable;
+            };
+            if inner.retired {
+                return DebugHeaderNodes::Missing;
+            }
+            inner
+                .mem_parsed_kv
+                .range(..=id)
+                .next_back()
+                .filter(|(_, block)| {
+                    block.peer == id.peer
+                        && block.counter_range.0 <= id.counter
+                        && id.counter < block.counter_range.1
+                })
+                .map(|(_, block)| block.clone())
+        };
+        if let Some(block) = cached {
+            return debug_dag_nodes_of_block(&block);
+        }
+
+        let Some(kv) = self.external_kv.try_lock() else {
+            return DebugHeaderNodes::Unreadable;
+        };
+        let id_bytes = id.to_bytes();
+        let Some((key, bytes)) = kv
+            .scan(Bound::Unbounded, Bound::Included(id_bytes.as_slice()))
+            .rfind(|(key, _)| key.len() == 12)
+        else {
+            return DebugHeaderNodes::Missing;
+        };
+        let block_id = ID::from_bytes(&key);
+        if block_id.peer != id.peer {
+            return DebugHeaderNodes::Missing;
+        }
+        let header = match decode_header(&bytes) {
+            Ok(header) => header,
+            Err(_) => return DebugHeaderNodes::Unreadable,
+        };
+        if header.peer != block_id.peer {
+            return DebugHeaderNodes::Unreadable;
+        }
+        let Some(&end) = header.counters.last() else {
+            return DebugHeaderNodes::Unreadable;
+        };
+        if id.counter < header.counter || id.counter >= end {
+            return DebugHeaderNodes::Missing;
+        }
+        match debug_dag_nodes_from_header(&header) {
+            Ok(nodes) => DebugHeaderNodes::Found(nodes),
+            Err(()) => DebugHeaderNodes::Unreadable,
+        }
     }
 
     /// Whether diff calculation may still encounter an unvalidated snapshot body.
@@ -1107,12 +1241,9 @@ impl ChangeStore {
                 return;
             };
             for c in changes {
-                let start = ((start_vv.get(&c.id.peer).copied().unwrap_or(0) - c.id.counter).max(0)
-                    as usize)
-                    .min(c.atom_len());
-                let end = ((latest_vv.get(&c.id.peer).copied().unwrap_or(0) - c.id.counter).max(0)
-                    as usize)
-                    .min(c.atom_len());
+                // From `span`, not `start_vv`: a caller's counter can be negative.
+                let start = ((span.counter.start - c.id.counter).max(0) as usize).min(c.atom_len());
+                let end = ((span.counter.end - c.id.counter).max(0) as usize).min(c.atom_len());
 
                 assert_ne!(start, end);
                 let ch = c.slice(start, end);
@@ -1411,7 +1542,8 @@ mod mut_inner_kv {
         pub fn get_change(&self, id: ID) -> Option<BlockChangeRef> {
             let block = self.get_parsed_block(id)?;
             Some(BlockChangeRef {
-                change_index: block.get_change_index_by_counter(id.counter).unwrap(),
+                // A caller's id can be below the block that was found for it.
+                change_index: block.get_change_index_by_counter(id.counter).ok()?,
                 block: block.clone(),
             })
         }

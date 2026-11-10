@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tracing::instrument;
 
 use super::change_store::BatchDecodeInfo;
+#[cfg(debug_assertions)]
+use super::change_store::DebugHeaderNodes;
 use super::ChangeStore;
 
 /// [AppDag] maintains the causal graph of the app.
@@ -599,7 +601,8 @@ impl AppDag {
     }
 
     fn ensure_lazy_load_node(&self, id: ID) -> LoroResult<()> {
-        if self.shallow_since_vv.includes_id(id) {
+        // A negative counter is below every node, however much of the peer is loaded.
+        if id.counter < 0 || self.shallow_since_vv.includes_id(id) {
             return Ok(());
         }
 
@@ -1123,6 +1126,16 @@ impl Dag for AppDag {
     }
 }
 
+/// A vv already stored on parsed nodes, or why that read cannot answer.
+#[cfg(debug_assertions)]
+enum ResidentVv {
+    Ready(VersionVector),
+    /// The id is not parsed, or its vv has not been filled in yet.
+    NotCached,
+    /// The node map could not be locked.
+    Unavailable,
+}
+
 impl AppDag {
     // PERF: this may be painfully slow
     /// get the version vector for a certain op.
@@ -1133,6 +1146,28 @@ impl AppDag {
             vv.insert(id.peer, id.counter + 1);
             vv
         })
+    }
+
+    /// Give `node` a version vector the caller already knows, the vv of `node.deps`, so that
+    /// resolving it does not walk to the root on a lazily loaded DAG.
+    ///
+    /// A dep with a cached vv is left to [`Self::try_ensure_vv_for`]: one step from there shares
+    /// structure with that vv, while `from_vv` builds a whole new map.
+    pub(crate) fn seed_vv_of_deps(
+        &self,
+        node: &AppDagNode,
+        deps_vv: &VersionVector,
+    ) -> LoroResult<()> {
+        if node.vv.get().is_some() {
+            return Ok(());
+        }
+        for dep in node.deps.iter() {
+            if self.try_get(dep)?.is_some_and(|d| d.vv.get().is_some()) {
+                return Ok(());
+            }
+        }
+        let _ = node.vv.set(ImVersionVector::from_vv(deps_vv));
+        Ok(())
     }
 
     pub(crate) fn ensure_vv_for(&self, target_node: &AppDagNode) -> ImVersionVector {
@@ -1287,6 +1322,178 @@ impl AppDag {
         Ok(Some(vv))
     }
 
+    /// The vv of `frontiers`, without inserting DAG nodes or caching blocks.
+    ///
+    /// [`Self::try_frontiers_to_vv`] loads every ancestor into the parsed map. Debug checks
+    /// that run on a cold import must not do that: the lazy-history tests count those nodes.
+    /// Block headers already carry deps, so the same walk reads them without writing the
+    /// store. A vv already cached on a resident node is reused.
+    ///
+    /// `None` means the check cannot be done. A header was truncated or corrupt, the id is
+    /// not loaded, or a lock could not be taken. That is not an invariant failure; the
+    /// caller's real read returns the error.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_vv_of_frontiers(&self, frontiers: &Frontiers) -> Option<VersionVector> {
+        if frontiers == &self.shallow_root_frontiers_deps {
+            return Some(VersionVector::from_im_vv(&self.shallow_since_vv));
+        }
+        if frontiers.is_empty() {
+            return Some(VersionVector::default());
+        }
+        if frontiers == &self.frontiers {
+            return Some(self.vv.clone());
+        }
+        match self.debug_vv_from_resident_nodes(frontiers) {
+            ResidentVv::Ready(vv) => return Some(vv),
+            ResidentVv::Unavailable => return None,
+            ResidentVv::NotCached => {}
+        }
+        self.debug_vv_from_block_headers(frontiers)
+    }
+
+    /// Compose a vv from nodes already in the map. Does not load anything.
+    #[cfg(debug_assertions)]
+    fn debug_vv_from_resident_nodes(&self, frontiers: &Frontiers) -> ResidentVv {
+        let Some(map) = self.map.try_lock() else {
+            return ResidentVv::Unavailable;
+        };
+        let mut vv = VersionVector::default();
+        for id in frontiers.iter() {
+            let node = if let Some((_, node)) = map.range(..=id).next_back() {
+                if node.contains_id(id) {
+                    node.clone()
+                } else {
+                    return ResidentVv::NotCached;
+                }
+            } else if self
+                .pending_txn_node
+                .as_ref()
+                .is_some_and(|node| node.contains_id(id))
+            {
+                self.pending_txn_node.clone().unwrap()
+            } else {
+                return ResidentVv::NotCached;
+            };
+            let Some(node_vv) = node.vv.get() else {
+                return ResidentVv::NotCached;
+            };
+            vv.extend_to_include_vv(node_vv.iter());
+            vv.extend_to_include_last_id(id);
+        }
+        ResidentVv::Ready(vv)
+    }
+
+    /// Walk deps recorded in change-block headers. Does not cache blocks or DAG nodes.
+    ///
+    /// `None` when a header cannot be read or an id is not in the store. The caller skips
+    /// the check instead of panicking.
+    #[cfg(debug_assertions)]
+    fn debug_vv_from_block_headers(&self, frontiers: &Frontiers) -> Option<VersionVector> {
+        let mut nodes: BTreeMap<ID, AppDagNode> = BTreeMap::new();
+        let mut load = |id: ID| -> Option<AppDagNode> {
+            if let Some((_, node)) = nodes.range(..=id).next_back() {
+                if node.contains_id(id) {
+                    return Some(node.clone());
+                }
+            }
+            if let Some(pending) = &self.pending_txn_node {
+                if pending.contains_id(id) {
+                    nodes.insert(pending.id_start(), pending.clone());
+                    return Some(pending.clone());
+                }
+            }
+            let found = match self.change_store.debug_read_dag_nodes(id) {
+                DebugHeaderNodes::Found(found) => found,
+                DebugHeaderNodes::Missing | DebugHeaderNodes::Unreadable => return None,
+            };
+            let mut hit = None;
+            for node in found {
+                if node.contains_id(id) {
+                    hit = Some(node.clone());
+                }
+                nodes.insert(node.id_start(), node);
+            }
+            hit
+        };
+
+        let mut memo: BTreeMap<ID, ImVersionVector> = BTreeMap::new();
+        let mut stack: Vec<AppDagNode> = Vec::new();
+        for id in frontiers.iter() {
+            stack.push(load(id)?);
+        }
+        let mut steps = 0usize;
+        while let Some(top) = stack.pop() {
+            steps += 1;
+            if steps > 1_000_000 {
+                return None;
+            }
+            let key = top.id_start();
+            if memo.contains_key(&key) || top.vv.get().is_some() {
+                continue;
+            }
+            if top.deps == self.shallow_root_frontiers_deps {
+                let mut ans = ImVersionVector::default();
+                for (&peer, &counter) in self.shallow_since_vv.iter() {
+                    ans.insert(peer, counter);
+                }
+                memo.insert(key, ans);
+                continue;
+            }
+
+            let mut missing = Vec::new();
+            for dep in top.deps.iter() {
+                if self.shallow_since_vv.includes_id(dep) {
+                    continue;
+                }
+                let dep_node = load(dep)?;
+                if dep_node.vv.get().is_none() && !memo.contains_key(&dep_node.id_start()) {
+                    missing.push(dep_node);
+                }
+            }
+            if !missing.is_empty() {
+                stack.push(top);
+                stack.extend(missing);
+                continue;
+            }
+
+            let mut ans = ImVersionVector::default();
+            for dep in top.deps.iter() {
+                if self.shallow_since_vv.includes_id(dep) {
+                    ans.extend_to_include_vv(self.shallow_since_vv.iter());
+                    continue;
+                }
+                let dep_node = load(dep)?;
+                let dep_vv = if let Some(vv) = dep_node.vv.get() {
+                    vv.clone()
+                } else {
+                    memo.get(&dep_node.id_start())?.clone()
+                };
+                if ans.is_empty() {
+                    ans = dep_vv;
+                } else {
+                    ans.extend_to_include_vv(dep_vv.iter());
+                }
+                // Block headers are whole changes, and a dep can point into the
+                // middle of one. Include up to that id, not the change's end.
+                ans.extend_to_include_last_id(dep);
+            }
+            memo.insert(key, ans);
+        }
+
+        let mut vv = VersionVector::default();
+        for id in frontiers.iter() {
+            let node = load(id)?;
+            let node_vv = if let Some(cached) = node.vv.get() {
+                cached.clone()
+            } else {
+                memo.get(&node.id_start())?.clone()
+            };
+            vv.extend_to_include_vv(node_vv.iter());
+            vv.extend_to_include_last_id(id);
+        }
+        Some(vv)
+    }
+
     #[allow(unused)]
     pub(crate) fn frontiers_to_im_vv(&self, frontiers: &Frontiers) -> ImVersionVector {
         if frontiers.is_empty() {
@@ -1347,8 +1554,15 @@ impl AppDag {
         shrink_frontiers(&last_ids, self).unwrap()
     }
 
+    /// [`Self::try_vv_to_frontiers`] for a caller that cannot report an absent id:
+    /// ids outside this history cannot be minimized, so the last id of every peer
+    /// is returned as it is. Using such frontiers reports `FrontiersNotFound`.
     pub fn vv_to_frontiers(&self, vv: &VersionVector) -> Frontiers {
-        self.try_vv_to_frontiers(vv).unwrap()
+        match self.try_vv_to_frontiers(vv) {
+            Ok(frontiers) => frontiers,
+            Err(LoroError::FrontiersNotFound(_)) => self.last_ids_of_vv(vv),
+            Err(err) => panic!("{err}"),
+        }
     }
 
     pub fn try_vv_to_frontiers(&self, vv: &VersionVector) -> LoroResult<Frontiers> {
@@ -1360,9 +1574,16 @@ impl AppDag {
             return Ok(Default::default());
         }
 
-        let this = vv;
-        let last_ids: Frontiers = this
-            .iter()
+        let last_ids = self.last_ids_of_vv(vv);
+        if last_ids.is_empty() {
+            return Ok(self.shallow_since_frontiers.clone());
+        }
+
+        crate::version::try_shrink_frontiers(&last_ids, self)
+    }
+
+    fn last_ids_of_vv(&self, vv: &VersionVector) -> Frontiers {
+        vv.iter()
             .filter_map(|(client_id, cnt)| {
                 if *cnt <= 0 {
                     return None;
@@ -1377,13 +1598,7 @@ impl AppDag {
 
                 Some(ID::new(*client_id, cnt - 1))
             })
-            .collect();
-
-        if last_ids.is_empty() {
-            return Ok(self.shallow_since_frontiers.clone());
-        }
-
-        crate::version::try_shrink_frontiers(&last_ids, self)
+            .collect()
     }
 
     pub(crate) fn frontiers_to_next_lamport(&self, frontiers: &Frontiers) -> Lamport {
