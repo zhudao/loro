@@ -6,6 +6,7 @@ use generic_btree::{
 };
 use loro_common::{Counter, HasId, HasIdSpan, IdFull, IdSpan, Lamport, PeerID, ID};
 use rle::HasLength as _;
+use rustc_hash::FxHashSet;
 use tracing::instrument;
 
 use crate::{cursor::AbsolutePosition, VersionVector};
@@ -33,6 +34,8 @@ pub(crate) struct Tracker {
     current_vv: VersionVector,
     rope: CrdtRope,
     id_to_cursor: IdToCursor,
+    /// Whether a delete or a move removed part of an `UNKNOWN_PEER_ID` span.
+    deleted_unknown: bool,
 }
 
 impl Default for Tracker {
@@ -49,6 +52,7 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            deleted_unknown: false,
         };
 
         let result = this.rope.tree.push(FugueSpan {
@@ -78,6 +82,7 @@ impl Tracker {
             id_to_cursor: IdToCursor::default(),
             applied_vv: Default::default(),
             current_vv: Default::default(),
+            deleted_unknown: false,
         }
     }
 
@@ -89,6 +94,13 @@ impl Tracker {
     #[inline]
     pub fn current_vv(&self) -> &VersionVector {
         &self.current_vv
+    }
+
+    /// While false, no diff of this tracker, retreats included, inserts an
+    /// `Unknown` chunk.
+    #[inline]
+    pub(crate) fn has_deleted_unknown(&self) -> bool {
+        self.deleted_unknown
     }
 
     pub(crate) fn insert(&mut self, op_id: IdFull, pos: usize, content: RichtextChunk) {
@@ -186,7 +198,12 @@ impl Tracker {
             }
             _ => {
                 let mut updates = Vec::with_capacity(split.len());
+                let mut seen = FxHashSet::default();
                 for &new_leaf_idx in split {
+                    // The rope reports a leaf once per update that touched it; updating it once is enough.
+                    if !seen.insert(new_leaf_idx) {
+                        continue;
+                    }
                     let leaf = self.rope.tree().get_elem(new_leaf_idx).unwrap();
                     updates.push((leaf.id_span(), new_leaf_idx));
                 }
@@ -239,15 +256,19 @@ impl Tracker {
 
     fn _delete(&mut self, target_start_id: ID, pos: usize, len: usize, reverse: bool, op_id: ID) {
         let mut ans = Vec::new();
+        let mut deleted_unknown = false;
         let split = self
             .rope
             .delete(target_start_id, pos, len, reverse, &mut |span| {
+                deleted_unknown |= span.id.peer == UNKNOWN_PEER_ID;
                 let mut id_span = span.id_span();
                 if reverse {
                     id_span.reverse();
                 }
                 ans.push(id_span);
             });
+
+        self.deleted_unknown |= deleted_unknown;
 
         let mut cur_id = op_id;
         for id_span in ans {
@@ -324,6 +345,8 @@ impl Tracker {
             debug_assert_eq!(s.rle_len(), 1);
             fake_delete_id = Some(s.id.id());
         });
+
+        self.deleted_unknown |= fake_delete_id.is_some_and(|id| id.peer == UNKNOWN_PEER_ID);
 
         for s in split {
             self.update_insert_by_split(&s.arr);

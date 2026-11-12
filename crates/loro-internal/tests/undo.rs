@@ -55,6 +55,54 @@ fn consecutive_noops_consume_one_item_and_notify_once() {
 }
 
 #[test]
+fn top_span_identifies_the_pushed_item_at_the_stack_limit() {
+    use std::sync::{Arc, Mutex};
+
+    use loro_internal::{undo::UndoOrRedo, CounterSpan};
+
+    let doc = LoroDoc::new_auto_commit();
+    doc.set_peer_id(1).unwrap();
+    let undo = UndoManager::new(&doc);
+    undo.set_merge_interval(0);
+    undo.set_max_undo_steps(3);
+    let pushed = Arc::new(Mutex::new(Vec::<(UndoOrRedo, CounterSpan)>::new()));
+    let record = pushed.clone();
+    undo.set_on_push(Some(Box::new(move |kind, span, _| {
+        record.lock().unwrap().push((kind, span));
+        Default::default()
+    })));
+    let last_pushed = || *pushed.lock().unwrap().last().unwrap();
+
+    let text = doc.get_text("text");
+    for i in 0..10 {
+        text.insert(i, "x", PosType::Unicode).unwrap();
+        doc.commit_then_renew();
+        let (kind, span) = last_pushed();
+        assert!(matches!(kind, UndoOrRedo::Undo));
+        assert_eq!(undo.top_undo_span(), Some(span));
+    }
+    assert_eq!(undo.undo_count(), 3);
+
+    assert!(undo.undo().unwrap());
+    let (kind, span) = last_pushed();
+    assert!(matches!(kind, UndoOrRedo::Redo));
+    assert_eq!(undo.top_redo_span(), Some(span));
+
+    undo.set_merge_interval(i64::MAX);
+    text.insert(0, "a", PosType::Unicode).unwrap();
+    doc.commit_then_renew();
+    let (_, first) = last_pushed();
+    text.insert(0, "b", PosType::Unicode).unwrap();
+    doc.commit_then_renew();
+    let (_, merged) = last_pushed();
+    assert_eq!(
+        undo.top_undo_span(),
+        Some(CounterSpan::new(first.start, merged.end)),
+        "a merged push extends the previous item"
+    );
+}
+
+#[test]
 fn test_basic_undo_group_checkpoint() {
     let doc = LoroDoc::new();
     let undo_manager = UndoManager::new(&doc);
@@ -80,6 +128,33 @@ fn test_basic_undo_group_checkpoint() {
         "12",
         "redo should redo the grouped updates"
     );
+}
+
+#[test]
+fn test_undo_group_survives_peer_id_change() {
+    let doc = LoroDoc::new();
+    doc.set_peer_id(1).unwrap();
+    let text = doc.get_text("text");
+    text.update("x", UpdateOptions::default()).unwrap();
+    doc.commit_then_renew();
+
+    let undo_manager = UndoManager::new(&doc);
+    undo_manager.set_merge_interval(0);
+    undo_manager.group_start().unwrap();
+    doc.set_peer_id(2).unwrap();
+    text.update("xa", UpdateOptions::default()).unwrap();
+    doc.commit_then_renew();
+    text.update("xab", UpdateOptions::default()).unwrap();
+    doc.commit_then_renew();
+    undo_manager.group_end();
+
+    undo_manager.undo().unwrap();
+    assert_eq!(
+        text.to_string(),
+        "x",
+        "undo should undo both edits the new peer made in the group"
+    );
+    assert!(!undo_manager.can_undo());
 }
 
 #[test]

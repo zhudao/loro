@@ -275,8 +275,9 @@ history can have holes and cannot satisfy the store's continuity contract.
 `PendingChange::Unknown` retains the Lamport supplied by the input even though
 the local DAG cannot yet resolve it. Export preserves that value (adjusted by a
 slice offset); it does not invent a Lamport or fill missing history. Import
-resolves Lamport values through the existing import path. An unrepresentable
-input Lamport range returns an encode error.
+resolves Lamport values through the existing import path. When the deps of a
+pending change arrive, its Lamport comes from the deps only. The supplied value
+is ignored. An unrepresentable input Lamport range returns an encode error.
 
 `PendingChanges::export_changes` sorts by operation ID and removes already
 applied prefixes and duplicate overlaps, independently of the missing-dependency
@@ -459,6 +460,14 @@ Pre-shallow frontier safety lives in `loro.rs`: `checkout`, `diff`, and
 `revert_to` must return `SwitchToVersionBeforeShallowRoot` instead of traversing
 history before the shallow root.
 
+Operation-span queries also require both endpoints to include the shallow root,
+including equal endpoints. `DagUtils::try_find_path` validates endpoints before
+walking. The retained span walk can still reach a pruned predecessor while its
+minimum-span bound requires descent: that predecessor is shared by both validated
+versions, so `_walk_to_meet` stops that edge and updates its queue counts. Missing
+dependencies outside the stored shallow cut remain errors. The public regressions
+are in `crates/loro/tests/shallow_span_queries.rs`.
+
 Merge semantics of a shallow replica meeting concurrent full-history peers
 (which updates apply, pend, or are rejected, and why a never-synced peer can
 never merge): [docs/shallow-snapshot-concurrency.md](../docs/shallow-snapshot-concurrency.md)
@@ -477,6 +486,20 @@ with tests in `crates/loro/tests/shallow_snapshot_concurrency.rs`.
 Malformed JSON schema should return `Err` without partial import. Look at
 [crates/loro-internal/src/tests/import_atomicity.rs](../crates/loro-internal/src/tests/import_atomicity.rs)
 when changing JSON import validation or rollback behavior.
+
+## Signed DeltaInt bounds
+
+Verified against code 2026-11-06. `value.rs::ValueReader::read_i32` uses the
+existing signed i64 LEB128 parser, then checks conversion to i32. Its only
+production caller is `Value::decode` for `ValueKind::DeltaInt`; the matching
+writer starts from an i32. Out-of-range signed values return the existing
+`DecodeDataCorruptionError` instead of wrapping. In-range values, including
+nonminimal encodings accepted by that parser, retain their decoded value and
+byte consumption. Primitive parser errors keep the same corruption mapping;
+the range check does not rewind the reader. The two `delta_int_decoding_*`
+module tests cover literal oversized values, both bounds, nonminimal zero and
+minus one, and a truncated varint. `read_usize`, raw-tree counters and other
+integer fields are separate paths and are unchanged by this fix.
 
 ## Validation Shortcuts
 

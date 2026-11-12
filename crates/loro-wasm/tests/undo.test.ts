@@ -1,5 +1,5 @@
 import { Cursor, LoroDoc, LoroMap, UndoManager } from "../bundler/index";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { expectDefined } from "./helpers";
 
 describe("undo", () => {
@@ -113,6 +113,41 @@ describe("undo", () => {
     });
   });
 
+  test.each([
+    [0, -500, false, false],
+    [0, 0, false, false],
+    [0, 500, false, false],
+    [1000, -500, false, false],
+    [1000, 0, false, true],
+    [1000, 500, false, true],
+    [1000, 1000, false, false],
+    [0, -500, true, true],
+  ])(
+    "merge interval %s with clock delta %s and manual group %s",
+    (mergeInterval, delta, grouped, merges) => {
+      const clock = vi.spyOn(Date, "now").mockReturnValue(100000);
+      try {
+        const doc = new LoroDoc();
+        const text = doc.getText("text");
+        const undo = new UndoManager(doc, { mergeInterval });
+        if (grouped) undo.groupStart();
+        text.insert(0, "a");
+        doc.commit();
+        clock.mockReturnValue(100000 + delta);
+        text.insert(1, "b");
+        doc.commit();
+        if (grouped) undo.groupEnd();
+
+        expect(undo.undo()).toBe(true);
+        expect(text.toString()).toBe(merges ? "" : "a");
+        expect(undo.redo()).toBe(true);
+        expect(text.toString()).toBe("ab");
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
   test("merge", async () => {
     const doc = new LoroDoc();
     const undo = new UndoManager(doc, { maxUndoSteps: 100, mergeInterval: 50 });
@@ -150,6 +185,34 @@ describe("undo", () => {
       undo.undo();
     }
     expect(doc.getText("text").length).toBe(100);
+  });
+
+  test("onPush metadata survives eviction at the undo limit", () => {
+    const doc = new LoroDoc();
+    const text = doc.getText("text");
+    let before = 0;
+    let restored: { value: unknown; cursors: Cursor[] } | undefined;
+    const undo = new UndoManager(doc, {
+      maxUndoSteps: 3,
+      mergeInterval: 0,
+      onPush: () => ({ value: before, cursors: [expectDefined(text.getCursor(before))] }),
+      onPop: (_isUndo, meta) => {
+        restored = meta;
+      },
+    });
+    for (let i = 0; i < 10; i++) {
+      before = text.length;
+      text.insert(before, "x");
+      doc.commit();
+    }
+    for (let i = 0; i < 3; i++) {
+      const length = text.length;
+      expect(undo.undo()).toBe(true);
+      expect(restored?.value).toBe(length - 1);
+      expect(restored?.cursors.length).toBe(1);
+    }
+    expect(undo.undo()).toBe(false);
+    undo.free();
   });
 
   test("max undo steps after remote update and undo", () => {

@@ -388,16 +388,10 @@ impl AppDag {
         }
     }
 
-    /// If the lamport of change can be calculated, return Ok, otherwise, Err
+    /// Sets the lamport from the deps only, like `get_change_lamport_from_deps`.
+    /// The lamport in the update is ignored, so it cannot depend on import order.
     pub(crate) fn calc_unknown_lamport_change(&self, change: &mut Change) -> Result<(), ()> {
-        for dep in change.deps.iter() {
-            match self.get_lamport(&dep) {
-                Some(lamport) => {
-                    change.lamport = change.lamport.max(lamport + 1);
-                }
-                None => return Err(()),
-            }
-        }
+        change.lamport = self.get_change_lamport_from_deps(&change.deps).ok_or(())?;
         Ok(())
     }
 
@@ -1123,6 +1117,14 @@ impl Dag for AppDag {
 
     fn contains(&self, id: ID) -> bool {
         self.vv.includes_id(id)
+    }
+
+    fn is_pruned(&self, id: ID) -> bool {
+        self.shallow_since_vv.includes_id(id)
+    }
+
+    fn is_before_shallow_root(&self, frontiers: &Frontiers) -> bool {
+        AppDag::is_before_shallow_root(self, frontiers)
     }
 }
 

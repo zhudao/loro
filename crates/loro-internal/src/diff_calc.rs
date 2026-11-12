@@ -593,14 +593,27 @@ fn replay_container_ops_from_empty(
     vv: &VersionVector,
     visitor: &mut dyn RebuildOpVisitor,
 ) {
-    let empty_vv = VersionVector::default();
-    let empty_frontiers = Frontiers::default();
-    let target_frontiers = oplog.dag.vv_to_frontiers(vv);
+    replay_container_ops(idx, oplog, &VersionVector::default(), vv, visitor);
+}
+
+/// Replays the ops of one container from `from` up to `to` (`to ⊇ from`) in
+/// causal order, each with the version it was made at. The replay can start
+/// below `from` (see `OpLog::iter_from_replay_base_causally_filtered`), so the
+/// visitor may see ops it has already applied.
+fn replay_container_ops(
+    idx: ContainerIdx,
+    oplog: &OpLog,
+    from: &VersionVector,
+    to: &VersionVector,
+    visitor: &mut dyn RebuildOpVisitor,
+) {
+    let from_frontiers = oplog.dag.vv_to_frontiers(from);
+    let to_frontiers = oplog.dag.vv_to_frontiers(to);
     let (_, iter) = oplog.iter_from_replay_base_causally_filtered(
-        &empty_vv,
-        &empty_frontiers,
-        vv,
-        &target_frontiers,
+        from,
+        &from_frontiers,
+        to,
+        &to_frontiers,
         Some(idx),
     );
 
@@ -848,6 +861,12 @@ impl ListDiffCalculator {
         self.source_not_in_op_context = true;
     }
 
+    /// A retreat never goes below a critical base, so it can only bring back
+    /// opaque content that a replayed op deleted.
+    fn retreat_is_trustworthy(&self) -> bool {
+        !self.tracker.has_deleted_unknown()
+    }
+
     #[cold]
     #[inline(never)]
     fn build_full_tracker(idx: ContainerIdx, oplog: &OpLog, vv: &VersionVector) -> ListTracker {
@@ -941,12 +960,11 @@ impl DiffCalculatorTrait for ListDiffCalculator {
             // arm additionally requires a non-shallow doc, which preserves
             // the old behavior exactly: list trackers have no shallow-root
             // seeding, and the pre-existing `base == from` arm never had a
-            // shallow term. `has_retreat` stays load-bearing: a retreat is
-            // the only way a diff could emit the opaque below-base span.
+            // shallow term.
             let base_is_trustworthy = (info.replay_base_is_critical
                 && oplog.shallow_since_vv().is_empty())
                 || (info.replay_base_vv == info.from_vv && !self.source_not_in_op_context);
-            has_retreat || !base_is_trustworthy
+            !base_is_trustworthy || (has_retreat && !self.retreat_is_trustworthy())
         };
         let diff_items = if should_rebuild {
             #[cfg(test)]
@@ -958,7 +976,17 @@ impl DiffCalculatorTrait for ListDiffCalculator {
             *self.tracker = full_tracker;
             diff_items
         } else {
-            self.tracker.diff(info.from_vv, info.to_vv).collect_vec()
+            let diff_items = self.tracker.diff(info.from_vv, info.to_vv).collect_vec();
+            debug_assert!(
+                self.tracker.has_deleted_unknown()
+                    || diff_items.iter().all(|item| !matches!(
+                        item,
+                        CrdtRopeDelta::Insert { chunk, .. }
+                            if matches!(chunk.value(), RichtextChunkValue::Unknown(_))
+                    )),
+                "the opaque below-base span leaked into a list diff"
+            );
+            diff_items
         };
 
         for item in diff_items {
@@ -1088,6 +1116,13 @@ pub(crate) struct RichtextDiffCalculator {
     mode: Box<RichtextCalcMode>,
 }
 
+/// See `RichtextCalcMode::Crdt::full`.
+#[derive(Debug)]
+struct FullTracker {
+    container: ContainerIdx,
+    vv: VersionVector,
+}
+
 #[derive(Debug)]
 enum RichtextCalcMode {
     Crdt {
@@ -1099,6 +1134,11 @@ enum RichtextCalcMode {
         start_vv: VersionVector,
         source_not_in_op_context: bool,
         shallow_root_seeded: bool,
+        /// Set while the tracker holds every op of the container up to this
+        /// version by its id, as a rebuild from empty history leaves it. With
+        /// no opaque base span, it can diff between any two versions it
+        /// holds, retreats included, and only needs the ops it has not seen.
+        full: Option<FullTracker>,
     },
     Linear {
         diff: DeltaRope<RichtextStateChunk, ()>,
@@ -1116,6 +1156,7 @@ impl RichtextDiffCalculator {
                 start_vv: VersionVector::new(),
                 source_not_in_op_context: false,
                 shallow_root_seeded: false,
+                full: None,
             }),
         }
     }
@@ -1572,26 +1613,6 @@ impl RichtextDiffCalculator {
         oplog: &OpLog,
         vv: &VersionVector,
     ) -> (RichtextTracker, Vec<(StyleOp, usize)>, TrackerTexts) {
-        struct RichtextRebuildVisitor<'a> {
-            oplog: &'a OpLog,
-            tracker: &'a mut RichtextTracker,
-            styles: &'a mut Vec<(StyleOp, usize)>,
-            texts: &'a mut TrackerTexts,
-        }
-
-        impl RebuildOpVisitor for RichtextRebuildVisitor<'_> {
-            fn visit(&mut self, vv: &VersionVector, op: RichOp<'_>) {
-                self.tracker.checkout(vv);
-                RichtextDiffCalculator::apply_crdt_op_to_tracker(
-                    self.oplog,
-                    self.tracker,
-                    self.styles,
-                    self.texts,
-                    op,
-                );
-            }
-        }
-
         let mut tracker = RichtextTracker::new_with_unknown();
         let mut styles = Vec::new();
         let mut texts = TrackerTexts::default();
@@ -1611,10 +1632,30 @@ impl RichtextDiffCalculator {
     }
 }
 
+struct RichtextRebuildVisitor<'a> {
+    oplog: &'a OpLog,
+    tracker: &'a mut RichtextTracker,
+    styles: &'a mut Vec<(StyleOp, usize)>,
+    texts: &'a mut TrackerTexts,
+}
+
+impl RebuildOpVisitor for RichtextRebuildVisitor<'_> {
+    fn visit(&mut self, vv: &VersionVector, op: RichOp<'_>) {
+        self.tracker.checkout(vv);
+        RichtextDiffCalculator::apply_crdt_op_to_tracker(
+            self.oplog,
+            self.tracker,
+            self.styles,
+            self.texts,
+            op,
+        );
+    }
+}
+
 impl DiffCalculatorTrait for RichtextDiffCalculator {
     fn start_tracking(
         &mut self,
-        _oplog: &super::oplog::OpLog,
+        oplog: &super::oplog::OpLog,
         vv: &crate::VersionVector,
         mode: DiffMode,
     ) {
@@ -1640,9 +1681,33 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 start_vv,
                 source_not_in_op_context,
                 shallow_root_seeded,
+                full,
             } => {
                 *source_not_in_op_context = false;
-                if !vv.includes_vv(start_vv) || !tracker.all_vv().includes_vv(vv) {
+                if let Some(full) = full {
+                    // Rebuilding it from empty history on the next retreat
+                    // (every undo, every checkout back in time) would cost
+                    // the whole history again; replaying the ops that
+                    // arrived since it was built keeps it complete.
+                    if !full.vv.includes_vv(vv) {
+                        let mut target = full.vv.clone();
+                        target.merge(vv);
+                        let mut visitor = RichtextRebuildVisitor {
+                            oplog,
+                            tracker,
+                            styles,
+                            texts,
+                        };
+                        replay_container_ops(
+                            full.container,
+                            oplog,
+                            &full.vv,
+                            &target,
+                            &mut visitor,
+                        );
+                        full.vv = target;
+                    }
+                } else if !vv.includes_vv(start_vv) || !tracker.all_vv().includes_vv(vv) {
                     **tracker = RichtextTracker::new_with_unknown();
                     styles.clear();
                     texts.clear();
@@ -1737,6 +1802,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 start_vv,
                 source_not_in_op_context: _,
                 shallow_root_seeded,
+                full,
             } => {
                 if !*shallow_root_seeded && !oplog.shallow_since_vv().is_empty() {
                     Self::seed_tracker_from_shallow_root(
@@ -1749,6 +1815,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     // The seeded tracker replaced the old one and holds no text chunks.
                     texts.clear();
                     *shallow_root_seeded = true;
+                    *full = None;
                 }
 
                 if let Some(vv) = vv {
@@ -1886,6 +1953,7 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 styles,
                 texts,
                 source_not_in_op_context,
+                full,
                 ..
             } => {
                 let (mut retreat, _) = info.from_vv.diff_iter(info.to_vv);
@@ -1910,8 +1978,11 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                 // CRDT ids.
                 let base_is_trustworthy = info.replay_base_is_critical
                     || (info.replay_base_vv == info.from_vv && !*source_not_in_op_context);
-                let should_rebuild =
-                    has_retreat || !base_is_trustworthy || !oplog.shallow_since_vv().is_empty();
+                // A full tracker has no opaque span to distrust: it holds
+                // every op up to the replay base, and the replay added the
+                // rest up to both versions.
+                let should_rebuild = !oplog.shallow_since_vv().is_empty()
+                    || (full.is_none() && (has_retreat || !base_is_trustworthy));
                 if should_rebuild {
                     // Richtext diffs can start from a tracker that only knows the replay-base
                     // state as unknown spans. Expressing a rollback or an import from a base
@@ -1947,8 +2018,20 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     // real seed is even lower (the empty version, or the
                     // shallow root), so the reseed test in `start_tracking`
                     // only becomes more conservative.
+                    // A tracker seeded from a shallow root keeps that root's
+                    // state as seeded spans, so only one built from empty
+                    // history is kept as full.
+                    *full = oplog.shallow_since_vv().is_empty().then_some(FullTracker {
+                        container: idx,
+                        vv: merged,
+                    });
 
                     return (InternalDiff::RichtextRaw(delta), DiffMode::Checkout);
+                }
+
+                if let Some(full) = full {
+                    full.vv.merge(info.from_vv);
+                    full.vv.merge(info.to_vv);
                 }
 
                 let mut delta = DeltaRope::new();
@@ -1957,7 +2040,9 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     // this loop: a retreat is the only way to un-delete
                     // below-base content, so a forward-only diff can never
                     // emit the opaque span as an insert (which would abort in
-                    // `push_tracker_chunk`).
+                    // `push_tracker_chunk`). A full tracker may retreat here:
+                    // its opaque span stands for no content, which no op
+                    // deletes.
                     #[cfg(debug_assertions)]
                     if let CrdtRopeDelta::Insert { chunk, .. } = &item {
                         debug_assert!(
@@ -2126,13 +2211,14 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
     ) -> (InternalDiff, DiffMode) {
         let (mut retreat, _) = info.from_vv.diff_iter(info.to_vv);
         let has_retreat = retreat.next().is_some();
-        // Deliberately NOT relaxed for a certified-critical replay base: the
-        // movable-list element phase reads positions from a tracker this
-        // rebuild has just refreshed, and trusting an unknown-span tracker
-        // here needs its own argument about element/position state. See the
-        // soundness comment in `RichtextDiffCalculator::calculate_diff`.
-        if has_retreat || info.replay_base_vv != info.from_vv || self.list.source_not_in_op_context
-        {
+        // As for lists: the element phase reads positions and values from the
+        // checkout index, and every replayed move is in `move_id_to_elem_id`.
+        let base_is_trustworthy = (info.replay_base_is_critical
+            && oplog.shallow_since_vv().is_empty())
+            || (info.replay_base_vv == info.from_vv && !self.list.source_not_in_op_context);
+        if !base_is_trustworthy || (has_retreat && !self.list.retreat_is_trustworthy()) {
+            #[cfg(test)]
+            FULL_TRACKER_REBUILD_COUNT.with(|c| c.set(c.get() + 1));
             let mut merged = info.from_vv.clone();
             merged.merge(info.to_vv);
             self.rebuild_full_tracker(idx, oplog, &merged);
