@@ -14,7 +14,8 @@ use std::sync::Arc;
 use tracing::trace_span;
 
 use self::change_store::iter::MergedChangeIter;
-use self::pending_changes::{PendingChanges, PendingChangesRollback};
+pub(crate) use self::pending_changes::PendingChanges;
+use self::pending_changes::PendingChangesRollback;
 use super::arena::{SharedArena, SharedArenaRollback};
 use crate::change::{get_sys_timestamp, Change, Lamport, Timestamp};
 use crate::configure::Configure;
@@ -832,7 +833,7 @@ impl OpLog {
         &mut self,
         remote_changes: Vec<Change>,
         would_affect: Option<&mut crate::version::VersionRange>,
-    ) -> crate::version::VersionRange {
+    ) -> loro_common::LoroResult<(crate::version::VersionRange, bool)> {
         self.extend_pending_changes_with_unknown_lamport(remote_changes, would_affect)
     }
 

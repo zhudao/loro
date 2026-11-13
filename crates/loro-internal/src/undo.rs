@@ -21,6 +21,8 @@ use crate::{
 #[cfg(test)]
 mod atomicity_tests;
 pub(crate) mod movable_list;
+#[cfg(test)]
+mod split_span_tests;
 
 /// A batch of diffs.
 ///
@@ -116,6 +118,36 @@ impl DiffBatch {
             } else {
                 self.cid_to_events.insert(id.clone(), diff.clone());
                 self.order.push(id.clone());
+            }
+        }
+    }
+
+    /// Inverses run in sequence, so a later inverse map write must win even
+    /// when it restores a value with an older operation timestamp.
+    fn compose_inverse(&mut self, other: Self) {
+        if other.cid_to_events.is_empty() {
+            return;
+        }
+        if self.cid_to_events.is_empty() {
+            *self = other;
+            return;
+        }
+        assert_eq!(
+            self.full_state, other.full_state,
+            "cannot compose a full-state DiffBatch with an incremental one"
+        );
+
+        for (id, diff) in other.into_iter() {
+            if let Some(this_diff) = self.cid_to_events.get_mut(&id) {
+                match (this_diff, diff) {
+                    (Diff::Map(a), Diff::Map(b)) => {
+                        a.updated.extend(b.updated);
+                    }
+                    (a, b) => a.compose_ref(&b),
+                }
+            } else {
+                self.cid_to_events.insert(id.clone(), diff);
+                self.order.push(id);
             }
         }
     }
@@ -523,7 +555,7 @@ impl Stack {
     }
 
     pub fn transform_based_on_this_delta(&mut self, diff: &DiffBatch) {
-        if self.is_empty() {
+        if self.stack.is_empty() {
             return;
         }
         let remote_diff = &mut self.stack.back_mut().unwrap().1;
@@ -627,16 +659,25 @@ impl UndoManagerInner {
     }
 
     fn record_checkpoint(this: &RefCell<Self>, latest_counter: Counter, event: Option<DiffEvent>) {
+        Self::record_checkpoint_at(this, latest_counter, event, None);
+    }
+
+    fn record_checkpoint_at(
+        this: &RefCell<Self>,
+        latest_counter: Counter,
+        event: Option<DiffEvent>,
+        now: Option<Timestamp>,
+    ) {
         let previous_counter = this.borrow().next_counter;
 
-        if Some(latest_counter) == this.borrow().next_counter {
+        if Some(latest_counter) == previous_counter {
             return;
         }
 
-        if this.borrow().next_counter.is_none() {
+        let Some(previous) = previous_counter else {
             this.borrow_mut().next_counter = Some(latest_counter);
             return;
-        }
+        };
 
         if let Some(group) = &mut this.borrow_mut().group {
             event.iter().for_each(|e| {
@@ -646,8 +687,8 @@ impl UndoManagerInner {
             });
         }
 
-        let now = get_sys_timestamp() as Timestamp;
-        let span = CounterSpan::new(this.borrow().next_counter.unwrap(), latest_counter);
+        let now = now.unwrap_or_else(|| get_sys_timestamp() as Timestamp);
+        let span = CounterSpan::new(previous, latest_counter);
         let meta = this
             .borrow()
             .on_push
@@ -674,18 +715,27 @@ impl UndoManagerInner {
 
         let should_merge = !this.undo_stack.is_empty() && (in_merge_interval || group_should_merge);
 
+        let previous_len = this.undo_stack.len();
         if should_merge {
             this.undo_stack
                 .push_with_merge(span, meta, true, this.group.as_ref());
         } else {
-            this.last_undo_time = now;
             this.undo_stack.push(span, meta);
+        }
+        // A requested merge can still create an item (e.g. after an import).
+        // Only an actual merge keeps the previous item's window.
+        if this.undo_stack.len() > previous_len {
+            this.last_undo_time = now;
         }
 
         this.next_counter = Some(latest_counter);
         this.redo_stack.clear();
-        while this.undo_stack.len() > this.max_stack_size {
-            this.undo_stack.pop_front();
+        this.trim_undo_stack();
+    }
+
+    fn trim_undo_stack(&mut self) {
+        while self.undo_stack.len() > self.max_stack_size {
+            self.undo_stack.pop_front();
         }
     }
 }
@@ -838,7 +888,10 @@ impl UndoManager {
     }
 
     pub fn set_max_undo_steps(&self, size: usize) {
-        self.inner.lock().borrow_mut().max_stack_size = size;
+        let inner = self.inner.lock();
+        let mut inner = inner.borrow_mut();
+        inner.max_stack_size = size;
+        inner.trim_undo_stack();
     }
 
     pub fn add_exclude_origin_prefix(&self, prefix: &str) {
@@ -1055,9 +1108,10 @@ impl UndoManager {
                     meta.cursors = inner;
                 }
 
-                get_opposite(&mut inner.borrow_mut())
-                    .push(CounterSpan::new(end_counter, new_counter), meta);
-                inner.borrow_mut().next_counter = Some(new_counter);
+                let mut inner = inner.borrow_mut();
+                get_opposite(&mut inner).push(CounterSpan::new(end_counter, new_counter), meta);
+                inner.trim_undo_stack();
+                inner.next_counter = Some(new_counter);
                 executed = true;
             }
         }
@@ -1180,7 +1234,7 @@ impl UndoManager {
 /// - `spans`: A vector of tuples where each tuple contains an `IdSpan` and its associated `Frontiers`.
 ///   - `IdSpan`: Represents a span of operations identified by an ID.
 ///   - `Frontiers`: Represents the deps of the given id_span
-/// - `latest_frontiers`: The latest frontiers of the document
+/// - `last_frontiers_or_last_bi`: The latest frontiers, or the precomputed final forward diff
 /// - `calc_diff`: A closure that takes two `Frontiers` and calculates the difference between them, returning a `DiffBatch`.
 ///
 /// # Returns
@@ -1199,9 +1253,15 @@ pub(crate) fn undo(
     // For each continuous span_i:
     //
     // 1. a. Calculate the event of checkout from id_span.last to id_span.deps, call it Ai. It undo the ops in the current span.
-    //    b. Calculate A'i = Ai + T(Ci-1, Ai) if i > 0, otherwise A'i = Ai.
+    //    b. Calculate A'i = Ai + Ci-1 if i > 0, otherwise A'i = Ai.
+    //       Ci-1 is based at this span's deps, exactly where Ai ends, so compose directly.
     //       NOTE: A'i can undo the ops in the current span and the previous spans, if it's applied on the id_span.last version.
-    // 2. Calculate the event of checkout from id_span.last to [the next span's last id] or [the latest version], call it Bi.
+    // 2. Calculate the checkout from id_span.last to the next span's deps, call it Bi.
+    //    These deps include this span's last op because a peer's ops are causally ordered.
+    //    Bi crosses only the other peers' ops between spans. Taking Ci through the next
+    //    span's own ops and back through their inverse is lossy: restored runs can be
+    //    reordered (#1245), or intermediate text can survive the undo (#1228).
+    //    For the last span only, Bi goes to the latest version (or uses the supplied diff).
     // 3. Transform event A'i based on Bi, call it Ci
     // 4. If span_i is the last span, apply Ci to the current state.
 
@@ -1229,27 +1289,29 @@ pub(crate) fn undo(
             let stack_diff_batch;
             let event_b_i = 'block: {
                 let next = if i + 1 < spans.len() {
-                    spans[i + 1].0.id_last().into()
+                    &spans[i + 1].1
                 } else {
                     match last_frontiers_or_last_bi {
-                        Either::Left(last_frontiers) => last_frontiers.clone(),
-                        Either::Right(right) => break 'block right,
+                        Either::Left(last_frontiers) => last_frontiers,
+                        Either::Right(right) => break 'block Some(right),
                     }
                 };
-                stack_diff_batch = Some(calc_diff(&this_id_span.id_last().into(), &next));
-                stack_diff_batch.as_ref().unwrap()
+                let from = Frontiers::from_id(this_id_span.id_last());
+                if &from == next {
+                    break 'block None;
+                }
+                stack_diff_batch = calc_diff(&from, next);
+                Some(&stack_diff_batch)
             };
 
             // println!("event_b_i: {:?}", event_b_i);
 
             // event_a_prime can undo the ops in the current span and the previous spans
-            let mut event_a_prime = if let Some(mut last_ci) = last_ci.take() {
+            let mut event_a_prime = if let Some(last_ci) = last_ci.take() {
                 // ------------------------------------------------------------------------------
-                // 1.b Transform and apply Ci-1 based on Ai, call it A'i
+                // 1.b Apply Ci-1 after Ai, call it A'i
                 // ------------------------------------------------------------------------------
-                last_ci.transform(&event_a_i, true);
-
-                event_a_i.compose(&last_ci);
+                event_a_i.compose_inverse(last_ci);
                 event_a_i
             } else {
                 event_a_i
@@ -1260,7 +1322,9 @@ pub(crate) fn undo(
             // --------------------------------------------------
             // 3. Transform event A'_i based on B_i, call it C_i
             // --------------------------------------------------
-            event_a_prime.transform(event_b_i, true);
+            if let Some(event_b_i) = event_b_i {
+                event_a_prime.transform(event_b_i, true);
+            }
 
             // println!("event_a_prime: {:?}", event_a_prime);
 
@@ -1270,4 +1334,106 @@ pub(crate) fn undo(
     }
 
     last_ci.unwrap()
+}
+
+#[cfg(test)]
+mod merge_timer_tests {
+    use super::*;
+    use loro_common::ContainerType;
+
+    fn manager() -> RefCell<UndoManagerInner> {
+        let mut inner = UndoManagerInner::new(0);
+        inner.merge_interval_in_ms = 500;
+        RefCell::new(inner)
+    }
+
+    fn record(inner: &RefCell<UndoManagerInner>, counter: Counter, now: Timestamp) {
+        UndoManagerInner::record_checkpoint_at(inner, counter, None, Some(now));
+    }
+
+    #[test]
+    fn first_item_starts_its_own_merge_window() {
+        let inner = manager();
+        record(&inner, 1, 100);
+        assert_eq!(inner.borrow().last_undo_time, 100);
+        record(&inner, 2, 550);
+        assert_eq!(inner.borrow().undo_stack.len(), 1);
+    }
+
+    #[test]
+    fn merged_edits_keep_the_original_window() {
+        let inner = manager();
+        record(&inner, 1, 100_000);
+        record(&inner, 2, 100_300);
+        assert_eq!(inner.borrow().undo_stack.len(), 1);
+        assert_eq!(inner.borrow().last_undo_time, 100_000);
+        record(&inner, 3, 100_600);
+        assert_eq!(inner.borrow().undo_stack.len(), 2);
+        assert_eq!(inner.borrow().last_undo_time, 100_600);
+    }
+
+    #[test]
+    fn remote_diff_starts_a_new_merge_window() {
+        let inner = manager();
+        record(&inner, 1, 100_000);
+        // A remote import leaves a diff on the row containing the old item.
+        let mut diff = crate::event::TextDiff::default();
+        diff.insert_value(0, "remote".into(), Default::default());
+        {
+            let inner = inner.borrow();
+            let mut remote_diff = inner.undo_stack.stack.back().unwrap().1.lock();
+            let cid = ContainerID::new_root("text", ContainerType::Text);
+            remote_diff
+                .cid_to_events
+                .insert(cid.clone(), Diff::Text(diff));
+            remote_diff.order.push(cid);
+        }
+        record(&inner, 2, 100_300);
+        assert_eq!(inner.borrow().undo_stack.len(), 2);
+        assert_eq!(inner.borrow().last_undo_time, 100_300);
+        record(&inner, 3, 100_600);
+        let inner = inner.borrow();
+        assert_eq!(inner.undo_stack.len(), 2);
+        assert_eq!(
+            inner.undo_stack.peek_top_span(),
+            Some(CounterSpan::new(1, 3))
+        );
+    }
+
+    #[test]
+    fn noncontiguous_span_starts_a_new_merge_window() {
+        let inner = manager();
+        record(&inner, 1, 100_000);
+        inner.borrow_mut().next_counter = Some(2);
+        record(&inner, 3, 100_300);
+        assert_eq!(inner.borrow().last_undo_time, 100_300);
+        record(&inner, 4, 100_600);
+        let inner = inner.borrow();
+        assert_eq!(inner.undo_stack.len(), 2);
+        assert_eq!(
+            inner.undo_stack.peek_top_span(),
+            Some(CounterSpan::new(2, 4))
+        );
+    }
+
+    #[test]
+    fn empty_tail_row_starts_a_new_merge_window() {
+        let inner = manager();
+        record(&inner, 1, 100_000);
+        record(&inner, 2, 100_600);
+        inner
+            .borrow_mut()
+            .undo_stack
+            .stack
+            .push_back(Default::default());
+        record(&inner, 3, 100_900);
+        assert_eq!(inner.borrow().last_undo_time, 100_900);
+        record(&inner, 4, 101_200);
+        let inner = inner.borrow();
+        assert_eq!(inner.undo_stack.len(), 3);
+        assert_eq!(
+            inner.undo_stack.peek_top_span(),
+            Some(CounterSpan::new(2, 4))
+        );
+    }
 }

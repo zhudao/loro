@@ -388,13 +388,6 @@ impl AppDag {
         }
     }
 
-    /// Sets the lamport from the deps only, like `get_change_lamport_from_deps`.
-    /// The lamport in the update is ignored, so it cannot depend on import order.
-    pub(crate) fn calc_unknown_lamport_change(&self, change: &mut Change) -> Result<(), ()> {
-        change.lamport = self.get_change_lamport_from_deps(&change.deps).ok_or(())?;
-        Ok(())
-    }
-
     pub(crate) fn find_deps_of_id(&self, id: ID) -> Frontiers {
         let Some(node) = self.get(id) else {
             return Frontiers::default();
@@ -816,34 +809,23 @@ impl AppDag {
             return Ok(true);
         }
 
-        // Deps equal to the root's own deps describe a change CONCURRENT with
-        // the root frontier op: its causal past is covered by the root state,
-        // so the boundary shortcut in `frontiers_to_vv` would resolve it to
-        // the shallow vv below. But the dep ids themselves are trimmed from
-        // the dag, so no lamport can be computed for such a change — it would
-        // be parked as pending and then panic in `calc_unknown_lamport_change`.
-        // Reject it like any other pre-root update.
-        if deps == &self.shallow_root_frontiers_deps {
+        // Check ids before resolving the frontier: the root's own deps resolve
+        // to the shallow VV even though their DAG nodes have been trimmed.
+        if Self::deps_reach_trimmed_history(&self.shallow_since_vv, deps) {
             return Ok(true);
         }
 
         let shallow_vv = VersionVector::from_im_vv(&self.shallow_since_vv);
-        if let Some(vv) = self.try_frontiers_to_vv(deps)? {
-            return Ok(!vv.includes_vv(&shallow_vv));
-        }
+        Ok(self
+            .try_frontiers_to_vv(deps)?
+            .is_some_and(|vv| !vv.includes_vv(&shallow_vv)))
+    }
 
-        // Import only needs to reject updates whose causal source is older than
-        // the shallow root. A dependency set that touches the retained boundary
-        // can still be a valid post-root update, even when the rest of the deps
-        // are imported later in the same batch.
-        if deps
-            .iter()
-            .any(|id| self.shallow_since_frontiers.contains(&id))
-        {
-            return Ok(false);
-        }
-
-        Ok(deps.iter().any(|id| self.shallow_since_vv.includes_id(id)))
+    pub(crate) fn deps_reach_trimmed_history(
+        shallow_vv: &ImVersionVector,
+        deps: &Frontiers,
+    ) -> bool {
+        deps.iter().any(|id| shallow_vv.includes_id(id))
     }
 
     /// Travel the ancestors of the given id, and call the callback for each node
@@ -1322,6 +1304,77 @@ impl AppDag {
         }
 
         Ok(Some(vv))
+    }
+
+    pub(crate) fn is_trimmed_and_unresolved(&self, dep: ID) -> bool {
+        self.shallow_since_vv.includes_id(dep)
+            && Frontiers::from_id(dep) != self.shallow_root_frontiers_deps
+    }
+
+    /// Whether `dep` (known to be in `self.vv`) causally covers `target` (also in `self.vv`).
+    /// Returns `Ok(None)` when `dep` is trimmed below the shallow root and cannot be resolved.
+    pub(crate) fn try_does_id_cover(&self, dep: ID, target: ID) -> LoroResult<Option<bool>> {
+        if dep.peer == target.peer {
+            return Ok(Some(dep.counter >= target.counter));
+        }
+        if Frontiers::from_id(dep) == self.shallow_root_frontiers_deps {
+            return Ok(Some(self.shallow_since_vv.includes_id(target)));
+        }
+        let Some(dep_node) = self.try_get(dep)? else {
+            return Ok(None);
+        };
+        if let Some(vv) = dep_node.vv.get() {
+            return Ok(Some(vv.includes_id(target)));
+        }
+        if self.unparsed_vv.lock().is_empty() {
+            let vv = self.try_ensure_vv_for(&dep_node)?;
+            return Ok(Some(vv.includes_id(target)));
+        }
+        // Cold snapshot DAG: avoid parsing history down to counter 0.
+        if self.shallow_since_vv.includes_id(target) {
+            return Ok(Some(true));
+        }
+        let Some(target_lamport) = self.try_get_lamport(&target)? else {
+            return Ok(None);
+        };
+        if dep_node.lamport <= target_lamport {
+            return Ok(Some(false));
+        }
+        let mut visited = FxHashSet::default();
+        visited.insert(dep_node.id_start());
+        let mut stack = vec![dep_node];
+        while let Some(node) = stack.pop() {
+            if let Some(vv) = node.vv.get() {
+                if vv.includes_id(target) {
+                    return Ok(Some(true));
+                }
+                continue;
+            }
+            if node.deps == self.shallow_root_frontiers_deps {
+                if self.shallow_since_vv.includes_id(target) {
+                    return Ok(Some(true));
+                }
+                continue;
+            }
+            for next_dep in node.deps.iter() {
+                if next_dep.peer == target.peer && next_dep.counter >= target.counter {
+                    return Ok(Some(true));
+                }
+                if self.shallow_since_vv.includes_id(next_dep) {
+                    continue;
+                }
+                let Some(next_node) = self.try_get(next_dep)? else {
+                    continue;
+                };
+                if next_node.lamport <= target_lamport {
+                    continue;
+                }
+                if visited.insert(next_node.id_start()) {
+                    stack.push(next_node);
+                }
+            }
+        }
+        Ok(Some(false))
     }
 
     /// The vv of `frontiers`, without inserting DAG nodes or caching blocks.
@@ -1819,6 +1872,16 @@ mod ensure_vv_for_tests {
         // The boundary shortcut resolves these deps to the shallow vv...
         assert!(dag.frontiers_to_vv(&deps).is_some());
         // ...but the import check must still reject them.
+        assert!(dag.import_deps_before_shallow_root(&deps));
+    }
+
+    #[test]
+    fn import_deps_before_shallow_root_rejects_boundary_with_trimmed_peer() {
+        let mut dag = make_shallow_dag_for_import_deps();
+        // Use a distinct peer because a frontier stores at most one id per peer.
+        dag.shallow_since_vv.insert(2, 1);
+        let mut deps = Frontiers::from(ID::new(1, 2));
+        deps.push(ID::new(2, 0));
         assert!(dag.import_deps_before_shallow_root(&deps));
     }
 
