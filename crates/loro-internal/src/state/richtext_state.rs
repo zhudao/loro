@@ -624,6 +624,76 @@ impl ContainerState for RichtextState {
         Ok(())
     }
 
+    fn undo_record(&mut self, diff: &InternalDiff) -> super::undo_log::StateUndo {
+        use super::undo_log::RichtextUndoStep;
+        let InternalDiff::RichtextRaw(delta) = diff else {
+            unreachable!()
+        };
+        let mut steps = Vec::new();
+        // Entity indexes, as in `apply_diff`: each `Replace` deletes, then
+        // inserts, at `index`; `index + deleted - inserted` is the same
+        // position before the diff.
+        let (mut index, mut inserted, mut deleted) = (0usize, 0usize, 0usize);
+        for span in delta.iter() {
+            match span {
+                loro_delta::DeltaItem::Retain { len, .. } => index += len,
+                loro_delta::DeltaItem::Replace { value, delete, .. } => {
+                    if *delete > 0 {
+                        let old = index + deleted - inserted;
+                        let chunks = self.state.get_mut().chunks_in_entity_range(old, *delete);
+                        steps.push(RichtextUndoStep::Deleted { index, chunks });
+                        deleted += delete;
+                    }
+                    let len = value.rle_len();
+                    if len > 0 {
+                        steps.push(RichtextUndoStep::Inserted { index, len });
+                        index += len;
+                        inserted += len;
+                    }
+                }
+            }
+        }
+        super::undo_log::StateUndo::Richtext(steps)
+    }
+
+    fn apply_undo(&mut self, undo: super::undo_log::StateUndo) {
+        use super::undo_log::RichtextUndoStep;
+        let super::undo_log::StateUndo::Richtext(steps) = undo else {
+            unreachable!()
+        };
+        // Reinserting goes through `apply_diff`, which restores the style
+        // ranges of reinserted anchors as an import would.
+        let doc = Weak::new();
+        for step in steps.into_iter().rev() {
+            let mut delta: DeltaRope<RichtextStateChunk, ()> = DeltaRope::new();
+            let index = match &step {
+                RichtextUndoStep::Inserted { index, .. }
+                | RichtextUndoStep::Deleted { index, .. } => *index,
+            };
+            if index > 0 {
+                delta.push_retain(index, ());
+            }
+            match step {
+                RichtextUndoStep::Inserted { len, .. } => {
+                    delta.push_delete(len);
+                }
+                RichtextUndoStep::Deleted { chunks, .. } => {
+                    for chunk in chunks {
+                        delta.push_insert(chunk, ());
+                    }
+                }
+            }
+            self.apply_diff(
+                InternalDiff::RichtextRaw(delta),
+                DiffApplyContext {
+                    mode: crate::diff_calc::DiffMode::Checkout,
+                    doc: &doc,
+                },
+            )
+            .expect("undoing a rich text diff cannot be rejected");
+        }
+    }
+
     fn apply_diff(&mut self, diff: InternalDiff, _ctx: DiffApplyContext) -> LoroResult<()> {
         self.update_version();
         let InternalDiff::RichtextRaw(richtext) = diff else {
@@ -882,13 +952,7 @@ impl ContainerState for RichtextState {
                         None,
                     );
                 }
-                list_op::InnerListOp::StyleStart {
-                    start,
-                    end,
-                    key,
-                    value,
-                    info,
-                } => {
+                list_op::InnerListOp::StyleStart(style) => {
                     // Behavior here is a little different from apply_diff.
                     //
                     // When apply_diff, we only do the mark when we have included both
@@ -899,14 +963,14 @@ impl ContainerState for RichtextState {
                     // for apply_local_op. (Because for local behavior, when we mark,
                     // we always create a pair of style ops.)
                     self.state.get_mut().mark_with_entity_index(
-                        *start as usize..*end as usize,
+                        style.start as usize..style.end as usize,
                         Arc::new(StyleOp {
                             lamport: r_op.lamport,
                             peer: r_op.id.peer,
                             cnt: r_op.id.counter,
-                            key: key.clone(),
-                            value: value.clone(),
-                            info: *info,
+                            key: style.key.clone(),
+                            value: style.value.clone(),
+                            info: style.info,
                         }),
                     );
                 }
@@ -1040,6 +1104,41 @@ impl RichtextState {
     #[inline]
     pub fn len_unicode(&mut self) -> usize {
         self.state.get_mut().len_unicode()
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let inner = match &self.state {
+            LazyLoad::Src(loader) => {
+                let text_bytes: usize = loader
+                    .elements
+                    .iter()
+                    .map(|c| match c {
+                        RichtextStateChunk::Text(t) => {
+                            t.as_str().len() + std::mem::size_of::<RichtextStateChunk>()
+                        }
+                        RichtextStateChunk::Style { .. } => {
+                            std::mem::size_of::<RichtextStateChunk>() + 64
+                        }
+                    })
+                    .sum();
+                let anchor_bytes = loader.start_anchor_pos.capacity()
+                    * (std::mem::size_of::<ID>() + std::mem::size_of::<usize>() + 8);
+                let style_bytes = loader.style_ranges.capacity()
+                    * std::mem::size_of::<(Arc<StyleOp>, Range<usize>)>();
+                std::mem::size_of::<RichtextStateLoader>()
+                    .saturating_add(text_bytes)
+                    .saturating_add(anchor_bytes)
+                    .saturating_add(style_bytes)
+            }
+            LazyLoad::Dst(inner) => inner.estimated_heap_bytes(),
+        };
+        std::mem::size_of::<Self>().saturating_add(inner)
+    }
+
+    pub(crate) fn reclaim_auxiliary_caches(&mut self) {
+        if let LazyLoad::Dst(inner) = &mut self.state {
+            inner.reclaim_auxiliary_caches();
+        }
     }
 
     #[cfg(test)]

@@ -30,7 +30,7 @@ use crate::{
 use bytes::{Buf, Bytes};
 use loro_common::{HasCounterSpan, IdSpan, InternalString, LoroEncodeError, LoroError, LoroResult};
 
-use super::{EncodedBlobMode, ImportBlobMetadata, ParsedHeaderAndBody};
+use super::{EncodedBlobMode, ImportBlobMetadata, ParsedHeaderAndBody, ParsedHeaderAndBodyBytes};
 pub(crate) const EMPTY_MARK: &[u8] = b"E";
 pub(crate) struct Snapshot {
     pub oplog_bytes: Bytes,
@@ -116,13 +116,14 @@ pub(super) fn _decode_snapshot_bytes(bytes: Bytes) -> LoroResult<Snapshot> {
     })
 }
 
-pub(super) fn _decode_snapshot_meta_partial(bytes: &[u8]) -> LoroResult<(&[u8], bool)> {
+fn parse_snapshot_meta_partial_range(bytes: &[u8]) -> LoroResult<(usize, usize, bool)> {
     let mut r = bytes;
     let oplog_bytes_len = read_u32_le_slice(&mut r)? as usize;
     if r.len() < oplog_bytes_len {
         return Err(LoroError::DecodeDataCorruptionError);
     }
-    let oplog_bytes = &r[..oplog_bytes_len];
+    let oplog_start = 4;
+    let oplog_end = oplog_start + oplog_bytes_len;
     r = &r[oplog_bytes_len..];
     let state_bytes_len = read_u32_le_slice(&mut r)? as usize;
     if r.len() < state_bytes_len {
@@ -138,7 +139,17 @@ pub(super) fn _decode_snapshot_meta_partial(bytes: &[u8]) -> LoroResult<(&[u8], 
         return Err(LoroError::DecodeDataCorruptionError);
     }
 
-    Ok((oplog_bytes, shallow_bytes_len > 0))
+    Ok((oplog_start, oplog_end, shallow_bytes_len > 0))
+}
+
+pub(super) fn _decode_snapshot_meta_partial(bytes: &[u8]) -> LoroResult<(&[u8], bool)> {
+    let (start, end, is_shallow) = parse_snapshot_meta_partial_range(bytes)?;
+    Ok((&bytes[start..end], is_shallow))
+}
+
+pub(super) fn _decode_snapshot_meta_partial_bytes(bytes: Bytes) -> LoroResult<(Bytes, bool)> {
+    let (start, end, is_shallow) = parse_snapshot_meta_partial_range(&bytes)?;
+    Ok((bytes.slice(start..end), is_shallow))
 }
 
 fn read_u32_le_slice(r: &mut &[u8]) -> LoroResult<u32> {
@@ -158,6 +169,15 @@ fn read_u32_le(r: &mut bytes::buf::Reader<Bytes>) -> LoroResult<u32> {
         )
     })?;
     Ok(u32::from_le_bytes(buf))
+}
+
+/// Whether a shallow snapshot's state and shallow-root sections are copied out
+/// of the input on import, so that they do not keep its op log section allocated.
+/// The copy is a transient extra allocation of their size; it is skipped when
+/// the op log section, the most that could stay allocated unaccounted, is under
+/// an eighth of them.
+fn copy_shallow_sections(oplog_len: usize, state_len: usize, shallow_len: usize) -> bool {
+    oplog_len.saturating_mul(8) >= state_len.saturating_add(shallow_len)
 }
 
 pub(crate) fn decode_snapshot(
@@ -213,6 +233,7 @@ pub(crate) fn decode_snapshot_inner(
 
     let arena_checkpoint = oplog.arena.checkpoint_for_rollback();
     let decode_result = (|| -> LoroResult<()> {
+        let oplog_len = oplog_bytes.len();
         oplog.decode_change_store(oplog_bytes)?;
         let state_frontiers;
         if shallow_root_state_bytes.is_empty() {
@@ -223,6 +244,22 @@ pub(crate) fn decode_snapshot_inner(
             state_frontiers = oplog.frontiers().clone();
         } else {
             ensure_cov::notify_cov("loro_internal::import::snapshot::gc");
+            // The shallow root keeps its bytes for the document's lifetime, and the
+            // state store keeps slices of the state section, but both are slices of
+            // the whole input: the op log section stayed allocated after the op log
+            // was rewritten (or spilled), uncounted. Copy them out unless the op log
+            // section is small. See context/memory-budget.md, "Shallow root input
+            // buffer".
+            let state_len = state_bytes.as_ref().map_or(0, Bytes::len);
+            let (shallow_root_state_bytes, state_bytes) =
+                if copy_shallow_sections(oplog_len, state_len, shallow_root_state_bytes.len()) {
+                    (
+                        Bytes::copy_from_slice(&shallow_root_state_bytes),
+                        state_bytes.map(|b| Bytes::copy_from_slice(&b)),
+                    )
+                } else {
+                    (shallow_root_state_bytes, state_bytes)
+                };
             let shallow_root_state_frontiers = state.store.decode_gc(
                 shallow_root_state_bytes.clone(),
                 oplog.dag().shallow_since_frontiers().clone(),
@@ -254,12 +291,16 @@ pub(crate) fn decode_snapshot_inner(
         }
 
         state.init_with_states_and_version(state_frontiers, &oplog, vec![], false, origin)?;
+        oplog.set_block_cache(doc.kv_block_cache.clone());
+        state.set_block_cache(doc.kv_block_cache.clone());
         Ok(())
     })();
 
     if let Err(e) = decode_result {
         state.reset_to_empty_for_failed_snapshot_import();
         oplog.reset_to_empty_for_failed_snapshot_import(arena_checkpoint, &mut state);
+        oplog.set_block_cache(doc.kv_block_cache.clone());
+        state.set_block_cache(doc.kv_block_cache.clone());
         return Err(e);
     }
     drop(state);
@@ -272,6 +313,8 @@ pub(crate) fn decode_snapshot_inner(
             let mut state = doc.app_state().lock();
             state.reset_to_empty_for_failed_snapshot_import();
             oplog.reset_to_empty_for_failed_snapshot_import(arena_checkpoint, &mut state);
+            oplog.set_block_cache(doc.kv_block_cache.clone());
+            state.set_block_cache(doc.kv_block_cache.clone());
             return Err(e);
         }
         debug_assert_eq!(doc.state_frontiers(), doc.oplog_frontiers());
@@ -355,11 +398,7 @@ fn encode_snapshot_inner_with(
     snapshot
 }
 
-pub(crate) fn decode_oplog(
-    oplog: &mut OpLog,
-    bytes: &[u8],
-    values: crate::oplog::ImportedValues,
-) -> Result<Vec<Change>, LoroError> {
+fn parse_oplog_len_range(bytes: &[u8]) -> Result<usize, LoroError> {
     let oplog_len = bytes
         .get(0..4)
         .ok_or_else(|| LoroError::DecodeError("decode_oplog: missing length prefix".into()))?;
@@ -368,11 +407,34 @@ pub(crate) fn decode_oplog(
             .try_into()
             .expect("slice length checked to be exactly 4"),
     ) as usize;
-    let oplog_bytes = bytes
-        .get(4..4 + oplog_len)
+    let end = 4usize
+        .checked_add(oplog_len)
         .ok_or_else(|| LoroError::DecodeError("decode_oplog: invalid oplog length".into()))?;
-    let mut changes =
-        ChangeStore::decode_snapshot_for_updates(oplog_bytes.to_vec().into(), oplog, values)?;
+    if bytes.len() < end {
+        return Err(LoroError::DecodeError(
+            "decode_oplog: invalid oplog length".into(),
+        ));
+    }
+    Ok(end)
+}
+
+pub(crate) fn decode_oplog(
+    oplog: &mut OpLog,
+    bytes: &[u8],
+    values: crate::oplog::ImportedValues,
+) -> Result<Vec<Change>, LoroError> {
+    let end = parse_oplog_len_range(bytes)?;
+    decode_oplog_bytes(oplog, bytes[..end].to_vec().into(), values)
+}
+
+pub(crate) fn decode_oplog_bytes(
+    oplog: &mut OpLog,
+    bytes: Bytes,
+    values: crate::oplog::ImportedValues,
+) -> Result<Vec<Change>, LoroError> {
+    let end = parse_oplog_len_range(&bytes)?;
+    let oplog_bytes = bytes.slice(4..end);
+    let mut changes = ChangeStore::decode_snapshot_for_updates(oplog_bytes, oplog, values)?;
     changes.sort_unstable_by_key(|x| x.lamport);
     Ok(changes)
 }
@@ -433,6 +495,83 @@ mod tests {
         let encoded = doc.export(ExportMode::Snapshot).unwrap();
         let parsed = crate::encoding::parse_header_and_body(&encoded, true).unwrap();
         _decode_snapshot_bytes(Bytes::copy_from_slice(parsed.body)).unwrap()
+    }
+
+    /// Imports `encoded` from a buffer whose drop is observable, runs `after`,
+    /// and returns whether the buffer was released.
+    fn input_released_after(encoded: &[u8], after: impl FnOnce(&LoroDoc)) -> bool {
+        struct Owner(Vec<u8>, Arc<std::sync::atomic::AtomicBool>);
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let parsed = crate::encoding::parse_header_and_body(encoded, true).unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let body = Bytes::from_owner(Owner(parsed.body.to_vec(), released.clone()));
+        let doc = LoroDoc::new_auto_commit();
+        doc.with_barrier(|| decode_snapshot(&doc, body, Default::default()))
+            .unwrap();
+        after(&doc);
+        let ans = released.load(std::sync::atomic::Ordering::SeqCst);
+        drop(doc);
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+        ans
+    }
+
+    fn doc_with_history() -> (LoroDoc, Frontiers) {
+        let doc = LoroDoc::new_auto_commit();
+        doc.set_peer_id(1).unwrap();
+        let map = doc.get_map("m");
+        for i in 0..200 {
+            map.insert(&format!("k{i}"), "v".repeat(100)).unwrap();
+        }
+        doc.commit_then_renew();
+        let middle = doc.oplog_frontiers();
+        let text = doc.get_text("t");
+        for _ in 0..50 {
+            text.insert(0, "abc", crate::cursor::PosType::Unicode)
+                .unwrap();
+            doc.commit_then_renew();
+        }
+        (doc, middle)
+    }
+
+    /// A shallow root used to keep a slice of the whole import input, so the op
+    /// log and state sections stayed allocated after their stores were rewritten
+    /// (an edit and `reclaim_memory`), uncounted by the statistics.
+    #[test]
+    fn rewritten_stores_release_the_snapshot_input_buffer() {
+        let (src, middle) = doc_with_history();
+        let full = src.export(ExportMode::Snapshot).unwrap();
+        let shallow = src.export(ExportMode::shallow_snapshot(&middle)).unwrap();
+        let parsed = crate::encoding::parse_header_and_body(&shallow, true).unwrap();
+        let sections = _decode_snapshot_bytes(Bytes::copy_from_slice(parsed.body)).unwrap();
+        assert!(copy_shallow_sections(
+            sections.oplog_bytes.len(),
+            sections.state_bytes.as_ref().map_or(0, Bytes::len),
+            sections.shallow_root_state_bytes.len()
+        ));
+        for (name, bytes) in [("full", &full), ("shallow", &shallow)] {
+            let released = input_released_after(bytes, |doc| {
+                assert_eq!(doc.get_deep_value(), src.get_deep_value());
+                let map = doc.get_map("m");
+                for i in 0..200 {
+                    map.insert(&format!("k{i}"), "changed").unwrap();
+                }
+                doc.get_text("t")
+                    .insert(0, "new", crate::cursor::PosType::Unicode)
+                    .unwrap();
+                doc.commit_then_renew();
+                let _ = doc.reclaim_memory();
+            });
+            assert!(released, "{name}: the input buffer is still allocated");
+        }
     }
 
     #[test]
@@ -569,10 +708,10 @@ fn new_metadata_oplog() -> OpLog {
     oplog
 }
 
-pub(crate) fn decode_snapshot_blob_meta(
-    parsed: ParsedHeaderAndBody,
+fn decode_snapshot_blob_meta_from_parts(
+    oplog_bytes: Bytes,
+    is_shallow: bool,
 ) -> LoroResult<ImportBlobMetadata> {
-    let (oplog_bytes, is_shallow) = _decode_snapshot_meta_partial(parsed.body)?;
     let mode = if is_shallow {
         EncodedBlobMode::ShallowSnapshot
     } else {
@@ -580,7 +719,7 @@ pub(crate) fn decode_snapshot_blob_meta(
     };
 
     let mut oplog = new_metadata_oplog();
-    oplog.decode_change_store(oplog_bytes.to_vec().into())?;
+    oplog.decode_change_store(oplog_bytes)?;
     let timestamp = oplog.get_greatest_timestamp(oplog.dag.frontiers());
     let f = oplog.dag.shallow_since_frontiers().clone();
     let start_timestamp = oplog.get_timestamp_of_version(&f);
@@ -597,11 +736,35 @@ pub(crate) fn decode_snapshot_blob_meta(
     })
 }
 
+pub(crate) fn decode_snapshot_blob_meta(
+    parsed: ParsedHeaderAndBody,
+) -> LoroResult<ImportBlobMetadata> {
+    let (oplog_bytes, is_shallow) = _decode_snapshot_meta_partial(parsed.body)?;
+    decode_snapshot_blob_meta_from_parts(oplog_bytes.to_vec().into(), is_shallow)
+}
+
+pub(crate) fn decode_snapshot_blob_meta_bytes(
+    parsed: ParsedHeaderAndBodyBytes,
+) -> LoroResult<ImportBlobMetadata> {
+    let (oplog_bytes, is_shallow) = _decode_snapshot_meta_partial_bytes(parsed.body)?;
+    decode_snapshot_blob_meta_from_parts(oplog_bytes, is_shallow)
+}
+
 pub(crate) fn decode_updates_blob_meta(
     parsed: ParsedHeaderAndBody,
 ) -> LoroResult<ImportBlobMetadata> {
+    decode_updates_blob_meta_from_body(parsed.body.to_vec().into())
+}
+
+pub(crate) fn decode_updates_blob_meta_bytes(
+    parsed: ParsedHeaderAndBodyBytes,
+) -> LoroResult<ImportBlobMetadata> {
+    decode_updates_blob_meta_from_body(parsed.body)
+}
+
+fn decode_updates_blob_meta_from_body(body: Bytes) -> LoroResult<ImportBlobMetadata> {
     let mut oplog = new_metadata_oplog();
-    let changes = decode_updates(&mut oplog, parsed.body.to_vec().into())?;
+    let changes = decode_updates(&mut oplog, body)?;
     let mut start_vv = VersionVector::new();
     let mut end_vv = VersionVector::new();
     for c in changes.iter() {

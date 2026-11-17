@@ -134,6 +134,9 @@ pub struct DocDiff {
     pub origin: InternalString,
     pub by: EventTriggerKind,
     pub diff: Vec<ContainerDiff>,
+    /// The inverse of the local commits in this event, when an undo manager
+    /// asked for it and they are contiguous. See [`crate::undo::LocalInverse`].
+    pub(crate) local_inverse: Option<std::sync::Arc<crate::undo::LocalInverse>>,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +172,8 @@ pub(crate) struct InternalDocDiff<'a> {
     /// The values inside this array is in random order
     pub(crate) diff: Cow<'a, [InternalContainerDiff]>,
     pub(crate) new_version: Cow<'a, Frontiers>,
+    /// For a local commit with an undo manager attached: its inverse.
+    pub(crate) local_inverse: Option<std::sync::Arc<crate::undo::LocalInverse>>,
 }
 
 impl InternalDocDiff<'_> {
@@ -178,6 +183,7 @@ impl InternalDocDiff<'_> {
             by: self.by,
             diff: Cow::Owned((*self.diff).to_owned()),
             new_version: Cow::Owned((*self.new_version).to_owned()),
+            local_inverse: self.local_inverse,
         }
     }
 
@@ -534,6 +540,83 @@ impl Diff {
             Diff::Text(text) => text.transform_pos(pos, left_prior),
             _ => pos,
         }
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        fn value_or_handler_bytes(vh: &ValueOrHandler) -> usize {
+            match vh {
+                ValueOrHandler::Value(v) => v.estimated_heap_bytes(),
+                ValueOrHandler::Handler(h) => container_id_estimated_bytes(&h.id()),
+            }
+        }
+
+        match self {
+            Diff::List(list) => {
+                let mut total = list.node_len() * std::mem::size_of::<ListDiffItem>();
+                for item in list.iter() {
+                    if let DeltaItem::Replace { value, .. } = item {
+                        for vh in value.iter() {
+                            total = total.saturating_add(value_or_handler_bytes(vh));
+                        }
+                    }
+                }
+                total
+            }
+            Diff::Text(text) => {
+                let mut total = text.node_len() * std::mem::size_of::<TextDiffItem>();
+                for item in text.iter() {
+                    if let DeltaItem::Replace { value, attr, .. } = item {
+                        total = total.saturating_add(value.len_bytes());
+                        if !attr.0.is_empty() {
+                            total = total.saturating_add(
+                                attr.0.capacity()
+                                    * (std::mem::size_of::<String>()
+                                        + std::mem::size_of::<LoroValue>()
+                                        + 8),
+                            );
+                            for (k, v) in attr.0.iter() {
+                                total = total.saturating_add(k.capacity()).saturating_add(
+                                    v.estimated_heap_bytes()
+                                        .saturating_sub(std::mem::size_of::<LoroValue>()),
+                                );
+                            }
+                        }
+                    }
+                }
+                total
+            }
+            Diff::Map(map) => {
+                let mut total = map.updated.capacity()
+                    * (std::mem::size_of::<InternalString>()
+                        + std::mem::size_of::<crate::delta::ResolvedMapValue>()
+                        + 8);
+                for mv in map.updated.values() {
+                    if let Some(vh) = &mv.value {
+                        total = total.saturating_add(
+                            value_or_handler_bytes(vh)
+                                .saturating_sub(std::mem::size_of::<LoroValue>()),
+                        );
+                    }
+                }
+                total
+            }
+            Diff::Tree(tree) => {
+                tree.diff.capacity() * std::mem::size_of::<crate::delta::TreeDiffItem>()
+            }
+            #[cfg(feature = "counter")]
+            Diff::Counter(_) => 0,
+            Diff::Unknown => 0,
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn container_id_estimated_bytes(id: &ContainerID) -> usize {
+    match id {
+        ContainerID::Root { name, .. } => {
+            std::mem::size_of::<ContainerID>().saturating_add(name.len())
+        }
+        ContainerID::Normal { .. } => std::mem::size_of::<ContainerID>(),
     }
 }
 

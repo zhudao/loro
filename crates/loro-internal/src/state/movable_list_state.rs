@@ -279,6 +279,37 @@ mod list_item_tree {
     }
 }
 
+/// What the import undo log (`state/undo_log.rs`) records for a movable list:
+/// the inverse of every primitive change of [`inner::InnerState`], in the order
+/// they were made. Undone in reverse, each step meets the exact state it was
+/// recorded in. Items are found by id, since leaf indices are not stable
+/// across removal and reinsertion.
+#[derive(Debug, Default)]
+pub(crate) struct MovableListUndo(Vec<MovableListUndoStep>);
+
+#[derive(Debug)]
+enum MovableListUndoStep {
+    /// A list item was inserted.
+    ListInserted(IdLp),
+    /// A list item was removed from op index `pos`.
+    ListRemoved { pos: usize, item: ListItem },
+    /// The list item's `pointed_by` was `old`.
+    PointedBy {
+        item: IdLp,
+        old: Option<CompactIdLp>,
+    },
+    /// The element was `old` (`None`: absent).
+    Element {
+        elem_id: CompactIdLp,
+        old: Option<Element>,
+    },
+    /// The child-container map entry was `old` (`None`: absent).
+    ChildMap {
+        container: ContainerID,
+        old: Option<CompactIdLp>,
+    },
+}
+
 /// The inner state of the list.
 ///
 /// The operations inside this mod need to ensure certain invariants.
@@ -294,7 +325,7 @@ mod inner {
 
     use super::{
         list_item_tree::{MovableListTreeTrait, OpLenQuery, UserLenQuery},
-        Element, IndexType, ListItem,
+        Element, IndexType, ListItem, MovableListUndoStep as Step,
     };
 
     #[derive(Debug, Clone)]
@@ -306,6 +337,18 @@ mod inner {
         /// But it's guaranteed that if there is a ContainerID in the actual list,
         /// it will be mapped correctly.
         child_container_to_elem: FxHashMap<ContainerID, CompactIdLp>,
+        /// Recording for the import undo log; see [`super::MovableListUndo`].
+        undo: UndoSlot,
+    }
+
+    /// A clone does not continue another state's recording.
+    #[derive(Debug, Default)]
+    struct UndoSlot(Option<Vec<Step>>);
+
+    impl Clone for UndoSlot {
+        fn clone(&self) -> Self {
+            Self(None)
+        }
     }
 
     impl PartialEq for InnerState {
@@ -336,6 +379,82 @@ mod inner {
                 id_to_list_leaf: FxHashMap::default(),
                 elements: FxHashMap::default(),
                 child_container_to_elem: FxHashMap::default(),
+                undo: UndoSlot(None),
+            }
+        }
+
+        pub fn start_undo(&mut self) {
+            self.undo.0 = Some(Vec::new());
+        }
+
+        pub fn take_undo(&mut self) -> Vec<Step> {
+            self.undo.0.take().unwrap_or_default()
+        }
+
+        #[inline]
+        fn rec(&mut self, step: impl FnOnce(&Self) -> Step) {
+            if self.undo.0.is_some() {
+                let step = step(self);
+                if let Some(undo) = &mut self.undo.0 {
+                    undo.push(step);
+                }
+            }
+        }
+
+        #[inline]
+        fn rec_elem(&mut self, elem_id: CompactIdLp) {
+            self.rec(|s| Step::Element {
+                elem_id,
+                old: s.elements.get(&elem_id).cloned(),
+            });
+        }
+
+        #[inline]
+        fn rec_child(&mut self, container: &ContainerID) {
+            self.rec(|s| Step::ChildMap {
+                container: container.clone(),
+                old: s.child_container_to_elem.get(container).copied(),
+            });
+        }
+
+        /// Undo steps recorded by [`Self::start_undo`], in reverse.
+        pub fn apply_undo(&mut self, steps: Vec<Step>) {
+            debug_assert!(self.undo.0.is_none());
+            for step in steps.into_iter().rev() {
+                match step {
+                    Step::ListInserted(id) => {
+                        let leaf = self.id_to_list_leaf.remove(&id).unwrap();
+                        self.list.remove_leaf(Cursor { leaf, offset: 0 }).unwrap();
+                    }
+                    Step::ListRemoved { pos, item } => {
+                        let id = item.id.idlp();
+                        let c = self.list.insert::<OpLenQuery>(&pos, item).0;
+                        self.id_to_list_leaf.insert(id, c.leaf);
+                    }
+                    Step::PointedBy { item, old } => {
+                        let leaf = *self.id_to_list_leaf.get(&item).unwrap();
+                        self.list.update_leaf(leaf, |list_item| {
+                            list_item.pointed_by = old;
+                            (true, None, None)
+                        });
+                    }
+                    Step::Element { elem_id, old } => match old {
+                        Some(elem) => {
+                            self.elements.insert(elem_id, elem);
+                        }
+                        None => {
+                            self.elements.remove(&elem_id);
+                        }
+                    },
+                    Step::ChildMap { container, old } => match old {
+                        Some(elem_id) => {
+                            self.child_container_to_elem.insert(container, elem_id);
+                        }
+                        None => {
+                            self.child_container_to_elem.remove(&container);
+                        }
+                    },
+                }
             }
         }
 
@@ -355,7 +474,33 @@ mod inner {
         }
 
         pub fn remove_elem_by_id(&mut self, elem_id: &CompactIdLp) {
+            self.rec_elem(*elem_id);
             self.elements.remove(elem_id);
+        }
+
+        pub(crate) fn estimated_heap_bytes(&self) -> usize {
+            let elem_overhead =
+                std::mem::size_of::<CompactIdLp>() + std::mem::size_of::<Element>() + 8;
+            let elements_bytes = self.elements.capacity() * elem_overhead
+                + self
+                    .elements
+                    .values()
+                    .map(|elem| {
+                        elem.value
+                            .estimated_heap_bytes()
+                            .saturating_sub(std::mem::size_of::<LoroValue>())
+                    })
+                    .sum::<usize>();
+            let list_len = self.list.root_cache().include_dead_len.max(0) as usize;
+            let leaf_bytes = self.id_to_list_leaf.capacity()
+                * (std::mem::size_of::<IdLp>() + std::mem::size_of::<LeafIndex>() + 8);
+            let child_bytes = self.child_container_to_elem.capacity()
+                * (std::mem::size_of::<ContainerID>() + std::mem::size_of::<CompactIdLp>() + 8);
+            std::mem::size_of::<super::MovableListState>()
+                .saturating_add(list_len * (std::mem::size_of::<ListItem>() + 16))
+                .saturating_add(elements_bytes)
+                .saturating_add(leaf_bytes)
+                .saturating_add(child_bytes)
         }
 
         #[allow(dead_code)]
@@ -450,6 +595,47 @@ mod inner {
             ans
         }
 
+        /// Visits the visible elements from user index `start` towards
+        /// `direction` (-1 or 1), with their user index, until `f` returns
+        /// `false`. One B-tree query, then neighbouring leaves.
+        pub fn walk_user(
+            &self,
+            start: usize,
+            direction: isize,
+            mut f: impl FnMut(usize, CompactIdLp, &Element) -> bool,
+        ) {
+            let Some(found) = self.list.query::<UserLenQuery>(&start) else {
+                return;
+            };
+            // The query may land on a dead item (no element) just before the
+            // visible one at `start`; the first visible item from there is it.
+            let mut c = found.cursor;
+            while self.list.get_elem(c.leaf).unwrap().pointed_by.is_none() {
+                match self.list.next_elem(c) {
+                    Some(next) => c = next,
+                    None => return,
+                }
+            }
+            let mut index = start as isize;
+            let mut cursor = Some(c);
+            while let Some(c) = cursor {
+                if let Some(elem_id) = self.list.get_elem(c.leaf).unwrap().pointed_by {
+                    if !f(index as usize, elem_id, &self.elements[&elem_id]) {
+                        return;
+                    }
+                    index += direction;
+                    if index < 0 {
+                        return;
+                    }
+                }
+                cursor = if direction > 0 {
+                    self.list.next_elem(c)
+                } else {
+                    self.list.prev_elem(c)
+                };
+            }
+        }
+
         #[inline]
         pub fn get_list_item_at(&self, pos: usize, index_type: IndexType) -> Option<&ListItem> {
             let index = match index_type {
@@ -512,6 +698,7 @@ mod inner {
                 )
                 .0;
             self.id_to_list_leaf.insert(list_item_id.idlp(), c.leaf);
+            self.rec(|_| Step::ListInserted(list_item_id.idlp()));
         }
 
         /// Drain the list items in the given range (op index).
@@ -522,8 +709,23 @@ mod inner {
             range: std::ops::Range<usize>,
             mut on_elem_id: impl FnMut(CompactIdLp, &Element),
         ) {
+            let start = range.start;
             for item in Self::drain_by_query::<OpLenQuery>(&mut self.list, range) {
                 self.id_to_list_leaf.remove(&item.id.idlp());
+                // Each drained item was at `start` once the ones before it were
+                // gone, so reinserting them at `start` in reverse restores them.
+                if let Some(undo) = &mut self.undo.0 {
+                    undo.push(Step::ListRemoved {
+                        pos: start,
+                        item: item.clone(),
+                    });
+                    if let Some(elem_id) = &item.pointed_by {
+                        undo.push(Step::Element {
+                            elem_id: *elem_id,
+                            old: self.elements.get(elem_id).cloned(),
+                        });
+                    }
+                }
                 if let Some(elem_id) = &item.pointed_by {
                     let elem = self.elements.get(elem_id).unwrap();
                     on_elem_id(*elem_id, elem);
@@ -554,6 +756,9 @@ mod inner {
             remove_old: bool,
         ) -> UpdateResultFromPosChange {
             let mut old_item_id = None;
+            if self.elements.get(&elem_id).is_none_or(|e| e.pos != new_pos) {
+                self.rec_elem(elem_id);
+            }
             if let Some(element) = self.elements.get_mut(&elem_id) {
                 if element.pos != new_pos {
                     old_item_id = Some(element.pos);
@@ -581,6 +786,12 @@ mod inner {
                 new_list_item_leaf: None,
                 removed_old_list_item_leaf: None,
             };
+            if let Some(&leaf) = self.id_to_list_leaf.get(&new_pos) {
+                self.rec(|s| Step::PointedBy {
+                    item: new_pos,
+                    old: s.list.get_elem(leaf).unwrap().pointed_by,
+                });
+            }
             if let Some(leaf) = self.id_to_list_leaf.get(&new_pos) {
                 ans.new_list_item_leaf = Some(*leaf);
                 self.list.update_leaf(*leaf, |list_item| {
@@ -605,9 +816,21 @@ mod inner {
 
                 if remove_old {
                     let leaf = self.id_to_list_leaf.remove(&old).unwrap();
+                    let pos = if self.undo.0.is_some() {
+                        self.get_index_of(leaf, IndexType::ForOp) as usize
+                    } else {
+                        0
+                    };
                     let elem = self.list.remove_leaf(Cursor { leaf, offset: 0 }).unwrap();
                     assert_eq!(elem.pointed_by, Some(elem_id));
+                    self.rec(|_| Step::ListRemoved { pos, item: elem });
                 } else if let Some(leaf) = self.id_to_list_leaf.get(&old) {
+                    let leaf = *leaf;
+                    self.rec(|s| Step::PointedBy {
+                        item: old,
+                        old: s.list.get_elem(leaf).unwrap().pointed_by,
+                    });
+                    let leaf = &leaf;
                     ans.removed_old_list_item_leaf = Some(*leaf);
                     let (still_valid, split) = self.list.update_leaf(*leaf, |item| {
                         item.pointed_by = None;
@@ -671,9 +894,23 @@ mod inner {
             debug_assert!(elem_id.peer != PeerID::MAX);
             debug_assert!(!value_id.is_none());
             if let LoroValue::Container(c) = &new_value {
+                self.rec_child(c);
                 self.child_container_to_elem.insert(c.clone(), elem_id);
             }
 
+            self.rec_elem(elem_id);
+            let old_child = match self.elements.get(&elem_id) {
+                Some(Element {
+                    value: LoroValue::Container(c),
+                    ..
+                }) if self.undo.0.is_some() && LoroValue::Container(c.clone()) != new_value => {
+                    Some(c.clone())
+                }
+                _ => None,
+            };
+            if let Some(c) = old_child {
+                self.rec_child(&c);
+            }
             if let Some(element) = self.elements.get_mut(&elem_id) {
                 if let LoroValue::Container(c) = &element.value {
                     if element.value != new_value {
@@ -701,8 +938,10 @@ mod inner {
             let pointed_by = elem.as_ref().map(|x| x.elem_id);
             if let Some(elem) = elem {
                 if let LoroValue::Container(c) = &elem.value {
+                    self.rec_child(c);
                     self.child_container_to_elem.insert(c.clone(), elem.elem_id);
                 }
+                self.rec_elem(elem.elem_id);
                 debug_assert!(!elem.last_set_id.is_none());
                 self.elements.insert(
                     elem.elem_id,
@@ -719,6 +958,7 @@ mod inner {
             });
             self.id_to_list_leaf
                 .insert(list_item_id.idlp(), cursor.leaf);
+            self.rec(|_| Step::ListInserted(list_item_id.idlp()));
         }
     }
 
@@ -831,6 +1071,16 @@ impl MovableListState {
         let item = self.inner.get_list_item_at(index, kind)?;
         let elem = item.pointed_by?;
         self.inner.elements().get(&elem).map(|x| &x.value)
+    }
+
+    /// See `InnerState::walk_user`.
+    pub(crate) fn walk_user(
+        &self,
+        start: usize,
+        direction: isize,
+        f: impl FnMut(usize, CompactIdLp, &Element) -> bool,
+    ) {
+        self.inner.walk_user(start, direction, f)
     }
 
     pub(crate) fn get_elem_at_given_pos(
@@ -1022,6 +1272,10 @@ impl MovableListState {
             (elem.pos.is_none() || elem.value_id.is_none())
                 && !self.inner.elements().contains_key(elem_id)
         })
+    }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.inner.estimated_heap_bytes()
     }
 }
 
@@ -1367,6 +1621,28 @@ impl ContainerState for MovableListState {
 
     // How we apply the diff is coupled with the [DiffMode] we used to calculate the diff.
     // So be careful when you modify this function.
+    fn undo_record(&mut self, _diff: &InternalDiff) -> super::undo_log::StateUndo {
+        // Recorded while the diff is applied; see `finish_undo_record`.
+        self.inner.start_undo();
+        super::undo_log::StateUndo::MovableList(MovableListUndo::default())
+    }
+
+    fn finish_undo_record(&mut self, undo: &mut super::undo_log::StateUndo) {
+        if let super::undo_log::StateUndo::MovableList(record) = undo {
+            record.0 = self.inner.take_undo();
+        }
+    }
+
+    fn apply_undo(&mut self, undo: super::undo_log::StateUndo) {
+        let super::undo_log::StateUndo::MovableList(record) = undo else {
+            unreachable!()
+        };
+        self.inner.apply_undo(record.0);
+        if cfg!(debug_assertions) {
+            self.inner.check_consistency();
+        }
+    }
+
     fn apply_diff(&mut self, diff: InternalDiff, ctx: DiffApplyContext) -> LoroResult<()> {
         let _ = self.apply_diff_and_convert(diff, ctx);
         Ok(())
@@ -2082,6 +2358,47 @@ mod test {
             list.validate_diff(&InternalDiff::MovableList(diff))
                 .unwrap();
         }
+    }
+
+    /// `walk_user` from every index, both ways, matches indexed lookups,
+    /// including with dead items (left by moves) between elements.
+    #[test]
+    fn walk_user_matches_indexed_lookup_with_dead_items() {
+        let doc = crate::LoroDoc::new_auto_commit();
+        let list = doc.get_movable_list("list");
+        for i in 0..12 {
+            list.push(LoroValue::I64(i)).unwrap();
+        }
+        for (from, to) in [(0, 5), (7, 1), (11, 0), (3, 9), (6, 6)] {
+            list.mov(from, to).unwrap();
+        }
+        doc.commit_then_renew();
+        let state = doc.app_state();
+        let mut state = state.lock();
+        let idx = list.idx();
+        state.with_state(idx, |s| {
+            let s = s.as_movable_list_state().unwrap();
+            let n = s.len();
+            for start in 0..n {
+                for direction in [-1isize, 1] {
+                    let mut walked = Vec::new();
+                    s.walk_user(start, direction, |i, id, _| {
+                        walked.push((i, id));
+                        true
+                    });
+                    let expected: Vec<_> = if direction > 0 {
+                        (start..n).collect()
+                    } else {
+                        (0..=start).rev().collect()
+                    };
+                    let expected: Vec<_> = expected
+                        .into_iter()
+                        .map(|i| (i, s.get_elem_id_at(i, IndexType::ForUser).unwrap()))
+                        .collect();
+                    assert_eq!(walked, expected, "start {start} direction {direction}");
+                }
+            }
+        });
     }
 
     #[test]

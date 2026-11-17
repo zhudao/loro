@@ -18,7 +18,7 @@ use crate::{
 #[derive(EnumAsInner, Debug, Clone)]
 pub enum InnerContent {
     List(InnerListOp),
-    Map(MapSet),
+    Map(Arc<MapSet>),
     Tree(Arc<TreeOp>),
     // The future content should not use any encoded arena context.
     Future(FutureInnerContent),
@@ -35,8 +35,8 @@ impl InnerContent {
                         }
                     }
                 }
-                InnerListOp::Set { value, .. } => {
-                    if let LoroValue::Container(c) = value {
+                InnerListOp::Set(set) => {
+                    if let LoroValue::Container(c) = &set.value {
                         f(c);
                     }
                 }
@@ -44,7 +44,7 @@ impl InnerContent {
                 InnerListOp::Move { .. } => {}
                 InnerListOp::InsertText { .. } => {}
                 InnerListOp::Delete(_) => {}
-                InnerListOp::StyleStart { .. } => {}
+                InnerListOp::StyleStart(_) => {}
                 InnerListOp::StyleEnd => {}
             },
             crate::op::InnerContent::Map(m) => {
@@ -67,7 +67,60 @@ impl InnerContent {
     }
 }
 
+/// The heap header of an `Arc` allocation (strong + weak counts).
+const ARC_HEADER_BYTES: usize = 16;
+
+fn value_payload_bytes(value: &LoroValue) -> usize {
+    value
+        .estimated_heap_bytes()
+        .saturating_sub(std::mem::size_of::<LoroValue>())
+}
+
 impl InnerContent {
+    /// Heap bytes this content owns beyond `size_of::<Op>()`: its boxed payload
+    /// (`Arc<MapSet>`, `Arc<SetListOp>`, `Arc<StyleOp>`, `Arc<TreeOp>`, future
+    /// values) and the values of a list insert, including nested values.
+    ///
+    /// This is a conservative per-document estimate. A payload that is shared
+    /// with materialized state, or a value buffer shared by the ops of one parsed
+    /// block, is counted once per op that refers to it. Text inserts point into
+    /// the string arena or the block's encoded bytes, which are accounted there.
+    /// O(size of the payload's value tree); callers cache the result per op batch.
+    pub(crate) fn payload_heap_bytes(&self) -> usize {
+        match self {
+            InnerContent::Map(set) => ARC_HEADER_BYTES
+                .saturating_add(std::mem::size_of::<MapSet>())
+                .saturating_add(set.key.len())
+                .saturating_add(set.value.as_ref().map_or(0, value_payload_bytes)),
+            InnerContent::Tree(_) => ARC_HEADER_BYTES.saturating_add(std::mem::size_of::<TreeOp>()),
+            InnerContent::List(list) => match list {
+                InnerListOp::Insert { slice, .. } => slice
+                    .as_slice()
+                    .iter()
+                    .map(value_payload_bytes)
+                    .fold(0usize, usize::saturating_add),
+                InnerListOp::Set(set) => ARC_HEADER_BYTES
+                    .saturating_add(std::mem::size_of_val::<
+                        crate::container::list::list_op::SetListOp,
+                    >(set))
+                    .saturating_add(value_payload_bytes(&set.value)),
+                InnerListOp::StyleStart(style) => ARC_HEADER_BYTES
+                    .saturating_add(std::mem::size_of_val(style.as_ref()))
+                    .saturating_add(style.key.len())
+                    .saturating_add(value_payload_bytes(&style.value)),
+                InnerListOp::InsertText { .. }
+                | InnerListOp::Delete(_)
+                | InnerListOp::Move { .. }
+                | InnerListOp::StyleEnd => 0,
+            },
+            InnerContent::Future(f) => match f {
+                #[cfg(feature = "counter")]
+                FutureInnerContent::Counter(_) => 0,
+                FutureInnerContent::Unknown { .. } => std::mem::size_of::<OwnedValue>(),
+            },
+        }
+    }
+
     pub fn estimate_storage_size(&self, kind: ContainerType) -> usize {
         match self {
             InnerContent::List(l) => l.estimate_storage_size(kind),
@@ -378,10 +431,10 @@ mod tests {
             other => panic!("expected sliced list insert, got {other:?}"),
         }
 
-        let map = InnerContent::Map(MapSet {
+        let map = InnerContent::Map(Arc::new(MapSet {
             key: InternalString::from("flag"),
             value: Some(true.into()),
-        });
+        }));
         assert_eq!(map.content_len(), 1);
         assert_eq!(map.estimate_storage_size(ContainerType::Map), 3);
         assert!(matches!(map.slice(0, 1), InnerContent::Map(_)));
@@ -425,10 +478,10 @@ mod tests {
         assert_eq!(children, vec![list_child.clone(), text_child.clone()]);
 
         let map_child = ContainerID::new_normal(ID::new(2, 1), ContainerType::Map);
-        let map = InnerContent::Map(MapSet {
+        let map = InnerContent::Map(Arc::new(MapSet {
             key: InternalString::from("child"),
             value: Some(LoroValue::Container(map_child.clone())),
-        });
+        }));
         let mut children = Vec::new();
         map.visit_created_children(&mut |id| children.push(id.clone()));
         assert_eq!(children, vec![map_child]);

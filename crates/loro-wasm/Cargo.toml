@@ -1,6 +1,6 @@
 [package]
 name = "loro-wasm"
-version = "1.17.1"
+version = "1.18.0"
 edition = "2021"
 publish = false
 repository = "https://github.com/loro-dev/loro/"
@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 release = false
 
 [dependencies]
+bytes = { workspace = true }
 js-sys = "0.3.60"
 loro-internal = { path = "../loro-internal", features = [
     "wasm",

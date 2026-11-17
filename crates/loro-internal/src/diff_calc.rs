@@ -158,6 +158,46 @@ impl DiffCalculator {
         self.calculators.get(&container).map(|(_, c)| c)
     }
 
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let map_table_bytes = self.calculators.capacity()
+            * (std::mem::size_of::<ContainerIdx>()
+                + std::mem::size_of::<(Option<NonZeroU32>, ContainerDiffCalculator)>()
+                + 8);
+        let calc_bytes: usize = self
+            .calculators
+            .values()
+            .map(|(_, c)| c.estimated_bytes())
+            .sum();
+        std::mem::size_of::<Self>()
+            .saturating_add(map_table_bytes)
+            .saturating_add(calc_bytes)
+    }
+
+    /// Evict cached per-container diff calculators down to `keep_hot` entries.
+    pub(crate) fn reclaim_cold_caches(&mut self, keep_hot: usize) -> usize {
+        let before = self.estimated_bytes();
+        if self.calculators.len() > keep_hot {
+            if keep_hot == 0 {
+                self.calculators.clear();
+            } else {
+                let mut by_size: Vec<(ContainerIdx, usize)> = self
+                    .calculators
+                    .iter()
+                    .map(|(&idx, (_, c))| (idx, c.estimated_bytes()))
+                    .collect();
+                // Keep the `keep_hot` smallest entries and drop the largest trackers first.
+                by_size.sort_by_key(|(idx, bytes)| (*bytes, *idx));
+                for (idx, _) in by_size.into_iter().skip(keep_hot) {
+                    self.calculators.remove(&idx);
+                }
+            }
+            self.calculators.shrink_to_fit();
+        } else if self.calculators.is_empty() && self.calculators.capacity() > 0 {
+            self.calculators.shrink_to_fit();
+        }
+        before.saturating_sub(self.estimated_bytes())
+    }
+
     /// Calculate the diff between two versions.
     ///
     /// Return the diff and the origin diff mode (it's not the diff mode used by the diff calculator.
@@ -195,6 +235,8 @@ impl DiffCalculator {
         if before == after {
             return Ok((Vec::new(), DiffMode::Linear));
         }
+        #[cfg(test)]
+        DIFF_CALCS.with(|n| n.set(n.get() + 1));
 
         let s = tracing::span!(tracing::Level::INFO, "DiffCalc", ?before, ?after,);
         let _e = s.enter();
@@ -579,6 +621,19 @@ impl ContainerDiffCalculator {
             _ => {}
         }
     }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Map(calc) => calc.estimated_bytes(),
+            Self::List(calc) => calc.estimated_bytes(),
+            Self::Richtext(calc) => calc.estimated_bytes(),
+            Self::Tree(calc) => calc.estimated_bytes(),
+            Self::MovableList(calc) => calc.estimated_bytes(),
+            #[cfg(feature = "counter")]
+            Self::Counter(calc) => calc.estimated_bytes(),
+            Self::Unknown(_) => std::mem::size_of::<UnknownDiffCalculator>(),
+        }
+    }
 }
 
 trait RebuildOpVisitor {
@@ -669,6 +724,20 @@ impl MapDiffCalculator {
             changed: Default::default(),
             current_mode: DiffMode::Checkout,
         }
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.changed.capacity()
+            * (std::mem::size_of::<InternalString>() + std::mem::size_of::<Option<MapValue>>() + 8)
+            + self
+                .changed
+                .values()
+                .filter_map(|v| v.as_ref().and_then(|mv| mv.value.as_ref()))
+                .map(|v| {
+                    v.estimated_heap_bytes()
+                        .saturating_sub(std::mem::size_of::<LoroValue>())
+                })
+                .sum::<usize>()
     }
 }
 
@@ -811,7 +880,7 @@ impl ListTracker {
                     // checkout can replay ops the tracker already has.
                     let values = &mut self.values;
                     self.tracker
-                        .insert_with(op.id_full(), *pos, slice.len(), |skip| {
+                        .insert_with(op.id_full(), *pos as usize, slice.len(), |skip| {
                             RichtextChunk::new_text(values.push(slice.slice(skip, slice.len())))
                         });
                 }
@@ -861,6 +930,13 @@ impl ListDiffCalculator {
         self.source_not_in_op_context = true;
     }
 
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        std::mem::size_of::<ListTracker>()
+            .saturating_add(self.start_vv.len() * 16)
+            .saturating_add(self.tracker.tracker.estimated_heap_bytes())
+            .saturating_add(self.tracker.values.estimated_bytes())
+    }
+
     /// A retreat never goes below a critical base, so it can only bring back
     /// opaque content that a replayed op deleted.
     fn retreat_is_trustworthy(&self) -> bool {
@@ -905,6 +981,29 @@ impl MovableListDiffCalculator {
 
     fn mark_source_not_in_op_context(&mut self) {
         self.list.mark_source_not_in_op_context();
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let inner = &self.inner;
+        let elem_changes_bytes = inner.changed_elements.capacity()
+            * (std::mem::size_of::<CompactIdLp>() + std::mem::size_of::<ElementDelta>() + 8)
+            + inner
+                .changed_elements
+                .values()
+                .map(|delta| {
+                    delta
+                        .value
+                        .estimated_heap_bytes()
+                        .saturating_sub(std::mem::size_of::<LoroValue>())
+                })
+                .sum::<usize>();
+        let move_map_bytes = inner.move_id_to_elem_id.capacity()
+            * (std::mem::size_of::<ID>() + std::mem::size_of::<IdLp>() + 8);
+        std::mem::size_of::<ListDiffCalculator>()
+            .saturating_add(std::mem::size_of::<MovableListInner>())
+            .saturating_add(self.list.estimated_bytes())
+            .saturating_add(elem_changes_bytes)
+            .saturating_add(move_map_bytes)
     }
 }
 
@@ -1171,6 +1270,42 @@ impl RichtextDiffCalculator {
         }
     }
 
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let mode_bytes = match &*self.mode {
+            RichtextCalcMode::Crdt {
+                tracker,
+                styles,
+                texts,
+                start_vv,
+                full,
+                ..
+            } => {
+                let styles_bytes = styles.capacity() * std::mem::size_of::<(StyleOp, usize)>()
+                    + styles
+                        .iter()
+                        .map(|(op, _)| {
+                            op.value
+                                .estimated_heap_bytes()
+                                .saturating_sub(std::mem::size_of::<LoroValue>())
+                        })
+                        .sum::<usize>();
+                let full_bytes = full.as_ref().map_or(0, |f| {
+                    std::mem::size_of::<FullTracker>().saturating_add(f.vv.len() * 16)
+                });
+                std::mem::size_of::<RichtextTracker>()
+                    .saturating_add(tracker.estimated_heap_bytes())
+                    .saturating_add(styles_bytes)
+                    .saturating_add(texts.estimated_bytes())
+                    .saturating_add(start_vv.len() * 16)
+                    .saturating_add(full_bytes)
+            }
+            RichtextCalcMode::Linear { diff, .. } => {
+                diff.node_len() * (std::mem::size_of::<RichtextStateChunk>() + 16)
+            }
+        };
+        std::mem::size_of::<RichtextCalcMode>().saturating_add(mode_bytes)
+    }
+
     /// Test-only: how many chars the text table holds, to pin that
     /// re-replayed inserts do not grow it.
     #[cfg(test)]
@@ -1196,14 +1331,7 @@ impl RichtextDiffCalculator {
     fn style_for_end_anchor(oplog: &OpLog, op: &RichOp) -> Option<(StyleOp, usize)> {
         let style_start_id = op.id().inc(-1);
         if let Some(start_op) = oplog.get_op_that_includes(style_start_id) {
-            let InnerListOp::StyleStart {
-                start: _,
-                end,
-                key,
-                value,
-                info,
-            } = start_op.content.as_list().unwrap()
-            else {
+            let InnerListOp::StyleStart(style) = start_op.content.as_list().unwrap() else {
                 unreachable!()
             };
 
@@ -1212,11 +1340,11 @@ impl RichtextDiffCalculator {
                     lamport: start_op.lamport(),
                     peer: style_start_id.peer,
                     cnt: style_start_id.counter,
-                    key: key.clone(),
-                    value: value.clone(),
-                    info: *info,
+                    key: style.key.clone(),
+                    value: style.value.clone(),
+                    info: style.info,
                 },
-                *end as usize,
+                style.end as usize,
             ))
         } else {
             oplog.with_history_cache(|history_cache| {
@@ -1358,14 +1486,13 @@ impl RichtextDiffCalculator {
                         del.is_reversed(),
                     );
                 }
-                InnerListOp::StyleStart {
-                    start,
-                    end,
-                    key,
-                    info,
-                    value,
-                } => {
-                    debug_assert!(start < end, "start: {}, end: {}", start, end);
+                InnerListOp::StyleStart(style) => {
+                    debug_assert!(
+                        style.start < style.end,
+                        "start: {}, end: {}",
+                        style.start,
+                        style.end
+                    );
                     // A persisted tracker replays ops it has already
                     // applied whenever the replay base sits below the
                     // version the tracker reached on an earlier round. The
@@ -1396,16 +1523,17 @@ impl RichtextDiffCalculator {
                                     lamport: op.lamport(),
                                     peer: id.peer,
                                     cnt: id.counter,
-                                    key: key.clone(),
-                                    value: value.clone(),
-                                    info: *info,
+                                    key: style.key.clone(),
+                                    value: style.value.clone(),
+                                    info: style.info,
                                 },
-                                *end as usize,
+                                style.end as usize,
                             ));
                             styles.len() - 1
                         }
                     };
-                    let start = Self::shallow_clamped_tracker_pos(oplog, tracker, *start as usize);
+                    let start =
+                        Self::shallow_clamped_tracker_pos(oplog, tracker, style.start as usize);
                     tracker.insert(
                         op.id_full(),
                         start,
@@ -1748,26 +1876,25 @@ impl DiffCalculatorTrait for RichtextDiffCalculator {
                     InnerListOp::Delete(del) => {
                         diff.delete(del.start() as usize, del.atom_len());
                     }
-                    InnerListOp::StyleStart {
-                        start,
-                        end,
-                        key,
-                        info,
-                        value,
-                    } => {
-                        debug_assert!(start < end, "start: {}, end: {}", start, end);
+                    InnerListOp::StyleStart(style) => {
+                        debug_assert!(
+                            style.start < style.end,
+                            "start: {}, end: {}",
+                            style.start,
+                            style.end
+                        );
                         let style_op = Arc::new(StyleOp {
                             lamport: op.lamport(),
                             peer: op.peer,
                             cnt: op.id_start().counter,
-                            key: key.clone(),
-                            value: value.clone(),
-                            info: *info,
+                            key: style.key.clone(),
+                            value: style.value.clone(),
+                            info: style.info,
                         });
 
-                        *last_style_start = Some((style_op.clone(), *end));
+                        *last_style_start = Some((style_op.clone(), style.end));
                         diff.insert_value(
-                            *start as usize,
+                            style.start as usize,
                             RichtextStateChunk::new_style(style_op, AnchorType::Start),
                             (),
                         );
@@ -2090,6 +2217,7 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
         self.list.source_not_in_op_context = false;
         if !vv.includes_vv(&self.list.start_vv) || !self.list.tracker.all_vv().includes_vv(vv) {
             self.list.tracker.reset();
+            self.inner.move_id_to_elem_id.clear();
             self.list.start_vv = vv.clone();
         }
 
@@ -2109,8 +2237,12 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
 
         // collect the elements that are moved, updated, or inserted
 
-        // If it's checkout mode, we don't need to track the changes
-        // we only need the element ids
+        // If it's checkout or import mode, `calculate_diff` rebuilds values from `checkout_index`,
+        // so we only need the element ids without cloning values here.
+        let skip_value_clone = matches!(
+            self.inner.current_mode,
+            DiffMode::Checkout | DiffMode::Import
+        );
         match l {
             InnerListOp::Insert { slice, pos: _ } => {
                 let op_id = op.id_full().idlp();
@@ -2121,7 +2253,11 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
                         id.compact(),
                         ElementDelta {
                             pos: Some(id),
-                            value: value.clone(),
+                            value: if skip_value_clone {
+                                LoroValue::Null
+                            } else {
+                                value.clone()
+                            },
                             value_updated: true,
                             value_id: Some(id),
                         },
@@ -2151,14 +2287,18 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
                     }
                 }
             }
-            InnerListOp::Set { elem_id, value } => {
+            InnerListOp::Set(set) => {
+                let elem_id = &set.elem_id;
+                let value = &set.value;
                 let idlp = IdLp::new(op.peer, op.lamport());
                 match self.inner.changed_elements.get_mut(&elem_id.compact()) {
                     Some(change) => {
                         if change.value_id.is_some() && change.value_id.as_ref().unwrap() > &idlp {
                         } else {
                             change.value_id = Some(idlp);
-                            change.value = value.clone();
+                            if !skip_value_clone {
+                                change.value = value.clone();
+                            }
                         }
                     }
                     None => {
@@ -2166,7 +2306,11 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
                             elem_id.compact(),
                             ElementDelta {
                                 pos: None,
-                                value: value.clone(),
+                                value: if skip_value_clone {
+                                    LoroValue::Null
+                                } else {
+                                    value.clone()
+                                },
                                 value_updated: true,
                                 value_id: Some(idlp),
                             },
@@ -2199,6 +2343,7 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
 
     fn finish_this_round(&mut self) {
         self.list.finish_this_round();
+        self.inner.changed_elements.clear();
     }
 
     #[instrument(skip(self, oplog, on_new_container))]
@@ -2235,15 +2380,10 @@ impl DiffCalculatorTrait for MovableListDiffCalculator {
             self.inner.current_mode,
             DiffMode::Checkout | DiffMode::Import
         );
-        let mut element_changes: FxHashMap<CompactIdLp, ElementDelta> = if is_checkout {
-            FxHashMap::default()
-        } else {
-            std::mem::take(&mut self.inner.changed_elements)
-        };
-
+        let mut element_changes = std::mem::take(&mut self.inner.changed_elements);
         if is_checkout {
-            for id in self.inner.changed_elements.keys() {
-                element_changes.insert(*id, ElementDelta::placeholder());
+            for change in element_changes.values_mut() {
+                *change = ElementDelta::placeholder();
             }
         }
 
@@ -2723,4 +2863,10 @@ fn persisted_walk_does_not_duplicate_style_entries() {
     };
     let ids = text.tracked_style_ids();
     assert_eq!(ids.len(), marks, "duplicate style entries: {ids:?}");
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Diffs computed between two different versions on this thread.
+    pub(crate) static DIFF_CALCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

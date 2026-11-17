@@ -66,6 +66,8 @@ pub use loro_internal::json::{
     JsonOpContent, JsonSchema, ListOp as JsonListOp, MapOp as JsonMapOp,
     MovableListOp as JsonMovableListOp, TextOp as JsonTextOp, TreeOp as JsonTreeOp,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use loro_internal::kv_store::FileKvStore;
 pub use loro_internal::kv_store::{KvStore, MemKvStore};
 pub use loro_internal::loro::CommitOptions;
 pub use loro_internal::loro::DocAnalysis;
@@ -75,13 +77,18 @@ pub use loro_internal::version::{Frontiers, VersionRange, VersionVector, Version
 pub use loro_internal::ApplyDiff;
 pub use loro_internal::Subscription;
 pub use loro_internal::UndoManager as InnerUndoManager;
+pub use loro_internal::{
+    global_memory_budget, global_memory_stats, reclaim_global_memory, set_global_memory_budget,
+    try_reclaim_global_to_budget, wasm_linear_memory_exceeded, DocMemoryStats, GlobalMemoryBudget,
+    GlobalMemoryStats, MemoryBudget,
+};
 pub use loro_internal::{loro_value, to_value};
 pub use loro_internal::{
     Counter, CounterSpan, FractionalIndex, IdLp, IdSpan, Lamport, PeerID, TreeID, TreeParentId, ID,
 };
 pub use loro_internal::{
     LoroBinaryValue, LoroEncodeError, LoroError, LoroListValue, LoroMapValue, LoroResult,
-    LoroStringValue, LoroTreeError, LoroValue, ToJson,
+    LoroStringValue, LoroTreeError, LoroValue, MemoryLimitExceeded, MemoryLimitKind, ToJson,
 };
 pub use loro_kv_store as kv_store;
 
@@ -162,7 +169,9 @@ impl LoroDoc {
         LoroDoc::_new(doc)
     }
 
-    /// Duplicate the document with a different PeerID
+    /// Duplicate the document with a different PeerID.
+    ///
+    /// The fork inherits an independent copy of the document memory budget.
     ///
     /// The time complexity and space complexity of this operation are both O(n),
     ///
@@ -177,6 +186,7 @@ impl LoroDoc {
     /// Fork the document at the given frontiers.
     ///
     /// The created doc will only contain the history before the specified frontiers.
+    /// It inherits an independent copy of the document memory budget.
     pub fn fork_at(&self, frontiers: &Frontiers) -> LoroResult<LoroDoc> {
         let new_doc = self.doc.fork_at(frontiers)?;
         new_doc.start_auto_commit();
@@ -252,6 +262,16 @@ impl LoroDoc {
         check_checksum: bool,
     ) -> LoroResult<ImportBlobMetadata> {
         InnerLoroDoc::decode_import_blob_meta(bytes, check_checksum)
+    }
+
+    /// Like [`Self::decode_import_blob_meta`], taking owned ref-counted [`bytes::Bytes`]
+    /// to avoid copying the payload buffer while decoding metadata.
+    #[inline]
+    pub fn decode_import_blob_meta_bytes(
+        bytes: bytes::Bytes,
+        check_checksum: bool,
+    ) -> LoroResult<ImportBlobMetadata> {
+        InnerLoroDoc::decode_import_blob_meta_bytes(bytes, check_checksum)
     }
 
     /// Set whether to record the timestamp of each change. Default is `false`.
@@ -541,6 +561,13 @@ impl LoroDoc {
         self.doc.import_batch(bytes)
     }
 
+    /// Like [`Self::import_batch`], taking owned ref-counted [`bytes::Bytes`]
+    /// buffers and dropping each buffer right after its blob finishes importing.
+    #[inline]
+    pub fn import_batch_bytes(&self, bytes: Vec<bytes::Bytes>) -> LoroResult<ImportStatus> {
+        self.doc.import_batch_bytes(bytes)
+    }
+
     /// Like [`import_batch`], with the same history mode as [`import_with_history_mode`].
     ///
     /// The existing [`import_batch`] signature stays exact.
@@ -552,6 +579,17 @@ impl LoroDoc {
     ) -> LoroResult<ImportStatus> {
         self.doc
             .import_batch_with_history_mode(bytes, mode == ImportHistoryMode::JsonLossy)
+    }
+
+    /// Like [`Self::import_batch_with_history_mode`], taking owned [`bytes::Bytes`] buffers.
+    #[inline]
+    pub fn import_batch_with_history_mode_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+        mode: ImportHistoryMode,
+    ) -> LoroResult<ImportStatus> {
+        self.doc
+            .import_batch_with_history_mode_bytes(bytes, mode == ImportHistoryMode::JsonLossy)
     }
 
     /// Import a batch of updates/snapshot and report what happened to each blob.
@@ -624,6 +662,16 @@ impl LoroDoc {
         self.doc.import_batch_detailed(bytes)
     }
 
+    /// Like [`Self::import_batch_detailed`], taking owned [`bytes::Bytes`]
+    /// buffers and dropping each buffer right after its blob finishes importing.
+    #[inline]
+    pub fn import_batch_detailed_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+    ) -> LoroResult<ImportBatchDetail> {
+        self.doc.import_batch_detailed_bytes(bytes)
+    }
+
     /// Like [`import_batch_detailed`](Self::import_batch_detailed), with the same history
     /// mode as [`import_with_history_mode`](Self::import_with_history_mode).
     #[inline]
@@ -634,6 +682,20 @@ impl LoroDoc {
     ) -> LoroResult<ImportBatchDetail> {
         self.doc
             .import_batch_detailed_with_history_mode(bytes, mode == ImportHistoryMode::JsonLossy)
+    }
+
+    /// Like [`Self::import_batch_detailed_with_history_mode`], taking owned
+    /// [`bytes::Bytes`] buffers.
+    #[inline]
+    pub fn import_batch_detailed_with_history_mode_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+        mode: ImportHistoryMode,
+    ) -> LoroResult<ImportBatchDetail> {
+        self.doc.import_batch_detailed_with_history_mode_bytes(
+            bytes,
+            mode == ImportHistoryMode::JsonLossy,
+        )
     }
 
     /// Get a [Container] by container id.
@@ -823,6 +885,22 @@ impl LoroDoc {
         self.doc.commit_with(options);
     }
 
+    /// Commit the pending auto-commit transaction, enforcing [`MemoryBudget::max_doc_bytes`].
+    ///
+    /// If committing would exceed `max_doc_bytes` after cache and cold-state reclamation,
+    /// uncommitted operations since the budget was armed are rolled back atomically without
+    /// firing subscribers and [`LoroError::MemoryLimitExceeded`] is returned.
+    #[inline]
+    pub fn try_commit(&self) -> LoroResult<()> {
+        self.doc.try_commit()
+    }
+
+    /// Commit the pending auto-commit transaction with options, enforcing [`MemoryBudget::max_doc_bytes`].
+    #[inline]
+    pub fn try_commit_with(&self, options: CommitOptions) -> LoroResult<()> {
+        self.doc.try_commit_with(options)
+    }
+
     /// Set commit message for the current uncommitted changes
     ///
     /// It will be persisted.
@@ -961,6 +1039,13 @@ impl LoroDoc {
         self.doc.import_with(bytes, "".into())
     }
 
+    /// Like [`Self::import`], taking owned ref-counted [`bytes::Bytes`] to avoid
+    /// copying the input buffer during decoding.
+    #[inline]
+    pub fn import_bytes(&self, bytes: bytes::Bytes) -> Result<ImportStatus, LoroError> {
+        self.doc.import_with_bytes(bytes, "".into())
+    }
+
     /// Import data exported by [`LoroDoc::export`] and mark it with a custom origin.
     ///
     /// The `origin` string will be attached to the ensuing change event, which is handy
@@ -972,6 +1057,16 @@ impl LoroDoc {
     #[inline]
     pub fn import_with(&self, bytes: &[u8], origin: &str) -> Result<ImportStatus, LoroError> {
         self.doc.import_with(bytes, origin.into())
+    }
+
+    /// Like [`Self::import_with`], taking owned ref-counted [`bytes::Bytes`].
+    #[inline]
+    pub fn import_with_bytes(
+        &self,
+        bytes: bytes::Bytes,
+        origin: &str,
+    ) -> Result<ImportStatus, LoroError> {
+        self.doc.import_with_bytes(bytes, origin.into())
     }
 
     /// Import binary bytes, choosing how overlapping op ids are compared.
@@ -987,6 +1082,21 @@ impl LoroDoc {
         mode: ImportHistoryMode,
     ) -> Result<ImportStatus, LoroError> {
         self.doc.import_with_history_mode(
+            bytes,
+            origin.into(),
+            mode == ImportHistoryMode::JsonLossy,
+        )
+    }
+
+    /// Like [`Self::import_with_history_mode`], taking owned ref-counted [`bytes::Bytes`].
+    #[inline]
+    pub fn import_with_history_mode_bytes(
+        &self,
+        bytes: bytes::Bytes,
+        origin: &str,
+        mode: ImportHistoryMode,
+    ) -> Result<ImportStatus, LoroError> {
+        self.doc.import_with_history_mode_bytes(
             bytes,
             origin.into(),
             mode == ImportHistoryMode::JsonLossy,
@@ -1599,6 +1709,58 @@ impl LoroDoc {
     #[inline]
     pub fn compact_change_store(&self) {
         self.doc.compact_change_store()
+    }
+
+    /// Configure memory watermarks, cache caps, and hard quotas for this document.
+    #[inline]
+    pub fn set_memory_budget(&self, budget: MemoryBudget) {
+        self.doc.set_memory_budget(budget);
+    }
+
+    /// Like [`Self::set_memory_budget`], but if moving the document to a new
+    /// `spill_dir` fails (the directory cannot be created or the spilled tables
+    /// cannot be written), returns the error and changes nothing. The plain
+    /// setter logs that failure, keeps the current storage and the previous
+    /// `spill_dir`, and applies the other settings; setting the same directory
+    /// again retries.
+    #[inline]
+    pub fn try_set_memory_budget(&self, budget: MemoryBudget) -> LoroResult<()> {
+        self.doc.try_set_memory_budget(budget)
+    }
+
+    /// Get a snapshot of this document's current [`MemoryBudget`] configuration.
+    #[inline]
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.doc.memory_budget()
+    }
+
+    /// Get estimated RAM and spilled byte usage across this document's subsystems.
+    #[inline]
+    pub fn memory_stats(&self) -> DocMemoryStats {
+        self.doc.memory_stats()
+    }
+
+    /// Takes the first failure to write spilled tables to the
+    /// [`MemoryBudget::spill_dir`] since the previous call, or `None`.
+    ///
+    /// Such a failure keeps the tables in memory (no data is lost), so the
+    /// document's memory grows instead of moving to disk. Always `None` without
+    /// a spill directory, and on `wasm32`.
+    #[inline]
+    pub fn take_spill_error(&self) -> Option<String> {
+        self.doc.take_spill_error()
+    }
+
+    /// Aggressively reclaim caches and demote cold container states, returning estimated freed bytes.
+    #[inline]
+    pub fn reclaim_memory(&self) -> usize {
+        self.doc.reclaim_memory()
+    }
+
+    /// Reclaim memory and fail with [`LoroError::MemoryLimitExceeded`] if usage still exceeds [`MemoryBudget::max_doc_bytes`].
+    #[inline]
+    pub fn try_reclaim_to_budget(&self) -> LoroResult<DocMemoryStats> {
+        self.doc.try_reclaim_to_budget()
     }
 
     /// Export the document in the given mode.
@@ -4514,6 +4676,21 @@ impl UndoManager {
     /// Set the maximum number of undo steps. The default value is 100.
     pub fn set_max_undo_steps(&mut self, size: usize) {
         self.0.set_max_undo_steps(size)
+    }
+
+    /// Set the maximum retained bytes across the undo/redo stacks.
+    pub fn set_max_undo_bytes(&mut self, max_bytes: usize) {
+        self.0.set_max_undo_bytes(max_bytes)
+    }
+
+    /// Get the maximum retained bytes configured on this undo manager.
+    pub fn max_undo_bytes(&self) -> usize {
+        self.0.max_undo_bytes()
+    }
+
+    /// Get the current estimated RAM usage in bytes of the undo/redo stacks.
+    pub fn used_bytes(&self) -> usize {
+        self.0.used_bytes()
     }
 
     /// Set the merge interval in ms. The default value is 0, which means no merge.

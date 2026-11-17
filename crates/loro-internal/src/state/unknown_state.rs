@@ -21,6 +21,10 @@ impl UnknownState {
     pub fn new(idx: ContainerIdx) -> Self {
         Self { idx }
     }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 impl ContainerState for UnknownState {
@@ -43,6 +47,12 @@ impl ContainerState for UnknownState {
         assert!(matches!(diff, InternalDiff::Unknown), "{diff:?}");
         Ok(())
     }
+
+    fn undo_record(&mut self, _diff: &InternalDiff) -> super::undo_log::StateUndo {
+        super::undo_log::StateUndo::None
+    }
+
+    fn apply_undo(&mut self, _undo: super::undo_log::StateUndo) {}
 
     fn apply_local_op(&mut self, _raw_op: &RawOp, _op: &Op) -> LoroResult<ApplyLocalOpReturn> {
         unreachable!()

@@ -1,6 +1,17 @@
 # LoroDoc Memory Analysis
 
-Verified against code 2026-11-06 (main `ea1d383e`, after #1218, #1222, #1244).
+Verified against code 2026-11-16 (main `ea1d383e`, plus Phase 1 speed and peak-memory improvements).
+
+
+Current cache lifecycle on the Phase 1 repair branch: ordinary snapshot export
+flushes dirty blocks without evicting warm parsed history. Explicit
+`compact_change_store` drops parsed blocks only outside import rollback scopes.
+`free_history_cache` releases the checkout index while preserving the tree import
+index; rollback paths still use `free_all`. Imported SSTable metadata owns its
+keys, so it cannot pin a superseded snapshot buffer. Normal blocks pass through
+tombstone removal and small-block coalescing on incremental export; large blocks
+retain raw copying. Export versions use one lazily allocated `FlushedMeta`.
+The historical tables below are not measurements of this repaired branch.
 
 This is a measurement report for a process that keeps many `LoroDoc`s open for a
 long time: a local sync hub holding tens to thousands of documents, with single
@@ -285,6 +296,19 @@ item changes the encoding format.
 Items 2, 1a, 7 and 9 have landed. Next: 4 with 3. Items 1b and 5 need design work first.
 
 ### What landed
+
+Phase 1 speed and peak-memory improvements (2026-11-16):
+
+- **`kv-store` zero-copy block/meta decode & raw-block export**: `NormalBlock::decode` and `BlockMeta::decode_meta` borrow input bytes with reused validation buffers, `SsTable::meta` uses `Arc<[BlockMeta]>`, and `MemKvStore::export_with_encoded_block` copies compressed SSTable blocks via `add_raw_block` without hydrating `BlockCache`.
+- **Single-pass `ChangeStore` block encoding, header queries, and direct snapshot handoff**: `ChangeStore::encode_block_with_header`, `try_iter_change_headers`, `unparsed_block_skip_end_if_missing_cid`, `FlushedMeta` version skip in `flush_and_compact`/`compact_parsed_blocks_in`, and direct `Snapshot` handoff in `fork_at_inner` (`encoding.rs`).
+- **Lazy `InnerStore::decode_twice` & cache release**: state-only/two-bytes snapshot decoding now registers `LoadState::Lazy` handles backed by a KV parent resolver (`inner_store.rs`), and `OpLog::free_history_cache` calls `free_all()`.
+- **Streaming `Bytes` imports, `toJSON()`, and WASM cache release**: `import_bytes`, `import_batch_bytes`, `import_batch_detailed_bytes`, `import_batch_with_loaders`, streaming large (> 256 KiB) WASM `importBatch`/`importBatchDetailed`, iterative zero-intermediate-tree `LoroDoc.toJSON()` (`crates/loro-wasm/src/to_json.rs`), and WASM `freeHistoryCache()`, `freeDiffCalculator()`, and `compactChangeStore()`.
+
+Phase 2 & 3 bounded memory, compact structures, and out-of-core spilling (2026-11-16):
+
+- **`LoroDoc` bounded memory (`MemoryBudget`, `DocMemoryStats`)**: see [context/memory-budget.md](memory-budget.md) for the 14-field accounting contract, Stage 1/2 watermark reclamation & second-chance cold container demotion, Stage 3 atomic budget rollback, and native `FileKvStore` (`spill_dir`) spilling.
+- **Compact `Op` (`<= 40B` on 64-bit), hybrid `ImVersionVector`, sparse paged `InnerStore`, lazy `ListState::child_container_to_index`, and `StrArena::shrink_spare_capacity()`** (items 12 & structural shrinkage): landed in `op.rs`, `op/content.rs`, `list_op.rs`, `version.rs`, `inner_store.rs`, `list_state.rs`, and `str_arena.rs`.
+- **Exact-span heap deduplication in `latest_single_head_critical_version` (`dag.rs`)**: `in_heap: FxHashSet<(ID, usize)>` deduplicates identical queued spans without pruning by causal dominance, keeping multi-diamond critical-version walks linear (`64`-diamond test `< 50ms`).
 
 Items 2, 1a, 7 and 9, measured with the same commands on `ea1d383e` and on the branch.
 Single runs on a shared host, so treat time differences under about 10% as noise.

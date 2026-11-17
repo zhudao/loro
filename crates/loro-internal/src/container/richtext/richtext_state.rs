@@ -67,7 +67,7 @@ mod cache {
     #[derive(Clone, Debug)]
     pub(super) struct CachedCursor {
         leaf: LeafIndex,
-        index: FxHashMap<PosType, usize>,
+        pub(super) index: FxHashMap<PosType, usize>,
     }
 
     impl RichtextState {
@@ -1419,6 +1419,31 @@ fn insert_stays_before_anchor(style: &StyleOp, anchor_type: AnchorType) -> bool 
 }
 
 impl RichtextState {
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let cache = self.tree.root_cache();
+        let bytes_len = cache.bytes.max(0) as usize;
+        let entity_len = cache.entity_len.max(0) as usize;
+        let style_bytes = if self.style_ranges.is_some() {
+            std::mem::size_of::<StyleRangeMap>() + entity_len.saturating_mul(16)
+        } else {
+            0
+        };
+        let cursor_bytes = self.cached_cursor.as_ref().map_or(0, |c| {
+            std::mem::size_of::<CachedCursor>()
+                + c.index.capacity()
+                    * (std::mem::size_of::<PosType>() + std::mem::size_of::<usize>() + 8)
+        });
+        std::mem::size_of::<Self>()
+            .saturating_add(bytes_len)
+            .saturating_add(entity_len.saturating_mul(24))
+            .saturating_add(style_bytes)
+            .saturating_add(cursor_bytes)
+    }
+
+    pub(crate) fn reclaim_auxiliary_caches(&mut self) {
+        self.clear_cache();
+    }
+
     pub(crate) fn from_chunks<I: Iterator<Item = impl Into<RichtextStateChunk>>>(i: I) -> Self {
         Self {
             tree: i.collect(),
@@ -2899,6 +2924,38 @@ impl RichtextState {
         };
         self.check_cache();
         result
+    }
+
+    /// The chunks covering entities `start..start + len`, sliced at both ends.
+    /// Costs `O(log n + k)` for `k` chunks. Used by the import undo log
+    /// (`state/undo_log.rs`) to keep what a diff deletes.
+    pub(crate) fn chunks_in_entity_range(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> Vec<RichtextStateChunk> {
+        if len == 0 {
+            return Vec::new();
+        }
+        assert!(start + len <= self.len_entity());
+        let from = self.tree.query::<EntityQuery>(&start).unwrap();
+        let to = self.tree.query::<EntityQuery>(&(start + len)).unwrap();
+        let mut ans = Vec::new();
+        for item in self.tree.iter_range(from.cursor..to.cursor) {
+            let chunk_len = item.elem.rle_len();
+            let a = item.start.unwrap_or(0);
+            let b = item.end.map(|v| v.min(chunk_len)).unwrap_or(chunk_len);
+            if b <= a {
+                continue;
+            }
+            if a == 0 && b == chunk_len {
+                ans.push(item.elem.clone());
+            } else {
+                ans.push(item.elem.slice(a..b));
+            }
+        }
+        debug_assert_eq!(ans.iter().map(|c| c.rle_len()).sum::<usize>(), len);
+        ans
     }
 
     pub(crate) fn get_stable_position_at_event_index(

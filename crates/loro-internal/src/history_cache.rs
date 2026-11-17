@@ -318,6 +318,46 @@ impl ContainerHistoryCache {
         self.shallow_maps_seeded.clear();
     }
 
+    pub(crate) fn estimated_memory_bytes(&self) -> usize {
+        let checkout_bytes = self.for_checkout.as_ref().map_or(0, |c| {
+            c.map
+                .map
+                .len()
+                .saturating_mul(std::mem::size_of::<MapHistoryCacheEntry>() + 32)
+                .saturating_add(c.map.keys.len().saturating_mul(32))
+                .saturating_add(
+                    c.movable_list
+                        .move_set
+                        .len()
+                        .saturating_mul(std::mem::size_of::<MovableListInnerDeltaEntry>() + 32),
+                )
+                .saturating_add(
+                    c.movable_list
+                        .set_set
+                        .len()
+                        .saturating_mul(std::mem::size_of::<MovableListSetDeltaEntry>() + 32),
+                )
+        });
+        let importing_bytes = self.for_importing.as_ref().map_or(0, |map| {
+            map.values()
+                .map(|v| match v {
+                    HistoryCacheForImporting::Tree(t) => t
+                        .ops
+                        .len()
+                        .saturating_mul(std::mem::size_of::<(IdLp, GroupedTreeOpInfo)>() + 48),
+                })
+                .sum::<usize>()
+                .saturating_add(map.capacity().saturating_mul(48))
+        });
+        let seeded_bytes = self
+            .shallow_maps_seeded
+            .capacity()
+            .saturating_mul(std::mem::size_of::<ContainerIdx>() + 8);
+        checkout_bytes
+            .saturating_add(importing_bytes)
+            .saturating_add(seeded_bytes)
+    }
+
     pub(crate) fn set_shallow_root_store(&mut self, shallow_root_store: Option<Arc<GcStore>>) {
         self.shallow_root_state = shallow_root_store;
         self.shallow_maps_seeded.clear();
@@ -904,7 +944,8 @@ impl HistoryCacheTrait for MovableListHistoryCache {
                         counter: cur_id.counter,
                     });
                 }
-                crate::container::list::list_op::InnerListOp::Set { elem_id, .. } => {
+                crate::container::list::list_op::InnerListOp::Set(set) => {
+                    let elem_id = &set.elem_id;
                     self.set_set.insert(MovableListSetDeltaEntry {
                         element_lamport: elem_id.lamport,
                         element_peer: elem_id.peer,
@@ -1006,8 +1047,8 @@ impl MovableListHistoryCache {
                             debug_assert_eq!(op.atom_len(), 1);
                             let lamport = op.lamport();
                             match &op.content {
-                                InnerContent::List(InnerListOp::Set { value, .. }) => {
-                                    (lamport, value.clone())
+                                InnerContent::List(InnerListOp::Set(set)) => {
+                                    (lamport, set.value.clone())
                                 }
                                 _ => {
                                     unreachable!()
@@ -1066,5 +1107,26 @@ impl MovableListHistoryCache {
                     Some(IdFull::new(e.peer, e.counter, lamport))
                 },
             )
+    }
+}
+
+#[cfg(test)]
+mod reclamation_tests {
+    #[test]
+    fn freeing_checkout_cache_keeps_tree_import_index() {
+        let doc = crate::LoroDoc::new_auto_commit();
+        let oplog = doc.oplog().lock();
+        oplog.with_history_cache(|cache| {
+            cache.ensure_all_caches_exist();
+            assert!(cache.for_checkout.is_some());
+            assert!(cache.for_importing.is_some());
+        });
+        oplog.free_history_cache();
+        oplog.with_history_cache(|cache| {
+            assert!(cache.for_checkout.is_none());
+            assert!(cache.for_importing.is_some());
+            cache.free_all();
+            assert!(cache.for_importing.is_none());
+        });
     }
 }

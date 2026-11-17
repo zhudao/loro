@@ -22,6 +22,9 @@ Loro is a Rust CRDT workspace with JS/WASM packaging and a MoonBit codec.
   [context/undo-history-boundaries.md](context/undo-history-boundaries.md).
 - Rust undo failure rollback and transaction writer serialization:
   [context/undo-atomicity.md](context/undo-atomicity.md).
+- Undo without checkouts: inverses recorded at local commit, the rules they
+  follow to match a checkout, fallbacks and the verification switch:
+  [context/undo-log.md](context/undo-log.md).
 - Encoding/import/export modes, current vs outdated formats, shallow snapshots:
   [context/internal-encoding.md](context/internal-encoding.md).
 - Mergeable container model, marker/cid rules, tests, and common pitfalls:
@@ -105,6 +108,11 @@ Loro is a Rust CRDT workspace with JS/WASM packaging and a MoonBit codec.
 - Where a long-lived `LoroDoc`'s memory goes, which operations expand lazy history,
   release paths, the ranked optimization list, and what has landed:
   [context/memory-analysis.md](context/memory-analysis.md).
+- Bounded `LoroDoc` & global WASM memory budgets (`MemoryBudget`,
+  `GlobalMemoryBudget`, 14 `DocMemoryStats` fields, `GlobalMemoryStats`, Stage
+  1/2 hysteresis & clock/LRU demotion, Stage 3 hard limits & atomic rollback,
+  `try_commit`, allocator tracking, and WASM error shapes):
+  [context/memory-budget.md](context/memory-budget.md).
 - Context backlog: [context/CONTEXT-GAPS.md](context/CONTEXT-GAPS.md).
 
 ## Commands

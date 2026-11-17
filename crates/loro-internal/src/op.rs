@@ -27,6 +27,9 @@ pub struct Op {
     pub(crate) content: InnerContent,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Op>() <= 40);
+
 impl EstimatedSize for Op {
     fn estimate_storage_size(&self) -> usize {
         // TODO: use benchmark to get the optimal estimated size for each container type
@@ -92,6 +95,11 @@ pub struct RichOp<'a> {
 }
 
 impl Op {
+    /// See [`InnerContent::payload_heap_bytes`].
+    pub(crate) fn payload_heap_bytes(&self) -> usize {
+        self.content.payload_heap_bytes()
+    }
+
     #[inline]
     #[allow(unused)]
     pub(crate) fn new(id: ID, content: InnerContent, container: ContainerIdx) -> Self {

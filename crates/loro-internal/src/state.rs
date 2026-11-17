@@ -25,6 +25,7 @@ use crate::{
     event::{Diff, EventTriggerKind, Index, InternalContainerDiff, InternalDiff, KeptChange},
     handler::ValueOrHandler,
     id::PeerID,
+    kv_store::{KvStore, SharedBlockCache},
     lock::{LoroLockGroup, LoroMutex},
     op::{Op, RawOp, RawOpContent},
     version::{Frontiers, VersionVector},
@@ -43,10 +44,13 @@ mod mergeable;
 mod movable_list_state;
 mod richtext_state;
 mod tree_state;
+pub(crate) mod undo_log;
 mod unknown_state;
 mod value_decode;
 
-pub(crate) use self::movable_list_state::{IndexType, MovableListState};
+pub(crate) use self::movable_list_state::{
+    Element as MovableListElement, IndexType, MovableListState,
+};
 pub(crate) use container_store::GcStore;
 pub(crate) use list_state::ListState;
 pub(crate) use map_state::MapState;
@@ -179,9 +183,12 @@ pub struct DocState {
     /// ([`crate::undo::DiffBatch::from_changes`]: revert, undo). Containers that keep their
     /// state are then not revived at all, which skips building full states nobody reads.
     record_changes_only: bool,
-    /// Set while a local transaction that may be rolled back runs (`apply_diff`,
-    /// `revert_to`). See [`Self::begin_local_rollback`].
-    local_rollback: Option<LocalRollbackJournal>,
+    /// Stack of active local rollback scopes (`budget_base_scope` and nested
+    /// `apply_diff` / `revert_to` scopes). See [`Self::begin_local_rollback`].
+    local_rollback_stack: Vec<LocalRollbackJournal>,
+    /// Records what `apply_diff` changes so a rejected import can be undone
+    /// without reading history; see [`Self::begin_import_undo`].
+    import_undo: Option<undo_log::ImportUndoLog>,
 }
 
 /// What undoing a local transaction's ops by checkout cannot restore exactly,
@@ -189,6 +196,9 @@ pub struct DocState {
 struct LocalRollbackJournal {
     /// The `apply_diff` scope that began it.
     scope: u64,
+    /// `StrArena` byte checkpoint captured at scope entry so rolled-back text inserts release
+    /// their appended bytes instead of permanently bloating `arena_bytes`.
+    str_checkpoint: crate::arena::StrArenaCheckpoint,
     /// The value of each counter before the transaction's first op on it:
     /// subtracting the increments again may not give back the same float.
     #[cfg(feature = "counter")]
@@ -297,6 +307,20 @@ pub(crate) trait ContainerState {
     }
 
     fn apply_local_op(&mut self, raw_op: &RawOp, op: &Op) -> LoroResult<ApplyLocalOpReturn>;
+
+    /// What undoes `diff` on this state, read before `diff` is applied. Costs
+    /// about as much as the part of the state `diff` changes. See
+    /// `state/undo_log.rs`.
+    fn undo_record(&mut self, diff: &InternalDiff) -> undo_log::StateUndo;
+
+    /// Undo a record from [`Self::undo_record`]. The diffs applied after its
+    /// diff have been undone already, so the state is as it was right after it.
+    fn apply_undo(&mut self, undo: undo_log::StateUndo);
+
+    /// Called after the diff of [`Self::undo_record`] was applied, for states
+    /// that record while applying.
+    fn finish_undo_record(&mut self, _undo: &mut undo_log::StateUndo) {}
+
     /// Convert a state to a diff, such that an empty state will be transformed into the same as this state when it's applied.
     fn to_diff(&mut self, doc: &Weak<LoroDocInner>) -> Diff;
 
@@ -359,6 +383,18 @@ impl<T: ContainerState> ContainerState for Box<T> {
 
     fn apply_local_op(&mut self, raw_op: &RawOp, op: &Op) -> LoroResult<ApplyLocalOpReturn> {
         self.as_mut().apply_local_op(raw_op, op)
+    }
+
+    fn undo_record(&mut self, diff: &InternalDiff) -> undo_log::StateUndo {
+        self.as_mut().undo_record(diff)
+    }
+
+    fn apply_undo(&mut self, undo: undo_log::StateUndo) {
+        self.as_mut().apply_undo(undo)
+    }
+
+    fn finish_undo_record(&mut self, undo: &mut undo_log::StateUndo) {
+        self.as_mut().finish_undo_record(undo)
     }
 
     #[doc = r" Convert a state to a diff, such that an empty state will be transformed into the same as this state when it's applied."]
@@ -491,6 +527,28 @@ impl State {
             State::UnknownState(unknown_state) => State::UnknownState(unknown_state.fork(config)),
         }
     }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let inner = match self {
+            State::ListState(s) => s.estimated_heap_bytes(),
+            State::MovableListState(s) => s.estimated_heap_bytes(),
+            State::MapState(s) => s.estimated_heap_bytes(),
+            State::RichtextState(s) => s.estimated_heap_bytes(),
+            State::TreeState(s) => s.estimated_heap_bytes(),
+            #[cfg(feature = "counter")]
+            State::CounterState(s) => s.estimated_heap_bytes(),
+            State::UnknownState(s) => s.estimated_heap_bytes(),
+        };
+        std::mem::size_of::<Self>().saturating_add(inner)
+    }
+
+    pub(crate) fn reclaim_auxiliary_caches(&mut self) {
+        match self {
+            State::TreeState(s) => s.reclaim_auxiliary_caches(),
+            State::RichtextState(s) => s.reclaim_auxiliary_caches(),
+            _ => {}
+        }
+    }
 }
 
 impl DocState {
@@ -501,13 +559,35 @@ impl DocState {
         config: Configure,
         lock_group: &LoroLockGroup,
     ) -> Arc<LoroMutex<Self>> {
+        Self::new_arc_with_cache(
+            doc,
+            arena,
+            config,
+            lock_group,
+            SharedBlockCache::default_per_doc(),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn new_arc_with_cache(
+        doc: Weak<LoroDocInner>,
+        arena: SharedArena,
+        config: Configure,
+        lock_group: &LoroLockGroup,
+        block_cache: SharedBlockCache,
+    ) -> Arc<LoroMutex<Self>> {
         let peer = DefaultRandom.next_u64();
         // TODO: maybe we should switch to certain version in oplog?
 
         let peer = Arc::new(AtomicU64::new(peer));
         Arc::new(lock_group.new_lock(
             Self {
-                store: ContainerStore::new(arena.clone(), config.clone(), peer.clone()),
+                store: ContainerStore::new_with_cache(
+                    arena.clone(),
+                    config.clone(),
+                    peer.clone(),
+                    block_cache,
+                ),
                 peer,
                 arena,
                 frontiers: Frontiers::default(),
@@ -519,7 +599,8 @@ impl DocState {
                 dead_containers_cache: Default::default(),
                 alive_containers_cache: None,
                 record_changes_only: false,
-                local_rollback: None,
+                local_rollback_stack: Vec::new(),
+                import_undo: None,
             },
             crate::lock::LockKind::DocState,
         ))
@@ -546,7 +627,8 @@ impl DocState {
             dead_containers_cache: Default::default(),
             alive_containers_cache: None,
             record_changes_only: false,
-            local_rollback: None,
+            local_rollback_stack: Vec::new(),
+            import_undo: None,
         }))
     }
 
@@ -795,7 +877,11 @@ impl DocState {
                 crate::event::DiffVariant::Internal(inner_diff) => {
                     self.ensure_containers_created_by_internal_diff(inner_diff);
                     let cid = self.arena.idx_to_id(idx).unwrap();
-                    info_span!("apply diff on", container_id = ?cid).in_scope(
+                    let undo_record = self
+                        .import_undo
+                        .is_some()
+                        .then(|| self.store.get_or_create_mut(idx).undo_record(inner_diff));
+                    let applied = info_span!("apply diff on", container_id = ?cid).in_scope(
                         || -> LoroResult<()> {
                             if self.in_txn {
                                 self.changed_idx_in_txn.insert(idx);
@@ -869,7 +955,15 @@ impl DocState {
                             }
                             Ok(())
                         },
-                    )?;
+                    );
+                    if let Some(mut undo) = undo_record {
+                        let state = self.store.get_or_create_mut(idx);
+                        state.finish_undo_record(&mut undo);
+                        if let Some(log) = &mut self.import_undo {
+                            log.entries.push((idx, undo));
+                        }
+                    }
+                    applied?;
                 }
                 crate::event::DiffVariant::External(_) => unreachable!(),
             }
@@ -1040,7 +1134,9 @@ impl DocState {
             self.changed_idx_in_txn.insert(op.container);
         }
         #[cfg(feature = "counter")]
-        if let (Some(journal), State::CounterState(counter)) = (&mut self.local_rollback, &*state) {
+        if let (Some(journal), State::CounterState(counter)) =
+            (self.local_rollback_stack.last_mut(), &*state)
+        {
             journal
                 .counters
                 .entry(op.container)
@@ -1061,28 +1157,81 @@ impl DocState {
     /// local ops applied from now on: the containers that get new state and the
     /// counters' values.
     ///
-    /// `scope` identifies the caller. A journal of another scope is replaced: two
-    /// scopes never share a transaction, so that scope's transaction was
-    /// committed by another thread and cannot be rolled back anyway.
+    /// Scopes can nest (for example, `apply_diff` inside a `MemoryBudget`
+    /// base scope on the open transaction).
     pub(crate) fn begin_local_rollback(&mut self, scope: u64) {
         self.store.begin_created_journal();
-        self.local_rollback = Some(LocalRollbackJournal {
+        let str_checkpoint = self.arena.str_checkpoint();
+        self.local_rollback_stack.push(LocalRollbackJournal {
             scope,
+            str_checkpoint,
             #[cfg(feature = "counter")]
             counters: Default::default(),
         });
     }
 
-    /// Stop recording for `scope`, keeping the ops.
+    /// Stop recording for `scope`, keeping the ops and merging into any enclosing scope.
     pub(crate) fn end_local_rollback(&mut self, scope: u64) {
-        if self
-            .local_rollback
-            .as_ref()
-            .is_some_and(|j| j.scope == scope)
-        {
-            self.store.take_created_journal();
-            self.local_rollback = None;
+        if let Some(popped) = self.local_rollback_stack.pop_if(|j| j.scope == scope) {
+            #[cfg(feature = "counter")]
+            if let Some(parent) = self.local_rollback_stack.last_mut() {
+                for (idx, value) in popped.counters {
+                    parent.counters.entry(idx).or_insert(value);
+                }
+            }
+            #[cfg(not(feature = "counter"))]
+            let _ = popped;
+            if self.local_rollback_stack.is_empty() {
+                self.store.take_created_journal();
+            } else {
+                self.store.commit_top_created_journal();
+            }
         }
+    }
+
+    /// The state of `idx`, created or loaded if needed (a reference-returning
+    /// [`Self::with_state_mut`]).
+    pub(crate) fn container_state_mut(&mut self, idx: ContainerIdx) -> &mut State {
+        self.store.get_or_create_mut(idx)
+    }
+
+    /// Start recording an import undo log: until [`Self::take_import_undo`],
+    /// `apply_diff` asks each container for the record that undoes its diff
+    /// before applying it. See `state/undo_log.rs`.
+    pub(crate) fn begin_import_undo(&mut self) {
+        debug_assert!(self.import_undo.is_none(), "import undo logs do not nest");
+        self.import_undo = Some(Default::default());
+    }
+
+    /// Stop recording; `None` if nothing was recording.
+    pub(crate) fn take_import_undo(&mut self) -> Option<undo_log::ImportUndoLog> {
+        self.import_undo.take()
+    }
+
+    /// Undo everything `log` recorded, newest first, and set the state's version
+    /// back to `frontiers` (its version when recording began). Reads no
+    /// history, so it cannot fail. Containers the import created keep their
+    /// (emptied) entries: the caller removes them with the created journal,
+    /// after this. Events of the undone changes are discarded.
+    pub(crate) fn undo_import(&mut self, log: undo_log::ImportUndoLog, frontiers: Frontiers) {
+        debug_assert!(self.import_undo.is_none());
+        for (idx, undo) in log.entries.into_iter().rev() {
+            self.store.get_or_create_mut(idx).apply_undo(undo);
+        }
+        self.frontiers = frontiers;
+        self.dead_containers_cache.clear();
+        self.alive_containers_cache = None;
+        let _ = self.take_events();
+    }
+
+    pub(crate) fn clear_local_rollback_stack(&mut self) {
+        self.local_rollback_stack.clear();
+        self.changed_idx_in_txn.clear();
+        self.store.clear_created_journals();
+    }
+
+    pub(crate) fn clear_changed_idx_in_txn(&mut self) {
+        self.changed_idx_in_txn.clear();
     }
 
     /// Takes the event recorder out, so that a state change the caller discards
@@ -1113,21 +1262,20 @@ impl DocState {
         start_counter: crate::id::Counter,
     ) {
         let created = self.store.take_created_journal();
-        let journal = self.local_rollback.take();
+        let journal = self.local_rollback_stack.pop();
         assert!(
             journal.as_ref().is_some_and(|j| j.scope == scope),
             "the journal of a rolled back apply_diff was replaced"
         );
-        #[cfg(feature = "counter")]
         if let Some(journal) = journal {
+            #[cfg(feature = "counter")]
             for (idx, value) in journal.counters {
                 if let Some(State::CounterState(counter)) = self.store.get_container_mut(idx) {
                     counter.set_value(value);
                 }
             }
+            self.arena.rollback_str(journal.str_checkpoint);
         }
-        #[cfg(not(feature = "counter"))]
-        let _ = journal;
         self.store.remove_created(&created);
         self.arena
             .forget_parents_of_discarded_ops(peer, start_counter);
@@ -1202,6 +1350,7 @@ impl DocState {
 
     pub(crate) fn commit_txn(&mut self, new_frontiers: Frontiers, diff: Option<InternalDocDiff>) {
         self.in_txn = false;
+        self.clear_local_rollback_stack();
         self.frontiers = new_frontiers;
         if let Some(diff) = diff {
             if self.is_recording() {
@@ -1405,6 +1554,7 @@ impl DocState {
                     by: EventTriggerKind::Import,
                     diff: unknown_diffs.into(),
                     new_version: Cow::Owned(frontiers.clone()),
+                    local_inverse: None,
                 },
                 DiffMode::Checkout,
             )?;
@@ -1437,6 +1587,7 @@ impl DocState {
                 by: EventTriggerKind::Import,
                 diff: diff.into(),
                 new_version: Cow::Borrowed(&frontiers),
+                local_inverse: None,
             });
         }
 
@@ -1524,9 +1675,13 @@ impl DocState {
     pub(crate) fn reset_to_empty_for_failed_snapshot_import(&mut self) {
         let was_recording = self.is_recording();
         self.frontiers = Frontiers::default();
-        self.store =
-            ContainerStore::new(self.arena.clone(), self.config.clone(), self.peer.clone());
+        self.store = self.store.new_empty_same_backend(
+            self.arena.clone(),
+            self.config.clone(),
+            self.peer.clone(),
+        );
         self.in_txn = false;
+        self.local_rollback_stack.clear();
         self.changed_idx_in_txn.clear();
         self.event_recorder = Default::default();
         if was_recording {
@@ -1568,19 +1723,23 @@ impl DocState {
             let id = self.arena.idx_to_id(root_idx).unwrap();
             match &id {
                 loro_common::ContainerID::Root { name, .. } => {
+                    let is_deleted = deleted_root_container.contains(&id);
+                    if should_hide_empty_root_container || is_deleted {
+                        let kind = root_idx.get_type();
+                        let shallow = self
+                            .store
+                            .get_value_ephemeral(root_idx)
+                            .unwrap_or_else(|| kind.default_value());
+                        if (should_hide_empty_root_container
+                            && visible_container_value_is_empty(kind, &shallow))
+                            || (is_deleted
+                                && deleted_root_container_value_is_cleared(kind, &shallow))
+                        {
+                            continue;
+                        }
+                    }
+
                     let v = self.get_container_deep_value(root_idx);
-                    if should_hide_empty_root_container
-                        && visible_container_value_is_empty(root_idx.get_type(), &v)
-                    {
-                        continue;
-                    }
-
-                    if deleted_root_container.contains(&id)
-                        && deleted_root_container_value_is_cleared(root_idx.get_type(), &v)
-                    {
-                        continue;
-                    }
-
                     ans.insert(name.to_string(), v);
                 }
                 loro_common::ContainerID::Normal { .. } => {
@@ -1590,6 +1749,70 @@ impl DocState {
         }
 
         LoroValue::Map(ans.into())
+    }
+
+    /// Return `(name, idx, id, shallow_value)` for visible root containers,
+    /// checking visibility and deletion rules using only shallow values first.
+    pub fn visible_root_shallow_values(
+        &mut self,
+    ) -> LoroResult<Vec<(InternalString, ContainerIdx, ContainerID, LoroValue)>> {
+        let roots = self.preferred_root_containers();
+        let mut visible = Vec::with_capacity(roots.len());
+        let binding = self.config.deleted_root_containers.clone();
+        let deleted_root_container = binding.lock();
+        let should_hide_empty_root_container = self
+            .config
+            .hide_empty_root_containers
+            .load(Ordering::Relaxed);
+        for root_idx in roots {
+            let id = self
+                .arena
+                .idx_to_id(root_idx)
+                .ok_or_else(|| LoroError::DecodeError("Missing container ID".into()))?;
+            match &id {
+                loro_common::ContainerID::Root { name, .. } => {
+                    let kind = root_idx.get_type();
+                    let shallow = self
+                        .store
+                        .try_get_value_ephemeral(root_idx)?
+                        .unwrap_or_else(|| kind.default_value());
+                    if should_hide_empty_root_container
+                        && visible_container_value_is_empty(kind, &shallow)
+                    {
+                        continue;
+                    }
+                    if deleted_root_container.contains(&id)
+                        && deleted_root_container_value_is_cleared(kind, &shallow)
+                    {
+                        continue;
+                    }
+                    visible.push((name.clone(), root_idx, id, shallow));
+                }
+                loro_common::ContainerID::Normal { .. } => {
+                    unreachable!()
+                }
+            }
+        }
+        Ok(visible)
+    }
+
+    /// Get the shallow value of `idx` without retaining a decoded entry in `value_cache`.
+    pub fn try_get_container_shallow_value_ephemeral(
+        &mut self,
+        idx: ContainerIdx,
+    ) -> LoroResult<LoroValue> {
+        Ok(self
+            .store
+            .try_get_value_ephemeral(idx)?
+            .unwrap_or_else(|| idx.get_type().default_value()))
+    }
+
+    pub fn register_container_id(&self, cid: &ContainerID) -> ContainerIdx {
+        self.arena.register_container(cid)
+    }
+
+    pub fn idx_to_id(&self, idx: ContainerIdx) -> Option<ContainerID> {
+        self.arena.idx_to_id(idx)
     }
 
     pub fn get_deep_value_with_id(&mut self) -> LoroValue {
@@ -2125,6 +2348,13 @@ impl DocState {
         let mut containers = FxHashMap::default();
         let to = (*diffs.last().unwrap().new_version).to_owned();
         let origin = diffs[0].origin.clone();
+        // Several local commits in one event: their inverses chain only if each
+        // continues right after the previous one.
+        let mut local_inverse = diffs[0].local_inverse.clone();
+        for next in diffs[1..].iter() {
+            local_inverse =
+                crate::undo::LocalInverse::chain(local_inverse, next.local_inverse.as_ref());
+        }
         for diff in diffs {
             #[allow(clippy::unnecessary_to_owned)]
             for container_diff in diff.diff.into_owned() {
@@ -2227,6 +2457,7 @@ impl DocState {
             origin,
             by: triggered_by,
             diff,
+            local_inverse,
         }
     }
 
@@ -2651,6 +2882,75 @@ impl DocState {
 
     pub(crate) fn shallow_root_store(&self) -> Option<&Arc<GcStore>> {
         self.store.shallow_root_store()
+    }
+
+    pub(crate) fn kv_estimated_bytes(&self) -> usize {
+        self.store.kv_estimated_bytes()
+    }
+
+    pub(crate) fn state_estimated_bytes(&self) -> usize {
+        self.store.estimated_state_bytes()
+    }
+
+    pub(crate) fn value_cache_bytes(&self) -> usize {
+        self.store.value_cache_bytes()
+    }
+
+    pub(crate) fn spilled_disk_bytes(&self) -> usize {
+        self.store.spilled_disk_bytes()
+    }
+
+    pub(crate) fn take_spill_error(&self) -> Option<String> {
+        self.store.take_spill_error()
+    }
+
+    pub(crate) fn evict_value_cache_to_bytes(&mut self, max_bytes: usize) -> usize {
+        self.store.evict_value_cache_to_bytes(max_bytes)
+    }
+
+    pub(crate) fn reclaim_auxiliary_caches(&mut self) -> usize {
+        let mut freed = self.store.reclaim_auxiliary_caches();
+        if let Some(cache) = self.alive_containers_cache.take() {
+            freed = freed.saturating_add(estimated_alive_containers_cache_bytes(
+                cache.roots.capacity(),
+                &cache.indices,
+            ));
+        }
+        freed
+    }
+
+    pub(crate) fn set_block_cache(&mut self, cache: SharedBlockCache) {
+        self.store.set_block_cache(cache);
+    }
+
+    pub(crate) fn flush_kv(&mut self) {
+        self.store.flush_kv();
+    }
+
+    pub(crate) fn prepare_kv_backend(
+        &self,
+        kv: Arc<Mutex<dyn KvStore>>,
+    ) -> Result<container_store::PreparedKvBackend, String> {
+        self.store.prepare_kv_backend(kv)
+    }
+
+    pub(crate) fn install_kv_backend(&mut self, prepared: container_store::PreparedKvBackend) {
+        self.store.install_kv_backend(prepared);
+    }
+
+    pub(crate) fn demote_cold_states(
+        &mut self,
+        target_state_bytes: usize,
+        extra_pinned: &FxHashSet<ContainerIdx>,
+    ) -> usize {
+        if !self.in_txn || self.changed_idx_in_txn.is_empty() {
+            return self
+                .store
+                .demote_cold_states(target_state_bytes, extra_pinned);
+        }
+        let mut pinned = self.changed_idx_in_txn.clone();
+        pinned.extend(extra_pinned.iter().copied());
+        self.store.demote_cold_states(target_state_bytes, &pinned)
     }
 }
 

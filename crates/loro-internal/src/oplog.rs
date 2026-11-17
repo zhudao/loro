@@ -27,6 +27,7 @@ use crate::encoding::decode_oplog;
 use crate::encoding::{ImportStatus, ParsedHeaderAndBody};
 use crate::history_cache::ContainerHistoryCache;
 use crate::id::{Counter, PeerID, ID};
+use crate::kv_store::SharedBlockCache;
 use crate::op::{FutureInnerContent, InnerContent, ListSlice, RawOpContent, RemoteOp, RichOp};
 use crate::span::{HasCounterSpan, HasLamportSpan};
 use crate::state::DocState;
@@ -67,6 +68,7 @@ pub struct OpLog {
     /// that is being edited in pre-commit callback.
     pub(crate) uncommitted_change: Option<Change>,
     pub(crate) import_rollback: Option<ImportRollback>,
+    pub(crate) max_pending_bytes: Option<usize>,
 }
 
 pub(crate) struct ImportRollback {
@@ -99,6 +101,17 @@ struct MovableListElemRef {
     op_id: ID,
     op_lamport: Lamport,
     elem_id: IdLp,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpLogMemoryBreakdown {
+    pub dag_bytes: usize,
+    pub arena_bytes: usize,
+    pub change_cache_bytes: usize,
+    pub change_kv_bytes: usize,
+    pub pending_bytes: usize,
+    pub history_cache_bytes: usize,
+    pub spilled_disk_bytes: usize,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -199,9 +212,18 @@ pub(super) fn import_op_can_reject(op: &crate::op::Op, detached: bool) -> bool {
 impl OpLog {
     #[inline]
     pub(crate) fn new(visible_op_count: Arc<AtomicUsize>) -> Self {
+        Self::new_with_cache(visible_op_count, SharedBlockCache::default_per_doc())
+    }
+
+    #[inline]
+    pub(crate) fn new_with_cache(
+        visible_op_count: Arc<AtomicUsize>,
+        block_cache: crate::kv_store::SharedBlockCache,
+    ) -> Self {
         let arena = SharedArena::new();
         let cfg = Configure::default();
-        let change_store = ChangeStore::new_mem(&arena, cfg.merge_interval_in_s.clone());
+        let change_store =
+            ChangeStore::new_mem_with_cache(&arena, cfg.merge_interval_in_s.clone(), block_cache);
         arena.set_creator_resolver(change_store.creator_resolver());
         Self {
             visible_op_count,
@@ -214,6 +236,7 @@ impl OpLog {
             configure: cfg,
             uncommitted_change: None,
             import_rollback: None,
+            max_pending_bytes: None,
         }
     }
 
@@ -348,7 +371,10 @@ impl OpLog {
             for op in change.ops.iter() {
                 let prev = prev_op.replace(op);
                 if op.container.get_type() == ContainerType::Text
-                    && matches!(op.content, InnerContent::List(list_op::InnerListOp::StyleEnd))
+                    && matches!(
+                        op.content,
+                        InnerContent::List(list_op::InnerListOp::StyleEnd)
+                    )
                 {
                     // Honest peers emit the `StyleStart` right before its `StyleEnd`,
                     // so this is the common case and needs no history lookup.
@@ -371,16 +397,19 @@ impl OpLog {
                 if op.container.get_type() != ContainerType::MovableList {
                     continue;
                 }
-                if let InnerContent::List(
-                    list_op::InnerListOp::Move { elem_id, .. }
-                    | list_op::InnerListOp::Set { elem_id, .. },
-                ) = &op.content
-                {
+                let elem_id = match &op.content {
+                    InnerContent::List(list_op::InnerListOp::Move { elem_id, .. }) => {
+                        Some(*elem_id)
+                    }
+                    InnerContent::List(list_op::InnerListOp::Set(set)) => Some(set.elem_id),
+                    _ => None,
+                };
+                if let Some(elem_id) = elem_id {
                     rollback.movable_list_refs.push(MovableListElemRef {
                         container: op.container,
                         op_id: ID::new(change.id.peer, op.counter),
                         op_lamport: change.lamport + (op.counter - change.id.counter) as Lamport,
-                        elem_id: *elem_id,
+                        elem_id,
                     });
                 }
             }
@@ -579,8 +608,10 @@ impl OpLog {
         let arena = self.arena.clone();
         let configure = self.configure.clone();
         // Also rolls back the arena; see `ChangeStore::retire`.
+        let empty_kv = self.change_store.new_empty_kv_backend();
         self.change_store.retire(arena_checkpoint);
-        let change_store = ChangeStore::new_mem(&arena, configure.merge_interval_in_s.clone());
+        let change_store =
+            ChangeStore::new_with_kv(&arena, configure.merge_interval_in_s.clone(), empty_kv);
         arena.set_creator_resolver(change_store.creator_resolver());
         self.history_cache = Mutex::new(ContainerHistoryCache::new(change_store.clone(), None));
         self.dag = AppDag::new(change_store.clone());
@@ -610,6 +641,59 @@ impl OpLog {
     pub fn free_history_cache(&self) {
         let mut history_cache = self.history_cache.lock();
         history_cache.free();
+    }
+
+    pub(crate) fn set_block_cache(&self, cache: SharedBlockCache) {
+        self.change_store.set_block_cache(cache);
+    }
+
+    pub(crate) fn flush_kv(&self) {
+        self.change_store.flush_kv();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn prepare_kv_backend(
+        &self,
+        new_backend: Box<dyn crate::kv_store::KvStore>,
+    ) -> Result<Box<dyn crate::kv_store::KvStore>, String> {
+        self.change_store.prepare_kv_backend(new_backend)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn install_kv_backend(&self, new_backend: Box<dyn crate::kv_store::KvStore>) {
+        self.change_store.install_kv_backend(new_backend);
+    }
+
+    pub(crate) fn compact_history(&self) {
+        if self.import_rollback.is_none() && !self.dag.has_pending_txn() {
+            self.change_store
+                .flush_and_compact(self.dag.vv(), self.dag.frontiers());
+        }
+    }
+
+    pub(crate) fn set_max_pending_bytes(&mut self, max: Option<usize>) {
+        self.max_pending_bytes = max;
+    }
+
+    pub(crate) fn has_max_pending_bytes(&self) -> bool {
+        self.max_pending_bytes.is_some()
+    }
+
+    pub(crate) fn estimated_memory_breakdown(&self) -> OpLogMemoryBreakdown {
+        let (change_kv_bytes, change_cache_bytes) = self.change_store.estimated_memory_bytes();
+        let dag_bytes = self.dag.estimated_memory_bytes();
+        let arena_bytes = self.arena.estimated_memory_bytes();
+        let history_cache_bytes = self.history_cache.lock().estimated_memory_bytes();
+        let spilled_disk_bytes = self.change_store.spilled_disk_bytes();
+        OpLogMemoryBreakdown {
+            dag_bytes,
+            arena_bytes,
+            change_cache_bytes,
+            change_kv_bytes,
+            pending_bytes: self.pending_changes.used_bytes(),
+            history_cache_bytes,
+            spilled_disk_bytes,
+        }
     }
 
     #[cfg(test)]
@@ -957,16 +1041,16 @@ impl OpLog {
         let mut uncovered = Vec::new();
         for (peer, span) in from.diff(to).forward.iter() {
             let id_span = IdSpan::new(*peer, span.start, span.end);
-            for change in self.change_store.try_iter_changes(id_span)? {
-                let start = change.id.counter.max(span.start);
-                let parents = if start > change.id.counter {
+            for (change_id, change_deps) in self.change_store.try_iter_change_headers(id_span)? {
+                let start = change_id.counter.max(span.start);
+                let parents = if start > change_id.counter {
                     // The change straddles `from`; the new suffix only has
                     // the implicit predecessor as parent.
                     Frontiers::from_id(ID::new(*peer, start - 1))
                 } else {
-                    let mut parents = change.deps().clone();
-                    if change.id.counter > 0 {
-                        let prev = ID::new(*peer, change.id.counter - 1);
+                    let mut parents = change_deps;
+                    if change_id.counter > 0 {
+                        let prev = ID::new(*peer, change_id.counter - 1);
                         if !parents.contains(&prev) {
                             parents.push(prev);
                         }
@@ -1422,6 +1506,8 @@ impl OpLog {
         let known_base =
             (&replay_base_frontiers == from_frontiers).then(|| replay_base_frontiers.clone());
 
+        let target_cid = container_filter.and_then(|idx| self.arena.get_container_id(idx));
+
         // go from the replay base to merged_vv
         let diff = replay_base_vv.diff(&merged_vv).forward;
         let mut iter = crate::dag::DagCausalIter::try_new(&self.dag, replay_base_frontiers, diff)?;
@@ -1448,6 +1534,22 @@ impl OpLog {
                                 .max(replay_base_vv.get(&peer).copied().unwrap_or(0));
                             let dag_node_end = (inner.data.cnt + inner.data.len as Counter)
                                 .min(merged_vv.get(&peer).copied().unwrap_or(0));
+                            if let Some(target_cid) = &target_cid {
+                                if let Some(block_end) =
+                                    self.change_store.unparsed_block_skip_end_if_missing_cid(
+                                        ID::new(peer, cnt),
+                                        target_cid,
+                                    )
+                                {
+                                    if block_end < dag_node_end {
+                                        cur_cnt = block_end;
+                                    } else {
+                                        node = iter.next();
+                                        cur_cnt = 0;
+                                    }
+                                    continue;
+                                }
+                            }
                             let change = match self.change_store.get_change(ID::new(peer, cnt)) {
                                 Some(change) => change,
                                 None => {
@@ -1612,7 +1714,8 @@ impl OpLog {
             // finds the style in the shallow root state.
             return Ok(!self.dag.shallow_since_vv().is_empty()
                 && self.with_history_cache(|h| {
-                    h.find_text_style_end_in_shallow_root(r.container, start_id).is_some()
+                    h.find_text_style_end_in_shallow_root(r.container, start_id)
+                        .is_some()
                 }));
         };
         Ok(start_op.container == r.container
@@ -1764,6 +1867,9 @@ impl OpLog {
     pub fn compact_change_store(&mut self) {
         self.change_store
             .flush_and_compact(self.dag.vv(), self.dag.frontiers());
+        if !self.has_import_rollback() {
+            self.change_store.compact_parsed_blocks();
+        }
     }
 
     #[inline]
@@ -1846,7 +1952,7 @@ pub(crate) fn local_op_to_remote(
                 loro_common::ContainerType::List | loro_common::ContainerType::MovableList => {
                     contents.push(RawOpContent::List(list_op::ListOp::Insert {
                         slice: ListSlice::RawData(Cow::Owned(slice.as_slice().to_vec())),
-                        pos: *pos,
+                        pos: *pos as usize,
                     }))
                 }
                 _ => unreachable!(),
@@ -1868,21 +1974,17 @@ pub(crate) fn local_op_to_remote(
                 _ => unreachable!(),
             },
             list_op::InnerListOp::Delete(del) => {
-                contents.push(RawOpContent::List(list_op::ListOp::Delete(*del)))
+                contents.push(RawOpContent::List(list_op::ListOp::Delete((*del).into())))
             }
-            list_op::InnerListOp::StyleStart {
-                start,
-                end,
-                key,
-                value,
-                info,
-            } => contents.push(RawOpContent::List(list_op::ListOp::StyleStart {
-                start: *start,
-                end: *end,
-                key: key.clone(),
-                value: value.clone(),
-                info: *info,
-            })),
+            list_op::InnerListOp::StyleStart(style) => {
+                contents.push(RawOpContent::List(list_op::ListOp::StyleStart {
+                    start: style.start,
+                    end: style.end,
+                    key: style.key.clone(),
+                    value: style.value.clone(),
+                    info: style.info,
+                }))
+            }
             list_op::InnerListOp::StyleEnd => {
                 contents.push(RawOpContent::List(list_op::ListOp::StyleEnd))
             }
@@ -1895,10 +1997,10 @@ pub(crate) fn local_op_to_remote(
                 elem_id: *from_id,
                 to: *to,
             })),
-            list_op::InnerListOp::Set { elem_id, value } => {
+            list_op::InnerListOp::Set(set) => {
                 contents.push(RawOpContent::List(list_op::ListOp::Set {
-                    elem_id: *elem_id,
-                    value: value.clone(),
+                    elem_id: set.elem_id,
+                    value: set.value.clone(),
                 }))
             }
         },

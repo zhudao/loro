@@ -295,6 +295,33 @@ impl ContainerState for MapState {
         Diff::Map(resolved_delta)
     }
 
+    fn undo_record(&mut self, diff: &InternalDiff) -> super::undo_log::StateUndo {
+        let InternalDiff::Map(delta) = diff else {
+            unreachable!()
+        };
+        super::undo_log::StateUndo::Map(
+            delta
+                .updated
+                .keys()
+                .map(|key| (key.clone(), self.map.get(key).cloned()))
+                .collect(),
+        )
+    }
+
+    fn apply_undo(&mut self, undo: super::undo_log::StateUndo) {
+        let super::undo_log::StateUndo::Map(entries) = undo else {
+            unreachable!()
+        };
+        for (key, old) in entries.into_iter().rev() {
+            match old {
+                Some(value) => {
+                    self.insert(key, value);
+                }
+                None => self.remove(&key),
+            }
+        }
+    }
+
     fn apply_diff(&mut self, diff: InternalDiff, ctx: DiffApplyContext) -> LoroResult<()> {
         let _ = self.apply_diff_and_convert(diff, ctx);
         Ok(())
@@ -429,6 +456,11 @@ impl MapState {
         };
 
         result
+    }
+
+    /// The entry for `key`, including a deleted key's tombstone.
+    pub(crate) fn get_map_value(&self, key: &InternalString) -> Option<&MapValue> {
+        self.map.get(key)
     }
 
     pub fn remove(&mut self, key: &InternalString) {
@@ -717,5 +749,49 @@ mod snapshot {
             let (_, state_bytes) = MapState::decode_value(&bytes).unwrap();
             assert!(MapState::decode_snapshot_fast(idx, (value, state_bytes), ctx).is_err());
         }
+    }
+}
+
+impl MapState {
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let map_bytes = match &self.map {
+            MapEntries::SortedTiny(entries) => {
+                entries.capacity() * std::mem::size_of::<(InternalString, MapValue)>()
+                    + entries
+                        .iter()
+                        .filter_map(|(_, v)| v.value.as_ref())
+                        .map(|v| {
+                            v.estimated_heap_bytes()
+                                .saturating_sub(std::mem::size_of::<LoroValue>())
+                        })
+                        .sum::<usize>()
+            }
+            MapEntries::Tree(tree) => {
+                tree.len()
+                    * (std::mem::size_of::<InternalString>() + std::mem::size_of::<MapValue>() + 32)
+                    + tree
+                        .values()
+                        .filter_map(|v| v.value.as_ref())
+                        .map(|v| {
+                            v.estimated_heap_bytes()
+                                .saturating_sub(std::mem::size_of::<LoroValue>())
+                        })
+                        .sum::<usize>()
+            }
+        };
+        let child_bytes = match &self.child_containers {
+            ChildContainers::Tiny(entries) => {
+                entries.capacity() * std::mem::size_of::<(ContainerID, InternalString)>()
+            }
+            ChildContainers::Map(map) => {
+                map.capacity()
+                    * (std::mem::size_of::<ContainerID>()
+                        + std::mem::size_of::<InternalString>()
+                        + 8)
+            }
+        };
+        std::mem::size_of::<Self>()
+            .saturating_add(map_bytes)
+            .saturating_add(child_bytes)
     }
 }

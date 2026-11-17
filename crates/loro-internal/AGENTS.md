@@ -11,6 +11,9 @@ over graceful degradation.
   [../../context/undo-history-boundaries.md](../../context/undo-history-boundaries.md).
 - Undo transaction rollback and writer gate:
   [../../context/undo-atomicity.md](../../context/undo-atomicity.md).
+- Undo steps use the inverse recorded at commit (`txn.rs` `local_op_inverse`,
+  `undo::LocalInverse`) instead of checkouts; `LORO_VERIFY_UNDO_LOG` compares
+  both: [../../context/undo-log.md](../../context/undo-log.md).
 - `src/loro.rs`: document-level orchestration for commit, import/export,
   checkout, barriers, state/oplog coordination, and event emission.
   `apply_diff`/`revert_to` roll a failed batch back:
@@ -29,10 +32,17 @@ over graceful degradation.
   [../../context/version-input-contract.md](../../context/version-input-contract.md).
   `ChangeStore` is also read without the op log lock, so keep its lock order:
   [../../context/arena-parent-links.md](../../context/arena-parent-links.md).
-- Retained memory by component, what forces a full history parse, why
-  `mem_parsed_kv` has no release path, and why replay callers must pass a `from`
+- Retained memory by component, what forces a full history parse, explicit parsed-cache
+  release versus ordinary flushing, and why replay callers must pass a `from`
   that is exactly the vv of `from_frontiers`:
   [../../context/memory-analysis.md](../../context/memory-analysis.md).
+- `src/fork.rs` owns `fork_at_inner`; both fork paths copy the local memory
+  budget. See the memory-budget context below.
+- Bounded `LoroDoc` & global memory budgets (`MemoryBudget`,
+  `GlobalMemoryBudget`, `DocMemoryStats`, `GlobalMemoryStats`, Stage 1/2
+  hysteresis & clock/LRU demotion, Stage 3 hard quotas, state-before-oplog
+  rollback, and `try_commit`):
+  [../../context/memory-budget.md](../../context/memory-budget.md).
 - `src/arena.rs`: container IDs, indices, and parent links. How a parent is
   found in a lazily loaded document, and the locking rules:
   [../../context/arena-parent-links.md](../../context/arena-parent-links.md).

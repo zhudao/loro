@@ -1,5 +1,6 @@
 use super::{ContainerCreationContext, State};
 use crate::arena::LoadAllFlag;
+use crate::kv_store::{KvStore, SharedBlockCache};
 use crate::sync::{AtomicU64, Mutex};
 use crate::{
     arena::SharedArena, configure::Configure, container::idx::ContainerIdx,
@@ -9,6 +10,7 @@ use bytes::Bytes;
 use inner_store::InnerStore;
 use loro_common::{ContainerID, InternalString, LoroResult, LoroValue};
 use once_cell::sync::OnceCell;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 pub(crate) use container_wrapper::ContainerWrapper;
@@ -38,6 +40,12 @@ mod inner_store;
 /// │                                                   │
 /// │                                                   │
 /// └───────────────────────────────────────────────────┘
+/// Backends filled by [`ContainerStore::prepare_kv_backend`].
+pub(crate) struct PreparedKvBackend {
+    main: Arc<Mutex<dyn KvStore>>,
+    root: Option<Arc<Mutex<dyn KvStore>>>,
+}
+
 pub(crate) struct ContainerStore {
     arena: SharedArena,
     store: InnerStore,
@@ -87,9 +95,19 @@ macro_rules! ctx {
 }
 
 impl ContainerStore {
+    #[allow(dead_code)]
     pub fn new(arena: SharedArena, conf: Configure, peer: Arc<AtomicU64>) -> Self {
+        Self::new_with_cache(arena, conf, peer, SharedBlockCache::default_per_doc())
+    }
+
+    pub(crate) fn new_with_cache(
+        arena: SharedArena,
+        conf: Configure,
+        peer: Arc<AtomicU64>,
+        block_cache: SharedBlockCache,
+    ) -> Self {
         ContainerStore {
-            store: InnerStore::new(arena.clone(), conf.clone()),
+            store: InnerStore::new_with_cache(arena.clone(), conf.clone(), block_cache),
             arena,
             conf,
             shallow_root_store: None,
@@ -265,7 +283,9 @@ impl ContainerStore {
         config: Configure,
     ) -> LoroResult<Option<Frontiers>> {
         assert!(self.shallow_root_store.is_none());
-        let mut inner = InnerStore::new(self.arena.clone(), config);
+        let mut inner = self
+            .store
+            .new_empty_same_backend(self.arena.clone(), config);
         let encoded_state_bytes = shallow_bytes.clone();
         let f = inner.decode(shallow_bytes)?;
         let encoded_state_bytes = if f.as_ref() == Some(&start_frontiers) {
@@ -329,16 +349,137 @@ impl ContainerStore {
         LoadAllFlag
     }
 
-    pub(super) fn begin_created_journal(&mut self) {
+    pub(crate) fn begin_created_journal(&mut self) {
         self.store.begin_created_journal();
     }
 
-    pub(super) fn take_created_journal(&mut self) -> Vec<ContainerIdx> {
+    pub(crate) fn take_created_journal(&mut self) -> Vec<ContainerIdx> {
         self.store.take_created_journal()
     }
 
-    pub(super) fn remove_created(&mut self, created: &[ContainerIdx]) {
+    pub(crate) fn commit_top_created_journal(&mut self) {
+        self.store.commit_top_created_journal();
+    }
+
+    pub(crate) fn clear_created_journals(&mut self) {
+        self.store.clear_created_journals();
+    }
+
+    pub(crate) fn remove_created(&mut self, created: &[ContainerIdx]) {
         self.store.remove_created(created);
+    }
+
+    pub(crate) fn evict_value_cache_to_bytes(&mut self, max_bytes: usize) -> usize {
+        let mut evicted = self.store.evict_value_cache_to_bytes(max_bytes);
+        if let Some(root) = &self.shallow_root_store {
+            evicted += root.store.lock().evict_value_cache_to_bytes(0);
+        }
+        evicted
+    }
+
+    pub(crate) fn value_cache_bytes(&self) -> usize {
+        self.store.value_cache_bytes()
+            + self
+                .shallow_root_store
+                .as_ref()
+                .map_or(0, |root| root.store.lock().value_cache_bytes())
+    }
+
+    pub(crate) fn estimated_state_bytes(&self) -> usize {
+        self.store.estimated_state_bytes()
+    }
+
+    pub(crate) fn kv_estimated_bytes(&self) -> usize {
+        self.store.kv_estimated_bytes()
+            + self.shallow_root_store.as_ref().map_or(0, |root| {
+                let s = root.store.lock();
+                s.kv_estimated_bytes() + s.estimated_state_bytes() + root.encoded_state_bytes.len()
+            })
+    }
+
+    pub(crate) fn take_spill_error(&self) -> Option<String> {
+        let root = self
+            .shallow_root_store
+            .as_ref()
+            .and_then(|root| root.store.lock().take_spill_error());
+        join_spill_errors(self.store.take_spill_error(), root)
+    }
+
+    pub(crate) fn spilled_disk_bytes(&self) -> usize {
+        self.store.spilled_disk_bytes()
+            + self
+                .shallow_root_store
+                .as_ref()
+                .map_or(0, |root| root.store.lock().spilled_disk_bytes())
+    }
+
+    pub(crate) fn set_block_cache(&mut self, cache: SharedBlockCache) {
+        self.store.set_block_cache(cache.clone());
+        if let Some(root) = &self.shallow_root_store {
+            root.store.lock().set_block_cache(cache);
+        }
+    }
+
+    pub(crate) fn flush_kv(&mut self) {
+        self.store.flush_kv();
+    }
+
+    pub(crate) fn new_empty_same_backend(
+        &self,
+        arena: SharedArena,
+        conf: Configure,
+        peer: Arc<AtomicU64>,
+    ) -> Self {
+        ContainerStore {
+            store: self
+                .store
+                .new_empty_same_backend(arena.clone(), conf.clone()),
+            arena,
+            conf,
+            shallow_root_store: None,
+            peer,
+        }
+    }
+
+    /// Fill `kv` (and a backend of the same kind for the shallow root) with this
+    /// store's entries without installing them. See [`Self::install_kv_backend`].
+    pub(crate) fn prepare_kv_backend(
+        &self,
+        kv: Arc<Mutex<dyn KvStore>>,
+    ) -> Result<PreparedKvBackend, String> {
+        self.store.fill_kv_backend(&kv)?;
+        let root = match &self.shallow_root_store {
+            Some(root) => {
+                let empty_gc = kv.lock().new_empty_same_backend();
+                root.store.lock().fill_kv_backend(&empty_gc)?;
+                Some(empty_gc)
+            }
+            None => None,
+        };
+        Ok(PreparedKvBackend { main: kv, root })
+    }
+
+    pub(crate) fn install_kv_backend(&mut self, prepared: PreparedKvBackend) {
+        if let (Some(root), Some(root_kv)) = (&self.shallow_root_store, prepared.root) {
+            root.store.lock().install_kv_backend(root_kv);
+        }
+        self.store.install_kv_backend(prepared.main);
+    }
+
+    pub(crate) fn demote_cold_states(
+        &mut self,
+        target_state_bytes: usize,
+        pinned: &FxHashSet<ContainerIdx>,
+    ) -> usize {
+        self.store.demote_cold_states(target_state_bytes, pinned)
+    }
+
+    pub(crate) fn reclaim_auxiliary_caches(&mut self) -> usize {
+        let mut freed = self.store.reclaim_auxiliary_caches();
+        if let Some(root) = &self.shallow_root_store {
+            freed = freed.saturating_add(root.store.lock().reclaim_auxiliary_caches());
+        }
+        freed
     }
 
     pub(super) fn get_or_create_mut(&mut self, idx: ContainerIdx) -> &mut State {
@@ -496,6 +637,62 @@ mod test {
         state.store.encode()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn shallow_root_import_uses_the_preconfigured_spill_backend() {
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = TempDir(std::env::temp_dir().join(format!(
+                "loro-shallow-backend-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )));
+        let source = crate::LoroDoc::new_auto_commit();
+        for i in 0..32 {
+            source
+                .get_map("map")
+                .insert(&format!("k{i}"), format!("value-{i}"))
+                .unwrap();
+        }
+        source.commit_then_renew();
+        let shallow = source.oplog_frontiers();
+        source.get_map("map").insert("tail", true).unwrap();
+        source.commit_then_renew();
+        let snapshot = source
+            .export(crate::loro::ExportMode::shallow_snapshot(&shallow))
+            .unwrap();
+        let doc = crate::LoroDoc::new_auto_commit();
+        doc.set_memory_budget(crate::memory::MemoryBudget::new().with_spill_dir(&dir.0));
+        doc.import(&snapshot).unwrap();
+        let state = doc.app_state().lock();
+        let root = state.store.shallow_root_store.as_ref().unwrap();
+        assert!(root.store.lock().spilled_disk_bytes() > 0);
+        drop(state);
+        assert_eq!(doc.get_deep_value(), source.get_deep_value());
+        let fork = doc.fork();
+        let fork_state = fork.app_state().lock();
+        assert!(
+            fork_state
+                .store
+                .shallow_root_store
+                .as_ref()
+                .unwrap()
+                .store
+                .lock()
+                .spilled_disk_bytes()
+                > 0
+        );
+        drop(fork_state);
+        assert_eq!(fork.get_deep_value(), source.get_deep_value());
+    }
+
     #[test]
     fn test_container_store_exports_imports() {
         let doc = init_doc();
@@ -636,15 +833,18 @@ mod test {
             assert!(!state.store.store.has_materialized_map_value_for_test(idx));
 
             // If an ordinary value read already materialized it, keep it so.
-            assert_eq!(state.store.get_value(idx).unwrap().as_map().unwrap().len(), 2);
+            assert_eq!(
+                state.store.get_value(idx).unwrap().as_map().unwrap().len(),
+                2
+            );
             assert!(state.store.store.has_materialized_map_value_for_test(idx));
             assert!(!state.root_container_is_empty(idx));
             assert!(state.store.store.has_materialized_map_value_for_test(idx));
 
-            let text_idx = state.store.arena.register_container(&ContainerID::new_root(
-                "text",
-                ContainerType::Text,
-            ));
+            let text_idx = state
+                .store
+                .arena
+                .register_container(&ContainerID::new_root("text", ContainerType::Text));
             assert!(!state.root_container_is_empty(text_idx));
         }
     }
@@ -674,7 +874,10 @@ mod test {
         let text_idx = state.store.arena.register_container(&text_id);
         let count = state.store.store.cached_value_count_for_test();
         assert!(state.store.store.has_cached_value_for_test(map_idx));
-        assert!(!state.store.store.has_materialized_map_value_for_test(map_idx));
+        assert!(!state
+            .store
+            .store
+            .has_materialized_map_value_for_test(map_idx));
         for _ in 0..32 {
             assert!(state.root_container_is_empty(map_idx));
             assert!(!state.root_container_is_empty(text_idx));
@@ -691,7 +894,10 @@ mod test {
             assert!(!roots.contains(&map_idx));
         }
         assert_eq!(state.store.store.cached_value_count_for_test(), count);
-        assert!(!state.store.store.has_materialized_map_value_for_test(map_idx));
+        assert!(!state
+            .store
+            .store
+            .has_materialized_map_value_for_test(map_idx));
     }
 
     #[test]
@@ -837,7 +1043,11 @@ mod test {
         // assertions, because export/deep reads can change state residency.
         let restored = LoroDoc::new();
         restored
-            .import(&imported.export(crate::encoding::ExportMode::Snapshot).unwrap())
+            .import(
+                &imported
+                    .export(crate::encoding::ExportMode::Snapshot)
+                    .unwrap(),
+            )
             .unwrap();
         assert_eq!(restored.get_map("live").get("keep"), Some(17.into()));
         assert_eq!(restored.get_map("shared").get("gone"), None);
@@ -1452,5 +1662,13 @@ mod test {
             .import(&doc.export(crate::encoding::ExportMode::Snapshot).unwrap())
             .unwrap();
         assert_eq!(round_tripped.get_deep_value(), doc.get_deep_value());
+    }
+}
+
+/// Both errors, when both stores failed to spill.
+pub(crate) fn join_spill_errors(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
     }
 }

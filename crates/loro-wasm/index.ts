@@ -501,6 +501,7 @@ decorateMethods(LoroDoc.prototype, [
   "checkoutToLatest",
   "checkout",
   "commit",
+  "tryCommit",
   "getCursorPos",
   "revertTo",
   "export",
@@ -516,6 +517,7 @@ decorateMethods(LoroDoc.prototype, [
   "diff",
   "applyDiff",
   "setPeerId",
+  "compactChangeStore",
 ]);
 
 decorateMethods(EphemeralStoreWasm.prototype, [

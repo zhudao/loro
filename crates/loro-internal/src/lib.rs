@@ -59,6 +59,7 @@ pub mod id;
 pub mod jsonpath;
 pub mod kv_store;
 pub mod loro;
+pub mod memory;
 pub mod op;
 pub mod oplog;
 pub mod subscription;
@@ -93,12 +94,17 @@ pub(crate) use loro_common::InternalString;
 pub use container::ContainerType;
 pub use encoding::json_schema::json;
 pub use fractional_index::FractionalIndex;
+pub use loro::{
+    global_memory_budget, global_memory_stats, reclaim_global_memory, set_global_memory_budget,
+    try_reclaim_global_to_budget, wasm_linear_memory_exceeded,
+};
 pub use loro_common::{loro_value, to_value};
 pub use loro_common::{
     Counter, CounterSpan, IdLp, IdSpan, IdSpanVector, Lamport, LoroEncodeError, LoroError,
-    LoroResult, LoroTreeError, PeerID, TreeID, ID,
+    LoroResult, LoroTreeError, MemoryLimitExceeded, MemoryLimitKind, PeerID, TreeID, ID,
 };
 pub use loro_common::{LoroBinaryValue, LoroListValue, LoroMapValue, LoroStringValue};
+pub use memory::{DocMemoryStats, GlobalMemoryBudget, GlobalMemoryStats, MemoryBudget};
 #[cfg(feature = "wasm")]
 pub use value::wasm;
 pub use value::{ApplyDiff, LoroValue, ToJson};
@@ -124,13 +130,33 @@ pub use version::VersionVector;
 #[derive(Debug, Clone)]
 #[repr(transparent)]
 pub struct LoroDoc {
-    inner: Arc<LoroDocInner>,
+    // Released explicitly in `Drop for LoroDoc`, inside the drop gate when this
+    // handle is not the last one (see `DocDropGate`).
+    inner: std::mem::ManuallyDrop<Arc<LoroDocInner>>,
 }
 
 impl LoroDoc {
     pub(crate) fn from_inner(inner: Arc<LoroDocInner>) -> Self {
-        Self { inner }
+        Self {
+            inner: std::mem::ManuallyDrop::new(inner),
+        }
     }
+}
+
+/// Serializes the "is this the last handle?" decision in `Drop for LoroDoc`
+/// with the global registry's temporary references.
+///
+/// The registry upgrades its `Weak` and increments `registry_refs` while holding
+/// this lock, and drops its `Arc` and decrements while holding it. A handle that
+/// is not the last one also releases its `Arc` while holding it. So inside the
+/// lock, `strong_count - registry_refs` counts exactly the other handles (plus
+/// short-lived upgrades made while one of those handles is in use), and the
+/// last handle always commits, however the registry interleaves. Kept outside
+/// `LoroDocInner` so that the final drop may happen while the lock is held.
+/// See `context/memory-budget.md` ("Last handle and registry references").
+#[derive(Debug, Default)]
+pub(crate) struct DocDropGate {
+    pub(crate) registry_refs: crate::sync::Mutex<usize>,
 }
 
 impl std::ops::Deref for LoroDoc {
@@ -171,6 +197,38 @@ pub struct LoroDocInner {
     first_commit_from_peer_subs:
         SubscriberSetWithQueue<(), FirstCommitFromPeerCallback, FirstCommitFromPeerPayload>,
     pre_commit_subs: SubscriberSetWithQueue<(), PreCommitCallback, PreCommitCallbackPayload>,
+    pub(crate) undo_managers: crate::sync::Mutex<
+        Vec<
+            std::sync::Weak<
+                parking_lot::ReentrantMutex<std::cell::RefCell<undo::UndoManagerInner>>,
+            >,
+        >,
+    >,
+    pub(crate) memory_budget: crate::sync::Mutex<memory::MemoryBudget>,
+    pub(crate) budget_flags: std::sync::atomic::AtomicU8,
+    pub(crate) kv_block_cache: kv_store::SharedBlockCache,
+    pub(crate) pool_doc_id: u64,
+    pub(crate) cached_doc_bytes: std::sync::atomic::AtomicUsize,
+    /// `spilled_disk_bytes` of the statistics `cached_doc_bytes` came from.
+    pub(crate) cached_spilled_bytes: std::sync::atomic::AtomicUsize,
+    /// Whether `cached_doc_bytes` may be stale; see [`loro::DocStatsDirty`].
+    pub(crate) stats_dirty: Arc<loro::DocStatsDirty>,
+    /// Skips per-document soft sweeps that recently failed; see [`loro::SoftBackoff`].
+    pub(crate) soft_backoff: loro::SoftBackoff,
+    pub(crate) last_access_tick: std::sync::atomic::AtomicU64,
+    pub(crate) drop_gate: Arc<DocDropGate>,
+}
+
+impl Drop for LoroDocInner {
+    fn drop(&mut self) {
+        loro::unregister_doc_from_global_pool(
+            self.pool_doc_id,
+            self.cached_doc_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.cached_spilled_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
 }
 
 /// The version of the loro crate
@@ -178,8 +236,30 @@ pub const LORO_VERSION: &str = include_str!("../VERSION");
 
 impl Drop for LoroDoc {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.inner) == 1 {
-            let _ = self.implicit_commit_then_stop();
+        struct ReleaseOnExit(*mut std::mem::ManuallyDrop<Arc<LoroDocInner>>);
+        impl Drop for ReleaseOnExit {
+            fn drop(&mut self) {
+                // SAFETY: points at `LoroDoc::inner`, which is not used after this
+                // guard runs, also when the commit below unwinds.
+                unsafe { std::mem::ManuallyDrop::drop(&mut *self.0) }
+            }
         }
+
+        let gate = Arc::clone(&self.inner.drop_gate);
+        let refs = gate.registry_refs.lock_ignoring_poison();
+        let others = Arc::strong_count(&self.inner)
+            .saturating_sub(1)
+            .saturating_sub(*refs);
+        if others > 0 {
+            // Release inside the gate: a concurrent `drop` of the other handle must
+            // not count this one as still alive.
+            // SAFETY: `inner` is not used after this.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.inner) };
+            drop(refs);
+            return;
+        }
+        drop(refs);
+        let _release = ReleaseOnExit(&mut self.inner);
+        let _ = self.implicit_commit_then_stop();
     }
 }

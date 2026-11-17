@@ -3,12 +3,18 @@ use crate::{
     block::{Block, BlockBuilder},
     compress::CompressionType,
     iter::KvIterator,
-    utils::{get_u16_le, get_u32_le, get_u8_le},
 };
 use bytes::{Buf, BufMut, Bytes};
 use ensure_cov::*;
 use loro_common::{LoroError, LoroResult};
-use std::{fmt::Debug, ops::Bound, sync::Arc};
+use std::{
+    fmt::Debug,
+    ops::Bound,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
+};
 
 pub(crate) const XXH_SEED: u32 = u32::from_le_bytes(*b"LORO");
 const MAGIC_BYTES: [u8; 4] = *b"LORO";
@@ -33,11 +39,11 @@ const MAX_BLOCK_NUM: u32 = 10_000_000;
 /// ```
 #[derive(Debug, Clone)]
 pub(crate) struct BlockMeta {
-    offset: usize,
-    is_large: bool,
-    compression_type: CompressionType,
-    first_key: Bytes,
-    last_key: Option<Bytes>,
+    pub(crate) offset: usize,
+    pub(crate) is_large: bool,
+    pub(crate) compression_type: CompressionType,
+    pub(crate) first_key: Bytes,
+    pub(crate) last_key: Option<Bytes>,
 }
 
 impl BlockMeta {
@@ -90,8 +96,11 @@ impl BlockMeta {
         buf.put_u32_le(checksum);
     }
 
-    fn decode_meta(data: &[u8]) -> LoroResult<Vec<BlockMeta>> {
-        let (num, mut data) = get_u32_le(data)?;
+    fn decode_meta(mut data: Bytes) -> LoroResult<Arc<[BlockMeta]>> {
+        if data.len() < SIZE_OF_U32 + SIZE_OF_U32 {
+            return Err(LoroError::DecodeError("Invalid bytes".into()));
+        }
+        let num = data.get_u32_le();
         if num > MAX_BLOCK_NUM {
             return Err(LoroError::DecodeError("Invalid bytes".into()));
         }
@@ -106,48 +115,59 @@ impl BlockMeta {
         {
             return Err(LoroError::DecodeError("Invalid bytes".into()));
         }
-        let mut ans = Vec::with_capacity(num as usize);
         let checksum = xxhash_rust::xxh32::xxh32(&data[..data.len() - SIZE_OF_U32], XXH_SEED);
+        let mut ans = Vec::with_capacity(num as usize);
         for _ in 0..num {
-            let (offset, buf) = get_u32_le(data)?;
-            let (first_key_len, mut buf) = get_u16_le(buf)?;
-            if buf.len() < first_key_len as usize {
+            if data.len() < SIZE_OF_U32 + SIZE_OF_U16 {
                 return Err(LoroError::DecodeError("Invalid bytes".into()));
             }
-            let first_key = buf.copy_to_bytes(first_key_len as usize);
-            let (is_large_and_compression_type, buf) = get_u8_le(buf)?;
+            let offset = data.get_u32_le() as usize;
+            let first_key_len = data.get_u16_le() as usize;
+            if data.len() < first_key_len + SIZE_OF_U8 {
+                return Err(LoroError::DecodeError("Invalid bytes".into()));
+            }
+            // Metadata outlives the table during export and spilling. Do not pin
+            // the entire input allocation with these tiny keys.
+            let first_key = Bytes::copy_from_slice(&data[..first_key_len]);
+            data.advance(first_key_len);
+            let is_large_and_compression_type = data.get_u8();
             let is_large = is_large_and_compression_type & 0b1000_0000 != 0;
             let compression_type = is_large_and_compression_type & 0b0111_1111;
             if is_large {
                 ans.push(BlockMeta {
-                    offset: offset as usize,
+                    offset,
                     is_large,
                     compression_type: compression_type.try_into()?,
                     first_key,
                     last_key: None,
                 });
-                data = buf;
                 continue;
             }
-            let (last_key_len, mut buf) = get_u16_le(buf)?;
-            if buf.len() < last_key_len as usize {
+            if data.len() < SIZE_OF_U16 {
                 return Err(LoroError::DecodeError("Invalid bytes".into()));
             }
-            let last_key = buf.copy_to_bytes(last_key_len as usize);
+            let last_key_len = data.get_u16_le() as usize;
+            if data.len() < last_key_len {
+                return Err(LoroError::DecodeError("Invalid bytes".into()));
+            }
+            let last_key = Bytes::copy_from_slice(&data[..last_key_len]);
+            data.advance(last_key_len);
             ans.push(BlockMeta {
-                offset: offset as usize,
+                offset,
                 is_large,
                 compression_type: compression_type.try_into()?,
                 first_key,
                 last_key: Some(last_key),
             });
-            data = buf;
         }
-        let (checksum_read, _) = get_u32_le(data)?;
+        if data.len() < SIZE_OF_U32 {
+            return Err(LoroError::DecodeError("Invalid bytes".into()));
+        }
+        let checksum_read = data.get_u32_le();
         if checksum != checksum_read {
             return Err(LoroError::DecodeChecksumMismatchError);
         }
-        Ok(ans)
+        Ok(Arc::from(ans))
     }
 }
 
@@ -256,6 +276,19 @@ impl SsTableBuilder {
         }
     }
 
+    pub(crate) fn add_raw_block(&mut self, meta: &BlockMeta, raw_block_and_check: &[u8]) {
+        self.finish_current_block();
+        let offset = self.data.len();
+        self.data.extend_from_slice(raw_block_and_check);
+        self.meta.push(BlockMeta {
+            offset,
+            is_large: meta.is_large,
+            compression_type: meta.compression_type,
+            first_key: meta.first_key.clone(),
+            last_key: meta.last_key.clone(),
+        });
+    }
+
     fn add_new_block_inner(&mut self, block: &Block) {
         assert!(self.block_builder.is_empty());
         let offset = self.data.len();
@@ -307,65 +340,415 @@ impl SsTableBuilder {
                 )
             })
             .unwrap_or_default();
-        let block_cache = new_block_cache(self.meta.len());
+        let meta: Arc<[BlockMeta]> = Arc::from(self.meta);
+        let meta_bytes = calc_meta_bytes(&meta);
         SsTable {
-            data: Bytes::from(buf),
+            id: next_table_id(),
+            backing: SsTableBacking::Memory(Bytes::from(buf)),
             first_key,
             last_key,
-            meta: self.meta,
+            meta,
+            meta_bytes,
             meta_offset: meta_offset as usize,
-            block_cache,
+            block_cache: SharedBlockCache::default_per_doc(),
         }
+    }
+
+    pub fn build_with_cache(self, block_cache: SharedBlockCache) -> SsTable {
+        let mut ss = self.build();
+        ss.set_block_cache(block_cache);
+        ss
     }
 }
 
-type BlockCache = quick_cache::sync::Cache<usize, Arc<Block>, BlockDataWeighter>;
+static NEXT_SSTABLE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_table_id() -> u64 {
+    NEXT_SSTABLE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn calc_meta_bytes(meta: &[BlockMeta]) -> usize {
+    meta.iter()
+        .map(|m| {
+            std::mem::size_of::<BlockMeta>()
+                + m.first_key.len()
+                + m.last_key.as_ref().map_or(0, Bytes::len)
+        })
+        .sum()
+}
+
+type BlockCache = quick_cache::sync::Cache<(u64, usize), Arc<Block>, BlockDataWeighter>;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct BlockDataWeighter;
 
-impl quick_cache::Weighter<usize, Arc<Block>> for BlockDataWeighter {
-    fn weight(&self, _idx: &usize, block: &Arc<Block>) -> u64 {
+impl quick_cache::Weighter<(u64, usize), Arc<Block>> for BlockDataWeighter {
+    fn weight(&self, _key: &(u64, usize), block: &Arc<Block>) -> u64 {
         // Zero-weight entries are never evicted; clamp so empty blocks cannot pin themselves.
         (block.data().len() as u64).max(1)
     }
 }
 
-/// `table_blocks` sizes what the cache reserves up front: a process can hold many small tables.
-fn new_block_cache(table_blocks: usize) -> BlockCache {
-    let max_blocks =
-        (BLOCK_CACHE_MAX_BYTES / crate::MemKvStore::DEFAULT_BLOCK_SIZE as u64) as usize;
-    let estimated_blocks = table_blocks.clamp(1, max_blocks);
-    BlockCache::with_weighter(estimated_blocks, BLOCK_CACHE_MAX_BYTES, BlockDataWeighter)
+#[derive(Debug)]
+struct SharedBlockCacheInner {
+    max_bytes: AtomicUsize,
+    cache: RwLock<Option<BlockCache>>,
+    has_explicit_max: AtomicBool,
+    has_parent: AtomicBool,
+    parent: RwLock<Option<Arc<SharedBlockCacheInner>>>,
+}
+
+/// A lazily-allocated, byte-bounded block cache that can be shared across all SSTables
+/// owned by a document (including both `ChangeStore` and `DocState` stores), or
+/// optionally delegated to a process-wide parent cache.
+#[derive(Clone, Debug)]
+pub struct SharedBlockCache {
+    inner: Arc<SharedBlockCacheInner>,
+}
+
+impl Default for SharedBlockCache {
+    fn default() -> Self {
+        Self::default_per_doc()
+    }
+}
+
+impl SharedBlockCache {
+    fn new_with_flag(max_bytes: usize, has_explicit_max: bool) -> Self {
+        Self {
+            inner: Arc::new(SharedBlockCacheInner {
+                max_bytes: AtomicUsize::new(max_bytes),
+                cache: RwLock::new(None),
+                has_explicit_max: AtomicBool::new(has_explicit_max),
+                has_parent: AtomicBool::new(false),
+                parent: RwLock::new(None),
+            }),
+        }
+    }
+
+    /// Creates a new shared block cache bounded to at most `max_bytes` decompressed block bytes.
+    /// When `max_bytes == 0`, block reads decode on demand without caching.
+    pub fn new(max_bytes: usize) -> Self {
+        Self::new_with_flag(max_bytes, true)
+    }
+
+    /// Creates a shared block cache with the default 4 MiB per-document budget.
+    pub fn default_per_doc() -> Self {
+        Self::new_with_flag(BLOCK_CACHE_MAX_BYTES as usize, false)
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.inner.max_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        let guard = self.inner.cache.read().unwrap();
+        guard.as_ref().map_or(0, |c| c.weight() as usize)
+    }
+
+    pub fn clear(&self) {
+        let mut guard = self.inner.cache.write().unwrap();
+        *guard = None;
+    }
+
+    pub fn set_max_bytes(&self, max_bytes: usize) {
+        let old = self.inner.max_bytes.swap(max_bytes, Ordering::Relaxed);
+        if max_bytes == 0 || old != max_bytes {
+            self.clear();
+        }
+    }
+
+    /// Sets or clears an explicit per-document max cache byte cap.
+    ///
+    /// When `Some(bytes)`, this cache enforces its own local budget instead of delegating to
+    /// an attached parent cache. When `None`, it reverts to default sizing and delegates to
+    /// the parent cache if one is attached.
+    pub fn set_explicit_max_bytes(&self, max_bytes: Option<usize>) {
+        match max_bytes {
+            Some(bytes) => {
+                self.inner.has_explicit_max.store(true, Ordering::Release);
+                self.set_max_bytes(bytes);
+            }
+            None => {
+                self.inner.has_explicit_max.store(false, Ordering::Release);
+                self.inner
+                    .max_bytes
+                    .store(BLOCK_CACHE_MAX_BYTES as usize, Ordering::Relaxed);
+                self.clear();
+            }
+        }
+    }
+
+    /// Attaches or detaches a shared parent block cache used whenever no explicit per-document
+    /// limit overrides it.
+    pub fn set_parent(&self, parent: Option<&SharedBlockCache>) {
+        let parent_arc = parent
+            .filter(|p| !Arc::ptr_eq(&self.inner, &p.inner))
+            .map(|p| p.inner.clone());
+        let has_parent = parent_arc.is_some();
+        {
+            let mut guard = self.inner.parent.write().unwrap();
+            *guard = parent_arc;
+        }
+        self.inner.has_parent.store(has_parent, Ordering::Release);
+        if has_parent && !self.inner.has_explicit_max.load(Ordering::Acquire) {
+            self.clear();
+        }
+    }
+
+    #[inline]
+    pub fn is_delegating_to_parent(&self) -> bool {
+        self.inner.has_parent.load(Ordering::Acquire)
+            && !self.inner.has_explicit_max.load(Ordering::Acquire)
+    }
+
+    /// Returns bytes cached locally in this cache, returning `0` when delegating to a parent.
+    pub fn local_used_bytes(&self) -> usize {
+        if self.is_delegating_to_parent() {
+            0
+        } else {
+            self.used_bytes()
+        }
+    }
+
+    pub fn get_or_insert_with(
+        &self,
+        table_id: u64,
+        block_idx: usize,
+        table_blocks_hint: usize,
+        decode: impl FnOnce() -> Arc<Block>,
+    ) -> Arc<Block> {
+        if self.is_delegating_to_parent() {
+            let parent_arc = { self.inner.parent.read().unwrap().clone() };
+            if let Some(parent) = parent_arc {
+                return Self::get_or_insert_on_inner(
+                    &parent,
+                    table_id,
+                    block_idx,
+                    table_blocks_hint,
+                    decode,
+                );
+            }
+        }
+        Self::get_or_insert_on_inner(&self.inner, table_id, block_idx, table_blocks_hint, decode)
+    }
+
+    fn get_or_insert_on_inner(
+        inner: &SharedBlockCacheInner,
+        table_id: u64,
+        block_idx: usize,
+        table_blocks_hint: usize,
+        decode: impl FnOnce() -> Arc<Block>,
+    ) -> Arc<Block> {
+        let max_bytes = inner.max_bytes.load(Ordering::Relaxed);
+        if max_bytes == 0 {
+            return decode();
+        }
+        {
+            let guard = inner.cache.read().unwrap();
+            if let Some(cache) = guard.as_ref() {
+                return cache
+                    .get_or_insert_with(&(table_id, block_idx), || Ok::<_, LoroError>(decode()))
+                    .expect("validated SSTable block cache insert should succeed");
+            }
+        }
+        {
+            let mut guard = inner.cache.write().unwrap();
+            if guard.is_none() {
+                let max_blocks = (max_bytes / crate::MemKvStore::DEFAULT_BLOCK_SIZE).max(1);
+                let estimated_blocks = table_blocks_hint.clamp(1, max_blocks);
+                *guard = Some(BlockCache::with_weighter(
+                    estimated_blocks,
+                    max_bytes as u64,
+                    BlockDataWeighter,
+                ));
+            }
+            guard
+                .as_ref()
+                .unwrap()
+                .get_or_insert_with(&(table_id, block_idx), || Ok::<_, LoroError>(decode()))
+                .expect("validated SSTable block cache insert should succeed")
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static NEXT_SPILL_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// A spilled table's blocks were checksummed when the table was built or
+/// imported; the file can still be changed or corrupted on disk afterwards.
+/// Reads re-verify each block and fail fast rather than return wrong data
+/// (`context/memory-budget.md`, "Spill IO errors").
+#[cfg(not(target_arch = "wasm32"))]
+const SPILLED_BLOCK_CORRUPT: &str =
+    "spilled SSTable block failed its checksum: the spill file was modified or the disk is corrupt";
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spilled_block_checksum_ok(raw_block_and_check: &[u8]) -> bool {
+    let Some(body_len) = raw_block_and_check.len().checked_sub(SIZE_OF_U32) else {
+        return false;
+    };
+    let expected = u32::from_le_bytes(raw_block_and_check[body_len..].try_into().unwrap());
+    expected == xxhash_rust::xxh32::xxh32(&raw_block_and_check[..body_len], XXH_SEED)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct SpillFile {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    len: usize,
+    #[cfg(not(unix))]
+    io_lock: std::sync::Mutex<()>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SpillFile {
+    fn create_and_write(dir: &std::path::Path, bytes: &[u8]) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let pid = std::process::id();
+        loop {
+            let seq = NEXT_SPILL_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("loro-kv-{pid}-{seq}.sst"));
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(mut file) => {
+                    if let Err(err) = (|| -> std::io::Result<()> {
+                        use std::io::Write;
+                        file.write_all(bytes)?;
+                        file.flush()
+                    })() {
+                        drop(file);
+                        let _ = std::fs::remove_file(&path);
+                        return Err(err);
+                    }
+                    return Ok(Self {
+                        file,
+                        path,
+                        len: bytes.len(),
+                        #[cfg(not(unix))]
+                        io_lock: std::sync::Mutex::new(()),
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn read_slice(&self, offset: usize, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(&mut buf, offset as u64)?;
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let _guard = self.io_lock.lock().unwrap();
+            (&self.file).seek(SeekFrom::Start(offset as u64))?;
+            (&self.file).read_exact(&mut buf)?;
+        }
+        Ok(buf)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for SpillFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SsTableBacking {
+    Memory(Bytes),
+    #[cfg(not(target_arch = "wasm32"))]
+    File(Arc<SpillFile>),
 }
 
 #[derive(Debug)]
 pub struct SsTable {
-    // TODO: mmap?
-    data: Bytes,
+    id: u64,
+    backing: SsTableBacking,
     pub(crate) first_key: Bytes,
     pub(crate) last_key: Bytes,
-    meta: Vec<BlockMeta>,
-    meta_offset: usize,
-    block_cache: BlockCache,
+    pub(crate) meta: Arc<[BlockMeta]>,
+    meta_bytes: usize,
+    pub(crate) meta_offset: usize,
+    block_cache: SharedBlockCache,
 }
 
 impl Clone for SsTable {
     fn clone(&self) -> Self {
         Self {
-            data: self.data.clone(),
+            id: self.id,
+            backing: self.backing.clone(),
             first_key: self.first_key.clone(),
             last_key: self.last_key.clone(),
             meta: self.meta.clone(),
+            meta_bytes: self.meta_bytes,
             meta_offset: self.meta_offset,
-            block_cache: new_block_cache(self.meta.len()),
+            block_cache: SharedBlockCache::new(self.block_cache.max_bytes()),
         }
     }
 }
 
 impl SsTable {
     pub fn export_all(&self) -> Bytes {
-        self.data.clone()
+        match &self.backing {
+            SsTableBacking::Memory(data) => data.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(file) => {
+                let bytes = Bytes::from(
+                    file.read_slice(0, file.len)
+                        .expect("spilled SSTable file should be readable"),
+                );
+                Self::check_block_checksum(&self.meta, &bytes, self.meta_offset)
+                    .expect(SPILLED_BLOCK_CORRUPT);
+                bytes
+            }
+        }
+    }
+
+    pub fn set_block_cache(&mut self, block_cache: SharedBlockCache) {
+        self.block_cache = block_cache;
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let backing_bytes = match &self.backing {
+            SsTableBacking::Memory(data) => data.len(),
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(_) => std::mem::size_of::<SpillFile>(),
+        };
+        backing_bytes + self.meta_bytes + std::mem::size_of::<Self>()
+    }
+
+    pub fn spilled_disk_bytes(&self) -> usize {
+        match &self.backing {
+            SsTableBacking::Memory(_) => 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(file) => file.len,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn spill_to_dir(&mut self, dir: &std::path::Path) -> std::io::Result<()> {
+        let SsTableBacking::Memory(data) = &self.backing else {
+            return Ok(());
+        };
+        if data.is_empty() {
+            return Ok(());
+        }
+        let file = Arc::new(SpillFile::create_and_write(dir, data)?);
+        self.backing = SsTableBacking::File(file);
+        Ok(())
     }
 
     pub fn iter(&self) -> SsTableIter<'_> {
@@ -385,7 +768,21 @@ impl SsTable {
     ///    - "Invalid magic number"
     ///    - "Invalid schema version"
     pub fn import_all(bytes: Bytes, validate_blocks: bool) -> LoroResult<Self> {
-        Self::import_all_with(bytes, validate_blocks, true)
+        Self::import_all_with(
+            bytes,
+            validate_blocks,
+            true,
+            SharedBlockCache::default_per_doc(),
+        )
+    }
+
+    pub(crate) fn import_all_with_cache(
+        bytes: Bytes,
+        validate_blocks: bool,
+        check_checksum: bool,
+        block_cache: SharedBlockCache,
+    ) -> LoroResult<Self> {
+        Self::import_all_with(bytes, validate_blocks, check_checksum, block_cache)
     }
 
     /// Import without per-block checksum verification (and without eager block
@@ -396,13 +793,14 @@ impl SsTable {
     /// checksum alone is insufficient because it can be recomputed over malformed
     /// inner blocks.
     pub fn import_all_unchecked(bytes: Bytes) -> LoroResult<Self> {
-        Self::import_all_with(bytes, false, false)
+        Self::import_all_with(bytes, false, false, SharedBlockCache::default_per_doc())
     }
 
     fn import_all_with(
         bytes: Bytes,
         validate_blocks: bool,
         check_checksum: bool,
+        block_cache: SharedBlockCache,
     ) -> LoroResult<Self> {
         // magic number + schema version + meta offset
         if bytes.len() < SIZE_OF_U32 + SIZE_OF_U8 + SIZE_OF_U32 {
@@ -429,7 +827,7 @@ impl SsTable {
         if meta_offset >= data_len - SIZE_OF_U32 {
             return Err(LoroError::DecodeError("Invalid bytes".into()));
         }
-        let raw_meta = &bytes[meta_offset..data_len - SIZE_OF_U32];
+        let raw_meta = bytes.slice(meta_offset..data_len - SIZE_OF_U32);
         let meta = BlockMeta::decode_meta(raw_meta)?;
         Self::validate_block_ranges(&meta, meta_offset)?;
         if validate_blocks {
@@ -450,12 +848,14 @@ impl SsTable {
                     .unwrap_or(meta.last().map(|m| m.first_key.clone()).unwrap_or_default())
             })
             .unwrap_or_default();
-        let block_cache = new_block_cache(meta.len());
+        let meta_bytes = calc_meta_bytes(&meta);
         let ans = Self {
-            data: bytes,
+            id: next_table_id(),
+            backing: SsTableBacking::Memory(bytes),
             first_key,
             last_key,
             meta,
+            meta_bytes,
             meta_offset,
             block_cache,
         };
@@ -556,13 +956,42 @@ impl SsTable {
             .min(self.meta.len() - 1)
     }
 
-    fn read_block(&self, block_idx: usize) -> Arc<Block> {
+    pub(crate) fn with_raw_block<R>(&self, block_idx: usize, f: impl FnOnce(&[u8]) -> R) -> R {
         let offset = self.meta[block_idx].offset;
         let offset_end = self
             .meta
             .get(block_idx + 1)
             .map_or(self.meta_offset, |m| m.offset);
-        let raw_block_and_check = self.data.slice(offset..offset_end);
+        match &self.backing {
+            SsTableBacking::Memory(data) => f(&data[offset..offset_end]),
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(file) => {
+                let raw = file
+                    .read_slice(offset, offset_end - offset)
+                    .expect("spilled SSTable block should be readable");
+                assert!(spilled_block_checksum_ok(&raw), "{SPILLED_BLOCK_CORRUPT}");
+                f(&raw)
+            }
+        }
+    }
+
+    pub(crate) fn read_block(&self, block_idx: usize) -> Arc<Block> {
+        let offset = self.meta[block_idx].offset;
+        let offset_end = self
+            .meta
+            .get(block_idx + 1)
+            .map_or(self.meta_offset, |m| m.offset);
+        let raw_block_and_check = match &self.backing {
+            SsTableBacking::Memory(data) => data.slice(offset..offset_end),
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(file) => {
+                let raw = file
+                    .read_slice(offset, offset_end - offset)
+                    .expect("spilled SSTable block should be readable");
+                assert!(spilled_block_checksum_ok(&raw), "{SPILLED_BLOCK_CORRUPT}");
+                Bytes::from(raw)
+            }
+        };
         Arc::new(Block::decode(
             raw_block_and_check,
             self.meta[block_idx].is_large,
@@ -573,10 +1002,9 @@ impl SsTable {
 
     pub(crate) fn read_block_cached(&self, block_idx: usize) -> Arc<Block> {
         self.block_cache
-            .get_or_insert_with(&block_idx, || {
-                Ok::<_, LoroError>(self.read_block(block_idx))
+            .get_or_insert_with(self.id, block_idx, self.meta.len(), || {
+                self.read_block(block_idx)
             })
-            .expect("validated SSTable block cache insert should succeed")
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {
@@ -607,16 +1035,15 @@ impl SsTable {
     }
 
     pub fn data_size(&self) -> usize {
-        self.data.len()
+        match &self.backing {
+            SsTableBacking::Memory(data) => data.len(),
+            #[cfg(not(target_arch = "wasm32"))]
+            SsTableBacking::File(file) => file.len,
+        }
     }
 
     pub fn meta_len(&self) -> usize {
         self.meta.len()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn cached_block_bytes(&self) -> u64 {
-        self.block_cache.weight()
     }
 }
 
@@ -1022,6 +1449,35 @@ mod test {
 
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn imported_metadata_does_not_retain_input_buffer() {
+        struct OwnedBytes(Vec<u8>, Arc<std::sync::atomic::AtomicBool>);
+        impl AsRef<[u8]> for OwnedBytes {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl Drop for OwnedBytes {
+            fn drop(&mut self) {
+                self.1.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut builder = SsTableBuilder::new(4096, CompressionType::None, false);
+        builder.add(Bytes::from_static(b"a"), Bytes::from_static(b"value"));
+        builder.add(Bytes::from_static(b"z"), Bytes::from_static(b"value"));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = Bytes::from_owner(OwnedBytes(
+            builder.build().export_all().to_vec(),
+            dropped.clone(),
+        ));
+        let table = SsTable::import_all(bytes, false).unwrap();
+        let metadata = table.meta.clone();
+        drop(table);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(metadata[0].first_key.as_ref(), b"a");
+        assert_eq!(metadata[0].last_key.as_deref(), Some(b"z".as_slice()));
+    }
 
     fn malformed_sstable_bytes(block_bytes: &[u8], meta: &[BlockMeta]) -> Bytes {
         let mut bytes = Vec::new();

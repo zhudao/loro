@@ -6,7 +6,9 @@
 // #![warn(missing_docs)]
 
 mod container_tree;
+mod to_json;
 
+use bytes::Bytes;
 use convert::{
     import_batch_detail_to_js_value, import_blob_metadata_to_js, import_status_to_js_value,
     js_diff_to_inner_diff, js_json_schema_to_loro_json_schema, js_to_id_span, js_to_version_vector,
@@ -21,6 +23,7 @@ use loro_internal::{
     diff::diff_impl::UpdateTimeoutError,
     encoding::ImportBlobMetadata,
     event::Index,
+    global_memory_budget, global_memory_stats,
     handler::{
         Handler, ListHandler, MapHandler, TextDelta, TextHandler, TreeHandler, UpdateOptions,
         ValueOrHandler,
@@ -28,6 +31,8 @@ use loro_internal::{
     id::{Counter, PeerID, TreeID, ID},
     loro::{CommitOptions, ExportMode},
     loro_common::{check_root_container_name, IdSpanVector},
+    memory::{DocMemoryStats, GlobalMemoryBudget, GlobalMemoryStats, MemoryBudget},
+    reclaim_global_memory, set_global_memory_budget, try_reclaim_global_to_budget,
     undo::{DiffBatch, UndoItemMeta, UndoOrRedo},
     version::{Frontiers, VersionRange},
     ContainerType, DiffEvent, FxHashMap, HandlerTrait, IdLp, IdSpan, LoroDoc as LoroDocInner,
@@ -101,6 +106,7 @@ fn run() {
 }
 
 fn init_panic_hook() {
+    loro_internal::memory::enable_global_heap_tracker();
     // Clear the slot only when it is absent: if another loro-crdt instance in
     // this realm already trapped and recorded a panic, keep that first record.
     let global = js_sys::global();
@@ -176,18 +182,20 @@ struct ReportingAlloc;
 
 unsafe impl GlobalAlloc for ReportingAlloc {
     // `#[inline(always)]` lets the wrapper collapse into the rustc-generated
-    // `__rust_alloc`/`__rust_dealloc` shims, leaving only the null check.
+    // `__rust_alloc`/`__rust_dealloc` shims, leaving only null check + relaxed counter update.
     #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if ptr.is_null() {
             report_oom_and_trap(layout.size());
         }
+        loro_internal::memory::record_global_alloc(layout.size());
         ptr
     }
 
     #[inline(always)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        loro_internal::memory::record_global_dealloc(layout.size());
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -200,6 +208,7 @@ unsafe impl GlobalAlloc for ReportingAlloc {
         if new_ptr.is_null() {
             report_oom_and_trap(new_size);
         }
+        loro_internal::memory::record_global_realloc(layout.size(), new_size);
         new_ptr
     }
 
@@ -209,6 +218,7 @@ unsafe impl GlobalAlloc for ReportingAlloc {
         if ptr.is_null() {
             report_oom_and_trap(layout.size());
         }
+        loro_internal::memory::record_global_alloc(layout.size());
         ptr
     }
 }
@@ -434,6 +444,10 @@ extern "C" {
     pub type JsContainerPath;
     #[wasm_bindgen(typescript_type = "(text: string) => boolean")]
     pub type JsTextIterCallback;
+    #[wasm_bindgen(typescript_type = "string")]
+    pub type JsStrArg;
+    #[wasm_bindgen(typescript_type = "Uint8Array")]
+    pub type JsUint8Array;
     #[wasm_bindgen(typescript_type = "Uint8Array[]")]
     pub type JsBinaryArray;
     #[wasm_bindgen(typescript_type = "Record<string, Value>")]
@@ -452,6 +466,14 @@ extern "C" {
     pub type JsDiffBatch;
     #[wasm_bindgen(typescript_type = "ApplyDiffOptions")]
     pub type JsApplyDiffOptions;
+    #[wasm_bindgen(typescript_type = "MemoryBudget")]
+    pub type JsMemoryBudget;
+    #[wasm_bindgen(typescript_type = "DocMemoryStats")]
+    pub type JsDocMemoryStats;
+    #[wasm_bindgen(typescript_type = "GlobalMemoryBudget")]
+    pub type JsGlobalMemoryBudget;
+    #[wasm_bindgen(typescript_type = "GlobalMemoryStats")]
+    pub type JsGlobalMemoryStats;
 }
 
 mod observer {
@@ -531,9 +553,68 @@ fn update_error_to_js(err: UpdateTimeoutError) -> JsValue {
     }
 }
 
-fn js_binary_array_to_vec(data: JsBinaryArray) -> JsResult<Vec<Vec<u8>>> {
-    let data: Array = data.dyn_into()?;
-    Ok(data.iter().map(|x| Uint8Array::new(&x).to_vec()).collect())
+const STREAMING_BATCH_BYTES_THRESHOLD: usize = 256 * 1024;
+
+fn js_str_to_string_checked(arg: JsStrArg) -> JsResult<String> {
+    let val: JsValue = arg.into();
+    if loro_internal::loro::has_global_wasm_linear_limit() {
+        if !val.is_string() {
+            return Err(JsError::new("Expected a string").into());
+        }
+        let js_str: &js_sys::JsString = wasm_bindgen::JsCast::unchecked_ref(&val);
+        let code_units = js_str.length() as u64;
+        if code_units >= 64 * 1024 {
+            loro_internal::loro::preflight_wasm_linear_alloc(code_units.saturating_mul(3))?;
+        }
+    }
+    val.as_string()
+        .ok_or_else(|| JsError::new("Expected a string").into())
+}
+
+fn js_u8_byte_len(val: &JsValue) -> usize {
+    if let Some(u8_arr) = val.dyn_ref::<Uint8Array>() {
+        return u8_arr.byte_length() as usize;
+    }
+    if let Some(buf) = val.dyn_ref::<js_sys::ArrayBuffer>() {
+        return buf.byte_length() as usize;
+    }
+    Uint8Array::new(val).byte_length() as usize
+}
+
+fn js_u8_to_bytes_checked(
+    doc: &LoroDocInner,
+    val: &JsValue,
+) -> Result<Bytes, loro_internal::LoroError> {
+    if let Some(u8_arr) = val.dyn_ref::<Uint8Array>() {
+        let len = u8_arr.byte_length() as usize;
+        doc.preflight_external_import_alloc(len)?;
+        return Ok(Bytes::from(u8_arr.to_vec()));
+    }
+    let u8_arr = Uint8Array::new(val);
+    let len = u8_arr.byte_length() as usize;
+    doc.preflight_external_import_alloc(len)?;
+    Ok(Bytes::from(u8_arr.to_vec()))
+}
+
+fn js_binary_array_info(data: JsBinaryArray) -> JsResult<(Array, usize, usize)> {
+    let array: Array = data.dyn_into()?;
+    let len = array.length() as usize;
+    let mut total_bytes = 0usize;
+    for i in 0..len {
+        let item = array.get(i as u32);
+        let u8_len = js_u8_byte_len(&item);
+        total_bytes = total_bytes.saturating_add(u8_len);
+    }
+    Ok((array, len, total_bytes))
+}
+
+fn js_binary_array_to_bytes_checked(doc: &LoroDocInner, array: &Array) -> JsResult<Vec<Bytes>> {
+    let len = array.length();
+    let mut out = Vec::with_capacity(len as usize);
+    for i in 0..len {
+        out.push(js_u8_to_bytes_checked(doc, &array.get(i))?);
+    }
+    Ok(out)
 }
 
 fn ids_to_frontiers(ids: Vec<JsID>) -> JsResult<Frontiers> {
@@ -579,6 +660,205 @@ fn js_to_idlp(id: JsIdLp) -> JsResult<IdLp> {
 fn peer_id_to_js(peer: PeerID) -> JsStrPeerID {
     let v: JsValue = peer.to_string().into();
     v.into()
+}
+
+fn read_optional_budget_usize(obj: &JsValue, key: &str) -> JsResult<Option<usize>> {
+    let val = Reflect::get(obj, &JsValue::from_str(key))?;
+    if val.is_undefined() || val.is_null() {
+        return Ok(None);
+    }
+    let Some(num) = val.as_f64() else {
+        return Err(JsError::new(&format!("MemoryBudget.{key} must be a number")).into());
+    };
+    if !num.is_finite() || num < 0.0 || num.fract() != 0.0 || num > usize::MAX as f64 {
+        return Err(JsError::new(&format!(
+            "MemoryBudget.{key} must be a non-negative integer"
+        ))
+        .into());
+    }
+    Ok(Some(num as usize))
+}
+
+fn js_to_memory_budget(js: JsMemoryBudget) -> JsResult<MemoryBudget> {
+    let obj: JsValue = js.into();
+    if !obj.is_object() || obj.is_null() {
+        return Err(JsError::new("MemoryBudget must be an object").into());
+    }
+    Ok(MemoryBudget {
+        max_doc_bytes: read_optional_budget_usize(&obj, "maxDocBytes")?,
+        high_watermark_bytes: read_optional_budget_usize(&obj, "highWatermarkBytes")?,
+        target_watermark_bytes: read_optional_budget_usize(&obj, "targetWatermarkBytes")?,
+        max_import_blob_bytes: read_optional_budget_usize(&obj, "maxImportBlobBytes")?,
+        max_pending_bytes: read_optional_budget_usize(&obj, "maxPendingBytes")?,
+        max_kv_block_cache_bytes: read_optional_budget_usize(&obj, "maxKvBlockCacheBytes")?,
+        max_decoded_value_cache_bytes: read_optional_budget_usize(
+            &obj,
+            "maxDecodedValueCacheBytes",
+        )?,
+        max_undo_bytes: read_optional_budget_usize(&obj, "maxUndoBytes")?,
+        spill_dir: None,
+    })
+}
+
+fn memory_budget_to_js(budget: &MemoryBudget) -> JsResult<JsValue> {
+    let obj = Object::new();
+    let fields: [(&str, Option<usize>); 8] = [
+        ("maxDocBytes", budget.max_doc_bytes),
+        ("highWatermarkBytes", budget.high_watermark_bytes),
+        ("targetWatermarkBytes", budget.target_watermark_bytes),
+        ("maxImportBlobBytes", budget.max_import_blob_bytes),
+        ("maxPendingBytes", budget.max_pending_bytes),
+        ("maxKvBlockCacheBytes", budget.max_kv_block_cache_bytes),
+        (
+            "maxDecodedValueCacheBytes",
+            budget.max_decoded_value_cache_bytes,
+        ),
+        ("maxUndoBytes", budget.max_undo_bytes),
+    ];
+    for (key, value) in fields {
+        if let Some(v) = value {
+            Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_f64(v as f64))?;
+        }
+    }
+    Ok(obj.into())
+}
+
+fn doc_memory_stats_to_js(stats: &DocMemoryStats) -> JsResult<JsValue> {
+    let obj = Object::new();
+    let fields: [(&str, usize); 14] = [
+        ("totalBytes", stats.total_bytes),
+        ("stateBytes", stats.state_bytes),
+        ("valueCacheBytes", stats.value_cache_bytes),
+        ("kvBytes", stats.kv_bytes),
+        ("blockCacheBytes", stats.block_cache_bytes),
+        ("changeCacheBytes", stats.change_cache_bytes),
+        ("dagBytes", stats.dag_bytes),
+        ("arenaBytes", stats.arena_bytes),
+        ("pendingBytes", stats.pending_bytes),
+        ("historyCacheBytes", stats.history_cache_bytes),
+        ("diffCalcBytes", stats.diff_calc_bytes),
+        ("undoBytes", stats.undo_bytes),
+        ("uncommittedTxnBytes", stats.uncommitted_txn_bytes),
+        ("spilledDiskBytes", stats.spilled_disk_bytes),
+    ];
+    for (key, value) in fields {
+        Reflect::set(
+            &obj,
+            &JsValue::from_str(key),
+            &JsValue::from_f64(value as f64),
+        )?;
+    }
+    Ok(obj.into())
+}
+
+const MAX_SAFE_JS_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+fn parse_non_negative_safe_u64(val: &JsValue, label: &str) -> JsResult<u64> {
+    let Some(num) = val.as_f64() else {
+        return Err(JsError::new(&format!("{label} must be a number")).into());
+    };
+    if !num.is_finite() || num < 0.0 || num.fract() != 0.0 || num > MAX_SAFE_JS_INTEGER {
+        return Err(JsError::new(&format!("{label} must be a non-negative integer")).into());
+    }
+    Ok(num as u64)
+}
+
+fn read_optional_global_budget_u64(obj: &JsValue, key: &str) -> JsResult<Option<u64>> {
+    let val = Reflect::get(obj, &JsValue::from_str(key))?;
+    if val.is_undefined() || val.is_null() {
+        return Ok(None);
+    }
+    parse_non_negative_safe_u64(&val, &format!("GlobalMemoryBudget.{key}")).map(Some)
+}
+
+fn read_optional_global_budget_usize(obj: &JsValue, key: &str) -> JsResult<Option<usize>> {
+    let val = Reflect::get(obj, &JsValue::from_str(key))?;
+    if val.is_undefined() || val.is_null() {
+        return Ok(None);
+    }
+    let Some(num) = val.as_f64() else {
+        return Err(JsError::new(&format!("GlobalMemoryBudget.{key} must be a number")).into());
+    };
+    if !num.is_finite() || num < 0.0 || num.fract() != 0.0 || num > usize::MAX as f64 {
+        return Err(JsError::new(&format!(
+            "GlobalMemoryBudget.{key} must be a non-negative integer"
+        ))
+        .into());
+    }
+    Ok(Some(num as usize))
+}
+
+fn js_to_global_memory_budget(js: JsGlobalMemoryBudget) -> JsResult<GlobalMemoryBudget> {
+    let obj: JsValue = js.into();
+    if !obj.is_object() || obj.is_null() {
+        return Err(JsError::new("GlobalMemoryBudget must be an object").into());
+    }
+    Ok(GlobalMemoryBudget {
+        max_heap_bytes: read_optional_global_budget_u64(&obj, "maxHeapBytes")?,
+        max_wasm_linear_bytes: read_optional_global_budget_u64(&obj, "maxWasmLinearBytes")?,
+        high_watermark_bytes: read_optional_global_budget_u64(&obj, "highWatermarkBytes")?,
+        target_watermark_bytes: read_optional_global_budget_u64(&obj, "targetWatermarkBytes")?,
+        max_import_blob_bytes: read_optional_global_budget_usize(&obj, "maxImportBlobBytes")?,
+        max_kv_block_cache_bytes: read_optional_global_budget_usize(&obj, "maxKvBlockCacheBytes")?,
+    })
+}
+
+fn global_memory_budget_to_js(budget: &GlobalMemoryBudget) -> JsResult<JsValue> {
+    let obj = Object::new();
+    let u64_fields: [(&str, Option<u64>); 4] = [
+        ("maxHeapBytes", budget.max_heap_bytes),
+        ("maxWasmLinearBytes", budget.max_wasm_linear_bytes),
+        ("highWatermarkBytes", budget.high_watermark_bytes),
+        ("targetWatermarkBytes", budget.target_watermark_bytes),
+    ];
+    for (key, value) in u64_fields {
+        if let Some(v) = value {
+            Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_f64(v as f64))?;
+        }
+    }
+    let usize_fields: [(&str, Option<usize>); 2] = [
+        ("maxImportBlobBytes", budget.max_import_blob_bytes),
+        ("maxKvBlockCacheBytes", budget.max_kv_block_cache_bytes),
+    ];
+    for (key, value) in usize_fields {
+        if let Some(v) = value {
+            Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_f64(v as f64))?;
+        }
+    }
+    Ok(obj.into())
+}
+
+fn global_memory_stats_to_js(stats: &GlobalMemoryStats) -> JsResult<JsValue> {
+    let obj = Object::new();
+    let fields: [(&str, f64); 7] = [
+        ("liveDocCount", stats.live_doc_count as f64),
+        ("docsEstimatedBytes", stats.docs_estimated_bytes as f64),
+        (
+            "globalBlockCacheBytes",
+            stats.global_block_cache_bytes as f64,
+        ),
+        ("allocatedHeapBytes", stats.allocated_heap_bytes as f64),
+        (
+            "peakAllocatedHeapBytes",
+            stats.peak_allocated_heap_bytes as f64,
+        ),
+        (
+            "wasmLinearMemoryBytes",
+            stats.wasm_linear_memory_bytes as f64,
+        ),
+        ("spilledDiskBytes", stats.spilled_disk_bytes as f64),
+    ];
+    for (key, value) in fields {
+        Reflect::set(&obj, &JsValue::from_str(key), &JsValue::from_f64(value))?;
+    }
+    // Pages never shrink: once past `maxWasmLinearBytes` they stay past it,
+    // while `tryCommit` and `tryReclaimGlobalToBudget` may still succeed.
+    Reflect::set(
+        &obj,
+        &JsValue::from_str("wasmLinearMemoryExceeded"),
+        &JsValue::from_bool(loro_internal::wasm_linear_memory_exceeded()),
+    )?;
+    Ok(obj.into())
 }
 
 fn js_id_to_id(id: JsID) -> Result<ID, JsValue> {
@@ -910,8 +1190,8 @@ impl LoroDoc {
     /// ```
     ///
     #[wasm_bindgen(js_name = "fromSnapshot")]
-    pub fn from_snapshot(snapshot: &[u8]) -> JsResult<LoroDoc> {
-        let doc = LoroDocInner::from_snapshot(snapshot)?;
+    pub fn from_snapshot(snapshot: Vec<u8>) -> JsResult<LoroDoc> {
+        let doc = LoroDocInner::from_snapshot_bytes(Bytes::from(snapshot))?;
         doc.start_auto_commit();
         Ok(Self {
             doc,
@@ -994,7 +1274,8 @@ impl LoroDoc {
         self.doc.detach()
     }
 
-    /// Duplicate the document with a different PeerID
+    /// Duplicate the document with a different PeerID.
+    /// The fork inherits an independent copy of the document memory budget.
     ///
     /// The time complexity and space complexity of this operation are both O(n),
     ///
@@ -1269,6 +1550,22 @@ impl LoroDoc {
             self.doc.commit_with(options);
         } else {
             self.doc.commit_with(CommitOptions::default());
+        }
+        Ok(())
+    }
+
+    /// Commit the pending auto-commit transaction, enforcing `MemoryBudget.maxDocBytes`.
+    ///
+    /// If committing would exceed `maxDocBytes` after cache and cold-state reclamation,
+    /// uncommitted operations since the budget was armed are rolled back atomically without
+    /// firing subscribers and a `MemoryLimitExceededError` is thrown.
+    #[wasm_bindgen(js_name = "tryCommit")]
+    pub fn try_commit(&self, options: Option<JsCommitOption>) -> JsResult<()> {
+        if let Some(options) = options {
+            let options = js_commit_option_to_commit_options(options)?;
+            self.doc.try_commit_with(options)?;
+        } else {
+            self.doc.try_commit()?;
         }
         Ok(())
     }
@@ -1893,6 +2190,10 @@ impl LoroDoc {
     /// only supports backward compatibility but not forward compatibility.
     #[wasm_bindgen(js_name = "importJsonUpdates")]
     pub fn import_json_updates(&self, json: JsJsonSchemaOrString) -> JsResult<JsImportStatus> {
+        let js_val: &JsValue = json.as_ref();
+        if let Some(s) = js_val.as_string() {
+            self.doc.check_import_blob_limit(s.len())?;
+        }
         let json_schema = js_json_schema_to_loro_json_schema(json)?;
         let status = self.doc.import_json_updates(json_schema)?;
         Ok(import_status_to_js_value(status)?.into())
@@ -1920,8 +2221,9 @@ impl LoroDoc {
     /// // or import updates
     /// doc2.import(updates);
     /// ```
-    pub fn import(&self, update_or_snapshot: &[u8]) -> JsResult<JsImportStatus> {
-        let status = self.doc.import(update_or_snapshot)?;
+    pub fn import(&self, update_or_snapshot: JsUint8Array) -> JsResult<JsImportStatus> {
+        let bytes = js_u8_to_bytes_checked(&self.doc, &update_or_snapshot.into())?;
+        let status = self.doc.import_bytes(bytes)?;
         Ok(import_status_to_js_value(status)?.into())
     }
 
@@ -1976,8 +2278,23 @@ impl LoroDoc {
     /// ```
     #[wasm_bindgen(js_name = "importBatch")]
     pub fn import_batch(&self, data: JsBinaryArray) -> JsResult<JsImportStatus> {
-        let data = js_binary_array_to_vec(data)?;
-        let status = self.doc.import_batch(&data)?;
+        let (array, len, total_bytes) = js_binary_array_info(data)?;
+        let status = if len > 1 && total_bytes > STREAMING_BATCH_BYTES_THRESHOLD {
+            let mut blobs = Vec::with_capacity(len);
+            for i in 0..len {
+                let item = array.get(i as u32);
+                let bytes = js_u8_to_bytes_checked(&self.doc, &item)?;
+                let meta = LoroDocInner::decode_import_blob_meta_bytes(bytes, false)?;
+                let arr = &array;
+                blobs.push((meta, move || {
+                    js_u8_to_bytes_checked(&self.doc, &arr.get(i as u32))
+                }));
+            }
+            self.doc.import_batch_with_loaders(blobs, false)?
+        } else {
+            let blobs = js_binary_array_to_bytes_checked(&self.doc, &array)?;
+            self.doc.import_batch_bytes(blobs)?
+        };
         Ok(import_status_to_js_value(status)?.into())
     }
 
@@ -2029,9 +2346,87 @@ impl LoroDoc {
     /// ```
     #[wasm_bindgen(js_name = "importBatchDetailed")]
     pub fn import_batch_detailed(&self, data: JsBinaryArray) -> JsResult<JsImportBatchDetail> {
-        let data = js_binary_array_to_vec(data)?;
-        let detail = self.doc.import_batch_detailed(&data)?;
+        let (array, len, total_bytes) = js_binary_array_info(data)?;
+        let detail = if len == 0 {
+            self.doc.import_batch_detailed_bytes(Vec::new())?
+        } else if len > 1 && total_bytes > STREAMING_BATCH_BYTES_THRESHOLD {
+            let mut blobs = Vec::with_capacity(len);
+            for i in 0..len {
+                let item = array.get(i as u32);
+                let meta = js_u8_to_bytes_checked(&self.doc, &item)
+                    .and_then(|bytes| LoroDocInner::decode_import_blob_meta_bytes(bytes, false));
+                let arr = &array;
+                blobs.push((meta, move || {
+                    js_u8_to_bytes_checked(&self.doc, &arr.get(i as u32))
+                }));
+            }
+            self.doc.import_batch_detailed_with_loaders(blobs, false)?
+        } else {
+            // Retain at most the small-batch threshold (or one blob), and share
+            // each allocation between metadata and import. Failed admissions
+            // stay per-blob errors rather than failing the whole batch.
+            let blobs: Vec<_> = (0..len)
+                .map(|i| js_u8_to_bytes_checked(&self.doc, &array.get(i as u32)))
+                .collect();
+            self.doc
+                .import_batch_detailed_with_blob_results(blobs, false)?
+        };
         Ok(import_batch_detail_to_js_value(detail)?.into())
+    }
+
+    /// Free the cached history index built for fast time-travel / checkout.
+    #[wasm_bindgen(js_name = "freeHistoryCache")]
+    pub fn free_history_cache(&self) {
+        self.doc.free_history_cache();
+    }
+
+    /// Free cached diff calculator state kept across checkouts and edits.
+    #[wasm_bindgen(js_name = "freeDiffCalculator")]
+    pub fn free_diff_calculator(&self) {
+        self.doc.free_diff_calculator();
+    }
+
+    /// Encode uncompacted changes into the KV change store and drop parsed ops from memory.
+    ///
+    /// Commits the current auto-commit transaction if active.
+    #[wasm_bindgen(js_name = "compactChangeStore")]
+    pub fn compact_change_store(&self) {
+        self.doc.compact_change_store();
+    }
+
+    /// Configure memory watermarks, cache caps, and hard quotas for this document.
+    #[wasm_bindgen(js_name = "setMemoryBudget")]
+    pub fn set_memory_budget(&self, budget: JsMemoryBudget) -> JsResult<()> {
+        let budget = js_to_memory_budget(budget)?;
+        self.doc.set_memory_budget(budget);
+        Ok(())
+    }
+
+    /// Get a snapshot of this document's current `MemoryBudget` configuration.
+    #[wasm_bindgen(js_name = "getMemoryBudget")]
+    pub fn get_memory_budget(&self) -> JsResult<JsMemoryBudget> {
+        let budget = self.doc.memory_budget();
+        Ok(memory_budget_to_js(&budget)?.into())
+    }
+
+    /// Get estimated RAM and spilled byte usage across this document's subsystems.
+    #[wasm_bindgen(js_name = "memoryStats")]
+    pub fn memory_stats(&self) -> JsResult<JsDocMemoryStats> {
+        let stats = self.doc.memory_stats();
+        Ok(doc_memory_stats_to_js(&stats)?.into())
+    }
+
+    /// Aggressively reclaim caches and demote cold container states, returning estimated freed bytes.
+    #[wasm_bindgen(js_name = "reclaimMemory")]
+    pub fn reclaim_memory(&self) -> f64 {
+        self.doc.reclaim_memory() as f64
+    }
+
+    /// Reclaim memory and throw `MemoryLimitExceededError` if usage still exceeds `maxDocBytes`.
+    #[wasm_bindgen(js_name = "tryReclaimToBudget")]
+    pub fn try_reclaim_to_budget(&self) -> JsResult<JsDocMemoryStats> {
+        let stats = self.doc.try_reclaim_to_budget()?;
+        Ok(doc_memory_stats_to_js(&stats)?.into())
     }
 
     /// Get the shallow json format of the document state.
@@ -2086,8 +2481,7 @@ impl LoroDoc {
     /// ```
     #[wasm_bindgen(js_name = "toJSON")]
     pub fn to_json(&self) -> JsResult<JsValue> {
-        let json = self.doc.get_deep_value();
-        Ok(json.into())
+        to_json::doc_to_json_js_value(&self.doc)
     }
 
     /// Subscribe to the changes of the loro document. The function will be called when the
@@ -3045,7 +3439,8 @@ impl LoroText {
     /// ```
     ///
     #[wasm_bindgen(skip_typescript)]
-    pub fn update(&self, text: &str, options: JsValue) -> JsResult<()> {
+    pub fn update(&self, text: JsStrArg, options: JsValue) -> JsResult<()> {
+        let text = js_str_to_string_checked(text)?;
         let options = if options.is_null() || options.is_undefined() {
             UpdateOptions {
                 timeout_ms: None,
@@ -3067,7 +3462,7 @@ impl LoroText {
             }
         };
         self.handler
-            .update(text, options)
+            .update(&text, options)
             .map_err(update_error_to_js)
     }
 
@@ -3075,7 +3470,8 @@ impl LoroText {
     ///
     /// It uses Myers' diff algorithm to compute the optimal difference.
     #[wasm_bindgen(js_name = "updateByLine", skip_typescript)]
-    pub fn update_by_line(&self, text: &str, options: JsValue) -> JsResult<()> {
+    pub fn update_by_line(&self, text: JsStrArg, options: JsValue) -> JsResult<()> {
+        let text = js_str_to_string_checked(text)?;
         let options = if options.is_null() || options.is_undefined() {
             UpdateOptions {
                 timeout_ms: None,
@@ -3097,7 +3493,7 @@ impl LoroText {
             }
         };
         self.handler
-            .update_by_line(text, options)
+            .update_by_line(&text, options)
             .map_err(update_error_to_js)
     }
 
@@ -3111,8 +3507,9 @@ impl LoroText {
     /// const text = doc.getText("text");
     /// text.insert(0, "Hello");
     /// ```
-    pub fn insert(&mut self, index: usize, content: &str) -> JsResult<()> {
-        self.handler.insert(index, content, PosType::Utf16)?;
+    pub fn insert(&mut self, index: usize, content: JsStrArg) -> JsResult<()> {
+        let content = js_str_to_string_checked(content)?;
+        self.handler.insert(index, &content, PosType::Utf16)?;
         Ok(())
     }
 
@@ -3164,8 +3561,9 @@ impl LoroText {
     /// text.insert(0, "Hello");
     /// text.splice(2, 3, "llo"); // "llo"
     /// ```
-    pub fn splice(&mut self, pos: usize, len: usize, s: &str) -> JsResult<String> {
-        match self.handler.splice(pos, len, s, PosType::Utf16) {
+    pub fn splice(&mut self, pos: usize, len: usize, s: JsStrArg) -> JsResult<String> {
+        let s = js_str_to_string_checked(s)?;
+        match self.handler.splice(pos, len, &s, PosType::Utf16) {
             Ok(x) => Ok(x),
             Err(x) => Err(x.into()),
         }
@@ -3182,8 +3580,9 @@ impl LoroText {
     /// text.insertUtf8(0, "Hello");
     /// ```
     #[wasm_bindgen(js_name = "insertUtf8")]
-    pub fn insert_utf8(&mut self, index: usize, content: &str) -> JsResult<()> {
-        self.handler.insert_utf8(index, content)?;
+    pub fn insert_utf8(&mut self, index: usize, content: JsStrArg) -> JsResult<()> {
+        let content = js_str_to_string_checked(content)?;
+        self.handler.insert_utf8(index, &content)?;
         Ok(())
     }
 
@@ -5930,10 +6329,18 @@ impl UndoManager {
                 .unwrap_or_default();
         let on_push = Reflect::get(&config, &JsValue::from_str("onPush")).ok();
         let on_pop = Reflect::get(&config, &JsValue::from_str("onPop")).ok();
+        let max_undo_bytes = Reflect::get(&config, &JsValue::from_str("maxUndoBytes"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .filter(|&n| n.is_finite() && n >= 0.0)
+            .map(|n| n as usize);
 
         let undo = InnerUndoManager::new(&doc.doc);
 
         undo.set_max_undo_steps(max_undo_steps);
+        if let Some(max_bytes) = max_undo_bytes {
+            undo.set_max_undo_bytes(max_bytes);
+        }
         undo.set_merge_interval(merge_interval);
         for prefix in exclude_origin_prefixes {
             undo.add_exclude_origin_prefix(&prefix);
@@ -6033,6 +6440,22 @@ impl UndoManager {
     /// If the number of undo steps exceeds this number, the oldest undo step will be removed.
     pub fn setMaxUndoSteps(&mut self, steps: usize) {
         self.undo.lock().set_max_undo_steps(steps);
+    }
+
+    /// Set the maximum retained bytes across the undo/redo stacks.
+    #[wasm_bindgen(js_name = "setMaxUndoBytes")]
+    pub fn set_max_undo_bytes(&mut self, max_bytes: f64) -> JsResult<()> {
+        if !max_bytes.is_finite() || max_bytes < 0.0 || max_bytes.fract() != 0.0 {
+            return Err(JsError::new("maxUndoBytes must be a non-negative integer").into());
+        }
+        self.undo.lock().set_max_undo_bytes(max_bytes as usize);
+        Ok(())
+    }
+
+    /// Get the current estimated RAM usage in bytes of the undo/redo stacks.
+    #[wasm_bindgen(js_name = "usedBytes")]
+    pub fn used_bytes(&self) -> f64 {
+        self.undo.lock().used_bytes() as f64
     }
 
     /// Set the merge interval (in ms).
@@ -6433,6 +6856,58 @@ impl Container {
             Container::Counter(c) => Handler::Counter(c.handler.clone()),
         }
     }
+}
+
+/// Configure the WASM-instance-wide global memory budget across all live `LoroDoc`s.
+#[wasm_bindgen(js_name = "setGlobalMemoryBudget")]
+pub fn wasm_set_global_memory_budget(budget: JsGlobalMemoryBudget) -> JsResult<()> {
+    loro_internal::memory::enable_global_heap_tracker();
+    let budget = js_to_global_memory_budget(budget)?;
+    set_global_memory_budget(budget);
+    Ok(())
+}
+
+/// Get a snapshot of the active global memory budget configuration.
+#[wasm_bindgen(js_name = "getGlobalMemoryBudget")]
+pub fn wasm_get_global_memory_budget() -> JsResult<JsGlobalMemoryBudget> {
+    let budget = global_memory_budget();
+    Ok(global_memory_budget_to_js(&budget)?.into())
+}
+
+/// Get global memory statistics across all live `LoroDoc`s, live WASM heap allocations,
+/// and committed WebAssembly linear memory (`wasmLinearMemoryBytes`).
+#[wasm_bindgen(js_name = "globalMemoryStats")]
+pub fn wasm_global_memory_stats() -> JsResult<JsGlobalMemoryStats> {
+    loro_internal::memory::enable_global_heap_tracker();
+    let stats = global_memory_stats();
+    Ok(global_memory_stats_to_js(&stats)?.into())
+}
+
+/// Trigger cross-document cache eviction and cold-state demotion across idle `LoroDoc`s,
+/// optionally down to `targetBytes`, returning the estimated reclaimed bytes.
+#[wasm_bindgen(js_name = "reclaimGlobalMemory")]
+pub fn wasm_reclaim_global_memory(target_bytes: Option<f64>) -> JsResult<f64> {
+    loro_internal::memory::enable_global_heap_tracker();
+    let target = match target_bytes {
+        Some(num) => {
+            if !num.is_finite() || num < 0.0 || num.fract() != 0.0 || num > MAX_SAFE_JS_INTEGER {
+                return Err(JsError::new("targetBytes must be a non-negative integer").into());
+            }
+            Some(num as u64)
+        }
+        None => None,
+    };
+    Ok(reclaim_global_memory(target) as f64)
+}
+
+/// Aggressively reclaim global memory across all idle documents and throw
+/// `MemoryLimitExceededError` (`kind: "GlobalBudget"`) if usage still exceeds the configured
+/// global hard ceiling.
+#[wasm_bindgen(js_name = "tryReclaimGlobalToBudget")]
+pub fn wasm_try_reclaim_global_to_budget() -> JsResult<JsGlobalMemoryStats> {
+    loro_internal::memory::enable_global_heap_tracker();
+    let stats = try_reclaim_global_to_budget()?;
+    Ok(global_memory_stats_to_js(&stats)?.into())
 }
 
 /// Decode the metadata of the import blob.
@@ -7031,9 +7506,70 @@ export type VersionVectorDiff = {
 export type UndoConfig = {
     mergeInterval?: number,
     maxUndoSteps?: number,
+    maxUndoBytes?: number,
     excludeOriginPrefixes?: string[],
     onPush?: (isUndo: boolean, counterRange: { start: number, end: number }, event?: LoroEventBatch) => { value: Value, cursors: Cursor[] },
     onPop?: (isUndo: boolean, value: { value: Value, cursors: Cursor[] }, counterRange: { start: number, end: number }) => void
+};
+
+export type MemoryLimitKind =
+    | "ImportBlob"
+    | "PendingPool"
+    | "DocBudget"
+    | "GlobalBudget";
+
+export type MemoryBudget = {
+    maxDocBytes?: number;
+    highWatermarkBytes?: number;
+    targetWatermarkBytes?: number;
+    maxImportBlobBytes?: number;
+    maxPendingBytes?: number;
+    maxKvBlockCacheBytes?: number;
+    maxDecodedValueCacheBytes?: number;
+    maxUndoBytes?: number;
+};
+
+export type GlobalMemoryBudget = {
+    maxHeapBytes?: number;
+    maxWasmLinearBytes?: number;
+    highWatermarkBytes?: number;
+    targetWatermarkBytes?: number;
+    maxImportBlobBytes?: number;
+    maxKvBlockCacheBytes?: number;
+};
+
+export type GlobalMemoryStats = {
+    liveDocCount: number;
+    docsEstimatedBytes: number;
+    globalBlockCacheBytes: number;
+    allocatedHeapBytes: number;
+    peakAllocatedHeapBytes: number;
+    wasmLinearMemoryBytes: number;
+    spilledDiskBytes: number;
+    /**
+     * Whether the WebAssembly linear memory has grown past `maxWasmLinearBytes`.
+     * Pages never shrink, so this stays true for the instance's lifetime even
+     * when `tryCommit` and `tryReclaimGlobalToBudget` succeed again (live heap at
+     * or below 70% of the ceiling). Recreate the instance to get the pages back.
+     */
+    wasmLinearMemoryExceeded: boolean;
+};
+
+export type DocMemoryStats = {
+    totalBytes: number;
+    stateBytes: number;
+    valueCacheBytes: number;
+    kvBytes: number;
+    blockCacheBytes: number;
+    changeCacheBytes: number;
+    dagBytes: number;
+    arenaBytes: number;
+    pendingBytes: number;
+    historyCacheBytes: number;
+    diffCalcBytes: number;
+    undoBytes: number;
+    uncommittedTxnBytes: number;
+    spilledDiskBytes: number;
 };
 export type Container = LoroList | LoroMap | LoroText | LoroTree | LoroMovableList | LoroCounter;
 

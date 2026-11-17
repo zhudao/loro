@@ -1,5 +1,11 @@
 use crate::encoding::json_schema::{encode_change, export_json_in_id_span};
 pub use crate::encoding::ExportMode;
+use crate::kv_store::SharedBlockCache;
+use crate::memory::{
+    heap_tracker_active, tracked_allocated_heap_bytes, tracked_peak_allocated_heap_bytes,
+    wasm_linear_memory_bytes, DocMemoryStats, GlobalMemoryBudget, GlobalMemoryStats, MemoryBudget,
+    DEFAULT_GLOBAL_BLOCK_CACHE_BYTES,
+};
 use crate::pre_commit::{FirstCommitFromPeerCallback, FirstCommitFromPeerPayload};
 pub use crate::state::analyzer::{ContainerAnalysisInfo, DocAnalysis};
 use crate::sync::{AtomicBool, AtomicUsize};
@@ -20,8 +26,9 @@ use crate::{
         export_fast_updates_in_range, export_shallow_snapshot, export_snapshot_at,
         export_state_only_snapshot,
         json_schema::{encode_change_to_json, json::JsonSchema},
-        parse_header_and_body, EncodeMode, ImportBatchDetail, ImportBlobMetadata,
-        ImportBlobOutcome, ImportStatus, ParsedHeaderAndBody,
+        parse_header_and_body, parse_header_and_body_bytes, EncodeMode, ImportBatchDetail,
+        ImportBlobMetadata, ImportBlobOutcome, ImportStatus, ParsedHeaderAndBody,
+        ParsedHeaderAndBodyBytes,
     },
     event::{str_to_path, EventTriggerKind, Index, InternalDocDiff},
     handler::{Handler, MovableListHandler, TextHandler, TreeHandler, ValueOrHandler},
@@ -45,6 +52,11 @@ use crate::{
 };
 use bytes::Bytes;
 use either::Either;
+
+type CommitResult<'a> = (
+    Option<CommitOptions>,
+    Option<LoroMutexGuard<'a, Option<Transaction>>>,
+);
 
 #[cfg(test)]
 thread_local! {
@@ -76,7 +88,7 @@ fn after_apply_diff_handler() -> LoroResult<()> {
 }
 use loro_common::{
     ContainerID, ContainerType, HasCounterSpan, HasIdSpan, HasLamportSpan, IdSpan, LoroEncodeError,
-    LoroResult, LoroValue, ID,
+    LoroResult, LoroValue, MemoryLimitKind, ID,
 };
 use rle::HasLength;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -86,7 +98,7 @@ use std::{
     collections::{hash_map::Entry, BinaryHeap},
     ops::ControlFlow,
     sync::{
-        atomic::Ordering::{Acquire, Release},
+        atomic::Ordering::{AcqRel, Acquire, Relaxed, Release},
         Arc,
     },
 };
@@ -173,13 +185,33 @@ impl LoroDoc {
 
     pub fn new() -> Self {
         let visible_op_count = Arc::new(AtomicUsize::new(0));
-        let oplog = OpLog::new(visible_op_count.clone());
+        let kv_block_cache = SharedBlockCache::default_per_doc();
+        let global_flags = global_budget_flags();
+        if global_flags != 0 {
+            kv_block_cache.set_parent(Some(&global_pool().global_block_cache));
+        }
+        #[cfg(not(loom))]
+        let pool_doc_id = NEXT_POOL_DOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(loom)]
+        let pool_doc_id = if global_flags != 0 {
+            NEXT_POOL_DOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        };
+        let initial_tick = GLOBAL_ACCESS_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let oplog = OpLog::new_with_cache(visible_op_count.clone(), kv_block_cache.clone());
         let arena = oplog.arena.clone();
         let config: Configure = oplog.configure.clone();
         let lock_group = LoroLockGroup::new();
         let global_txn = Arc::new(lock_group.new_lock(None, LockKind::Txn));
         let inner = Arc::new_cyclic(|w| {
-            let state = DocState::new_arc(w.clone(), arena.clone(), config.clone(), &lock_group);
+            let state = DocState::new_arc_with_cache(
+                w.clone(),
+                arena.clone(),
+                config.clone(),
+                &lock_group,
+                kv_block_cache.clone(),
+            );
             LoroDocInner {
                 oplog: Arc::new(lock_group.new_lock(oplog, LockKind::OpLog)),
                 state,
@@ -197,9 +229,32 @@ impl LoroDoc {
                 peer_id_change_subs: SubscriberSetWithQueue::new(),
                 pre_commit_subs: SubscriberSetWithQueue::new(),
                 first_commit_from_peer_subs: SubscriberSetWithQueue::new(),
+                undo_managers: crate::sync::Mutex::new(Vec::new()),
+                memory_budget: crate::sync::Mutex::new(MemoryBudget::default()),
+                budget_flags: std::sync::atomic::AtomicU8::new(0),
+                kv_block_cache,
+                pool_doc_id,
+                cached_doc_bytes: std::sync::atomic::AtomicUsize::new(0),
+                cached_spilled_bytes: std::sync::atomic::AtomicUsize::new(0),
+                stats_dirty: Arc::new(DocStatsDirty::new(pool_doc_id)),
+                soft_backoff: SoftBackoff::new(),
+                last_access_tick: std::sync::atomic::AtomicU64::new(initial_tick),
+                drop_gate: Default::default(),
             }
         });
-        LoroDoc { inner }
+        if pool_doc_id != 0 {
+            global_pool().register(pool_doc_id, Arc::downgrade(&inner), inner.drop_gate.clone());
+            // After registering: a mark pushes the id, and the refresh of a pushed id
+            // must find the document in the registry.
+            let dirty = &inner.stats_dirty;
+            inner.txn.set_stats_dirty(dirty.clone());
+            inner.oplog.set_stats_dirty(dirty.clone());
+            inner.state.set_stats_dirty(dirty.clone());
+            inner.diff_calculator.set_stats_dirty(dirty.clone());
+            inner.arena.set_stats_dirty(dirty.clone());
+            // `register` queued it (it starts dirty); the next estimate computes it.
+        }
+        LoroDoc::from_inner(inner)
     }
 
     pub fn fork(&self) -> Self {
@@ -213,6 +268,7 @@ impl LoroDoc {
             .with_barrier(|| encoding::fast_snapshot::encode_snapshot_inner_for_fork(self))
             .expect("forking a valid document should encode a snapshot");
         let doc = Self::new();
+        doc.set_memory_budget(self.memory_budget());
         doc.with_barrier(|| {
             encoding::fast_snapshot::decode_snapshot_inner(snapshot, &doc, Default::default())
         })
@@ -376,16 +432,11 @@ impl LoroDoc {
     /// A pre-commit callback that panics does not stop the commit; its panic is
     /// raised after the txn lock is released, so the lock is not poisoned.
     #[instrument(skip_all)]
-    fn commit_internal(
-        &self,
-        config: CommitOptions,
-        preserve_on_empty: bool,
-    ) -> (
-        Option<CommitOptions>,
-        Option<LoroMutexGuard<'_, Option<Transaction>>>,
-    ) {
+    fn commit_internal(&self, config: CommitOptions, preserve_on_empty: bool) -> CommitResult<'_> {
         let mut panic = DeferredPanic::default();
-        let ans = self.commit_internal_inner(config, preserve_on_empty, &mut panic);
+        let ans = self
+            .commit_internal_inner(config, preserve_on_empty, &mut panic, false)
+            .expect("infallible commit does not enforce hard admission");
         if !panic.has_panic() {
             return ans;
         }
@@ -399,26 +450,29 @@ impl LoroDoc {
         config: CommitOptions,
         preserve_on_empty: bool,
         panic: &mut DeferredPanic,
-    ) -> (
-        Option<CommitOptions>,
-        Option<LoroMutexGuard<'_, Option<Transaction>>>,
-    ) {
+        enforce_budget: bool,
+    ) -> LoroResult<CommitResult<'_>> {
         if !self.auto_commit.load(Acquire) {
             let txn_guard = self.txn.lock();
             // if not auto_commit, nothing should happen
             // because the global txn is not used
-            return (None, Some(txn_guard));
+            return Ok((None, Some(txn_guard)));
         }
 
         loop {
             if let Some(txn_guard) = self.before_commit() {
-                return (None, Some(txn_guard));
+                return Ok((None, Some(txn_guard)));
             }
 
             let mut txn_guard = self.txn.lock();
+            if enforce_budget {
+                if let Some(txn) = txn_guard.as_mut() {
+                    self.admit_transaction_commit(txn)?;
+                }
+            }
             let txn = txn_guard.take();
             let Some(mut txn) = txn else {
-                return (None, Some(txn_guard));
+                return Ok((None, Some(txn_guard)));
             };
             let on_commit = txn.take_on_commit();
             if let Some(origin) = config.origin.clone() {
@@ -460,14 +514,14 @@ impl LoroDoc {
                 }
             }
 
-            return (
+            return Ok((
                 options,
                 if !config.immediate_renew {
                     Some(txn_guard)
                 } else {
                     None
                 },
-            );
+            ));
         }
     }
 
@@ -476,14 +530,70 @@ impl LoroDoc {
     /// This is used by user-facing explicit commits. If the transaction is empty,
     /// any provided commit options are swallowed and will NOT carry over.
     #[instrument(skip_all)]
-    pub fn commit_with(
-        &self,
-        config: CommitOptions,
-    ) -> (
-        Option<CommitOptions>,
-        Option<LoroMutexGuard<'_, Option<Transaction>>>,
-    ) {
+    pub fn commit_with(&self, config: CommitOptions) -> CommitResult<'_> {
         self.commit_internal(config, false)
+    }
+
+    /// Commits the current pending auto-commit transaction, enforcing any
+    /// configured [`MemoryBudget::max_doc_bytes`] hard limit atomically.
+    ///
+    /// If committing would exceed `max_doc_bytes` even after soft and cold-state
+    /// reclamation, pending uncommitted operations since the budget was armed
+    /// are rolled back atomically without firing commit or diff subscribers and
+    /// `Err(LoroError::MemoryLimitExceeded)` is returned.
+    pub fn try_commit(&self) -> LoroResult<()> {
+        self.try_commit_with(CommitOptions::default())
+    }
+
+    /// Commits the pending auto-commit transaction with options, enforcing any
+    /// configured [`MemoryBudget::max_doc_bytes`] or global hard memory limit atomically.
+    pub fn try_commit_with(&self, options: CommitOptions) -> LoroResult<()> {
+        if self.txn.is_held_by_current_thread() {
+            return Err(LoroError::DuplicatedTransactionError);
+        }
+        self.touch_access_tick();
+        let mut panic = DeferredPanic::default();
+        let result = self
+            .commit_internal_inner(options, false, &mut panic, true)
+            .map(|_| ());
+        // Mapping drops any transaction guard before resuming user panics.
+        panic.resume();
+        result
+    }
+
+    fn admit_transaction_commit(&self, txn: &mut Transaction) -> LoroResult<()> {
+        if txn.is_empty() {
+            return Ok(());
+        }
+        if txn.doc_budget_limit.is_none()
+            && !(global_budget_flags() & BUDGET_FLAG_MAX_DOC != 0
+                && txn.budget_base_scope().is_some())
+        {
+            return Ok(());
+        }
+        if txn.has_rollback_scope() {
+            return Err(LoroError::DuplicatedTransactionError);
+        }
+        let uncommitted = txn.estimated_uncommitted_bytes();
+        self.enforce_memory_watermarks_with_txn_bytes(uncommitted, false);
+        if let Err(err) = self.check_transaction_budget(txn, Some(txn.budget_scope_linear_bytes()))
+        {
+            let scope = txn
+                .budget_base_scope()
+                .expect("budgeted transaction has a base scope");
+            assert!(
+                txn.rollback_scope_is_intact(scope),
+                "budget rollback scope must be intact"
+            );
+            self.rollback_transaction_scope_inner(txn, scope)?;
+            self.refresh_cached_doc_bytes_unlocked();
+            txn.doc_budget_limit = None;
+            if self.has_max_doc_bytes() {
+                self.arm_budget_scope_on_txn(txn);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Set the commit message of the next commit
@@ -706,6 +816,15 @@ impl LoroDoc {
         self.import_with(bytes, Default::default())
     }
 
+    /// Like [`Self::import`], taking owned ref-counted [`bytes::Bytes`] to avoid
+    /// copying the input buffer during decoding.
+    #[inline(always)]
+    pub fn import_bytes(&self, bytes: bytes::Bytes) -> Result<ImportStatus, LoroError> {
+        let s = debug_span!("import_bytes", peer = self.peer_id());
+        let _e = s.enter();
+        self.import_with_bytes(bytes, Default::default())
+    }
+
     #[inline]
     pub fn import_with(
         &self,
@@ -713,6 +832,17 @@ impl LoroDoc {
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
         self.import_with_history_mode(bytes, origin, false)
+    }
+
+    /// Like [`Self::import_with`], taking owned ref-counted [`bytes::Bytes`] to avoid
+    /// copying the input buffer during decoding.
+    #[inline]
+    pub fn import_with_bytes(
+        &self,
+        bytes: bytes::Bytes,
+        origin: InternalString,
+    ) -> Result<ImportStatus, LoroError> {
+        self.import_with_history_mode_bytes(bytes, origin, false)
     }
 
     /// Import binary bytes. `json_lossy` accepts only the equivalences a JSON hop
@@ -723,98 +853,203 @@ impl LoroDoc {
         origin: InternalString,
         json_lossy: bool,
     ) -> Result<ImportStatus, LoroError> {
+        self.import_input_with_history_mode(ImportInput::Slice(bytes), origin, json_lossy)
+    }
+
+    /// Like [`Self::import_with_history_mode`], taking owned ref-counted [`bytes::Bytes`].
+    pub fn import_with_history_mode_bytes(
+        &self,
+        bytes: bytes::Bytes,
+        origin: InternalString,
+        json_lossy: bool,
+    ) -> Result<ImportStatus, LoroError> {
+        self.import_input_with_history_mode(ImportInput::Bytes(bytes), origin, json_lossy)
+    }
+
+    fn import_input_with_history_mode(
+        &self,
+        input: ImportInput<'_>,
+        origin: InternalString,
+        json_lossy: bool,
+    ) -> Result<ImportStatus, LoroError> {
         self.check_import_not_nested()?;
-        let values = if json_lossy {
-            ImportedValues::JsonLossy
-        } else {
-            ImportedValues::Exact
-        };
-        self.with_barrier(|| self._import_with(bytes, origin, values))
+        let values = imported_values_for_mode(json_lossy);
+        self.with_barrier(|| self._import_with_input(input, origin, values))
     }
 
     #[tracing::instrument(skip_all)]
-    fn _import_with(
+    fn _import_with_input(
         &self,
-        bytes: &[u8],
+        input: ImportInput<'_>,
         origin: InternalString,
         values: ImportedValues,
     ) -> Result<ImportStatus, LoroError> {
-        let result = self.import_without_emitting(bytes, origin, values);
+        let result = self.import_without_emitting_input(input, origin, values);
+        // The import rollback scope has closed, so history compaction is now
+        // safe even for budgets that configure only soft watermarks.
+        self.enforce_memory_watermarks_with_txn_bytes(0, false);
         self.emit_events();
         result
     }
 
-    fn import_without_emitting(
+    fn import_without_emitting_input(
         &self,
-        bytes: &[u8],
+        input: ImportInput<'_>,
         origin: InternalString,
         values: ImportedValues,
     ) -> Result<ImportStatus, LoroError> {
         ensure_cov::notify_cov("loro_internal::import");
-        let parsed = parse_header_and_body(bytes, true)?;
-        loro_common::info!("Importing with mode={:?}", &parsed.mode);
-        match parsed.mode {
-            EncodeMode::OutdatedRle => {
-                let s = tracing::span!(
-                    tracing::Level::INFO,
-                    "Import updates ",
-                    peer = self.peer_id()
-                );
-                let _e = s.enter();
-                self.update_oplog_and_apply_delta_to_state_if_needed(
-                    |oplog| oplog.decode(parsed, values),
-                    origin,
-                )
-            }
-            EncodeMode::OutdatedSnapshot => {
-                if self.can_reset_with_snapshot() {
-                    loro_common::info!("Init by snapshot {}", self.peer_id());
-                    decode_snapshot(self, parsed.mode, parsed.body, origin)
-                } else {
-                    self.update_oplog_and_apply_delta_to_state_if_needed(
-                        |oplog| oplog.decode(parsed, values),
-                        origin,
-                    )
+        self.touch_access_tick();
+        match &input {
+            ImportInput::Slice(bytes) => self.check_import_blob_limit(bytes.len())?,
+            ImportInput::Bytes(bytes) => self.check_import_blob_limit(bytes.len())?,
+        }
+        match input {
+            ImportInput::Slice(bytes) => {
+                let parsed = parse_header_and_body(bytes, true)?;
+                loro_common::info!("Importing with mode={:?}", &parsed.mode);
+                match parsed.mode {
+                    EncodeMode::OutdatedRle => {
+                        let s = tracing::span!(
+                            tracing::Level::INFO,
+                            "Import updates ",
+                            peer = self.peer_id()
+                        );
+                        let _e = s.enter();
+                        self.update_oplog_and_apply_delta_to_state_if_needed(
+                            |oplog| oplog.decode(parsed, values),
+                            origin,
+                        )
+                    }
+                    EncodeMode::OutdatedSnapshot => {
+                        if self.can_reset_with_snapshot() {
+                            loro_common::info!("Init by snapshot {}", self.peer_id());
+                            decode_snapshot(self, parsed.mode, parsed.body, origin)
+                        } else {
+                            self.update_oplog_and_apply_delta_to_state_if_needed(
+                                |oplog| oplog.decode(parsed, values),
+                                origin,
+                            )
+                        }
+                    }
+                    EncodeMode::FastSnapshot => {
+                        if self.can_reset_with_snapshot() {
+                            ensure_cov::notify_cov("loro_internal::import::snapshot");
+                            loro_common::info!("Init by fast snapshot {}", self.peer_id());
+                            self.init_snapshot_preserving_pending(
+                                parsed.mode,
+                                parsed.body,
+                                origin,
+                                values,
+                            )
+                        } else {
+                            self.import_changes_and_apply_delta_to_state_if_needed(
+                                |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
+                                values,
+                                origin,
+                            )
+                        }
+                    }
+                    EncodeMode::FastUpdates => self
+                        .import_changes_and_apply_delta_to_state_if_needed(
+                            |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
+                            values,
+                            origin,
+                        ),
+                    EncodeMode::Auto => unreachable!(),
                 }
             }
-            EncodeMode::FastSnapshot => {
-                if self.can_reset_with_snapshot() {
-                    ensure_cov::notify_cov("loro_internal::import::snapshot");
-                    loro_common::info!("Init by fast snapshot {}", self.peer_id());
-                    self.init_snapshot_preserving_pending(parsed.mode, parsed.body, origin, values)
-                } else {
-                    self.import_changes_and_apply_delta_to_state_if_needed(
-                        |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
-                        values,
-                        origin,
-                    )
-
-                    // let new_doc = LoroDoc::new();
-                    // new_doc.import(bytes)?;
-                    // let updates = new_doc.export(ExportMode::updates(&self.oplog_vv())).unwrap();
-                    // return self.import_with(updates.as_slice(), origin);
+            ImportInput::Bytes(bytes) => {
+                let parsed = parse_header_and_body_bytes(bytes, true)?;
+                loro_common::info!("Importing with mode={:?}", &parsed.mode);
+                match parsed.mode {
+                    EncodeMode::OutdatedRle => {
+                        let s = tracing::span!(
+                            tracing::Level::INFO,
+                            "Import updates ",
+                            peer = self.peer_id()
+                        );
+                        let _e = s.enter();
+                        let borrowed = parsed_as_borrowed(&parsed);
+                        self.update_oplog_and_apply_delta_to_state_if_needed(
+                            |oplog| oplog.decode(borrowed, values),
+                            origin,
+                        )
+                    }
+                    EncodeMode::OutdatedSnapshot => {
+                        if self.can_reset_with_snapshot() {
+                            loro_common::info!("Init by snapshot {}", self.peer_id());
+                            decode_snapshot_bytes(self, parsed.mode, parsed.body, origin)
+                        } else {
+                            let borrowed = parsed_as_borrowed(&parsed);
+                            self.update_oplog_and_apply_delta_to_state_if_needed(
+                                |oplog| oplog.decode(borrowed, values),
+                                origin,
+                            )
+                        }
+                    }
+                    EncodeMode::FastSnapshot => {
+                        if self.can_reset_with_snapshot() {
+                            ensure_cov::notify_cov("loro_internal::import::snapshot");
+                            loro_common::info!("Init by fast snapshot {}", self.peer_id());
+                            self.init_snapshot_preserving_pending_bytes(
+                                parsed.mode,
+                                parsed.body,
+                                origin,
+                                values,
+                            )
+                        } else {
+                            self.import_changes_and_apply_delta_to_state_if_needed(
+                                |oplog| encoding::decode_oplog_changes_bytes(oplog, parsed, values),
+                                values,
+                                origin,
+                            )
+                        }
+                    }
+                    EncodeMode::FastUpdates => self
+                        .import_changes_and_apply_delta_to_state_if_needed(
+                            |oplog| encoding::decode_oplog_changes_bytes(oplog, parsed, values),
+                            values,
+                            origin,
+                        ),
+                    EncodeMode::Auto => unreachable!(),
                 }
-            }
-            EncodeMode::FastUpdates => self.import_changes_and_apply_delta_to_state_if_needed(
-                |oplog| encoding::decode_oplog_changes(oplog, parsed, values),
-                values,
-                origin,
-            ),
-            EncodeMode::Auto => {
-                unreachable!()
             }
         }
     }
 
-    /// Bootstrap state and history together, then replay parked changes against
-    /// that exact snapshot version. On error restore the original parking claims
-    /// as well as empty handles; no queued snapshot event may escape.
     fn init_snapshot_preserving_pending(
         &self,
         mode: EncodeMode,
         body: &[u8],
         origin: InternalString,
         values: ImportedValues,
+    ) -> LoroResult<ImportStatus> {
+        self.init_snapshot_preserving_pending_with(origin, values, |doc, origin| {
+            decode_snapshot(doc, mode, body, origin)
+        })
+    }
+
+    fn init_snapshot_preserving_pending_bytes(
+        &self,
+        mode: EncodeMode,
+        body: bytes::Bytes,
+        origin: InternalString,
+        values: ImportedValues,
+    ) -> LoroResult<ImportStatus> {
+        self.init_snapshot_preserving_pending_with(origin, values, |doc, origin| {
+            decode_snapshot_bytes(doc, mode, body, origin)
+        })
+    }
+
+    /// Bootstrap state and history together, then replay parked changes against
+    /// that exact snapshot version. On error restore the original parking claims
+    /// as well as empty handles; no queued snapshot event may escape.
+    fn init_snapshot_preserving_pending_with(
+        &self,
+        origin: InternalString,
+        values: ImportedValues,
+        decode_fn: impl FnOnce(&Self, InternalString) -> LoroResult<ImportStatus>,
     ) -> LoroResult<ImportStatus> {
         let (checkpoint, empty_containers, pending) = {
             let mut oplog = self.oplog.lock();
@@ -826,8 +1061,9 @@ impl LoroDoc {
             )
         };
         let was_detached = self.is_detached();
+        let linear_before = wasm_linear_memory_bytes();
         let result = (|| {
-            let mut status = decode_snapshot(self, mode, body, origin.clone())?;
+            let mut status = decode_fn(self, origin.clone())?;
             // A replay-only shallow snapshot's decoder temporarily attaches to
             // its retained head. The batch still owns the final checkout.
             self.set_detached(was_detached);
@@ -842,6 +1078,10 @@ impl LoroDoc {
                 status.success = VersionRange::from_vv(oplog.vv());
                 status.pending = non_empty(oplog.pending_changes.version_range());
             }
+            if !self.oplog.lock().batch_importing && self.has_max_doc_bytes() {
+                self.enforce_memory_watermarks_with_txn_bytes(0, false);
+                self.check_doc_budget_with_txn_bytes_and_linear(0, Some(linear_before))?;
+            }
             Ok(status)
         })();
         self.set_detached(was_detached);
@@ -854,9 +1094,16 @@ impl LoroDoc {
             for id in empty_containers {
                 state.ensure_container(&id);
             }
+            oplog.set_block_cache(self.kv_block_cache.clone());
+            state.set_block_cache(self.kv_block_cache.clone());
             drop(state);
             drop(oplog);
             *self.diff_calculator.lock() = DiffCalculator::new(true);
+            if global_budget_flags() != 0 {
+                self.refresh_cached_doc_bytes_unlocked();
+            }
+        } else if global_budget_flags() != 0 && !self.oplog.lock().batch_importing {
+            self.refresh_cached_doc_bytes_unlocked();
         }
         result
     }
@@ -898,6 +1145,7 @@ impl LoroDoc {
         // scope rolls the whole batch back if its final reattach fails, and commits
         // everything otherwise.
         let owns_rollback = !oplog.has_import_rollback();
+        let linear_before = wasm_linear_memory_bytes();
         if owns_rollback {
             oplog.begin_import_rollback();
         }
@@ -923,17 +1171,42 @@ impl LoroDoc {
                     }
                 };
                 let mut state = self.state.lock();
-                if let Err(e) = state.apply_diff(
+                // A quota may reject the import after the state changed; record
+                // how to undo it (see `state/undo_log.rs`).
+                let quota = owns_rollback && self.has_max_doc_bytes();
+                if quota {
+                    state.begin_import_undo();
+                }
+                let applied = state.apply_diff(
                     InternalDocDiff {
                         origin,
                         diff: (diff).into(),
                         by: EventTriggerKind::Import,
                         new_version: Cow::Owned(oplog.frontiers().clone()),
+                        local_inverse: None,
                     },
                     diff_mode,
-                ) {
+                );
+                let undo = state.take_import_undo();
+                if let Err(e) = applied {
                     oplog.rollback_owned_import(owns_rollback, &mut state);
                     return Err(e);
+                }
+                if let Some(undo) = undo {
+                    self.enforce_watermarks_locked(&oplog, &mut state, 0, false);
+                    if let Err(budget_err) = self.check_doc_budget_locked_with_linear(
+                        &oplog,
+                        &state,
+                        0,
+                        Some(linear_before),
+                    ) {
+                        state.undo_import(undo, old_frontiers.clone());
+                        oplog.rollback_owned_import(owns_rollback, &mut state);
+                        *self.diff_calculator.lock() = DiffCalculator::new(true);
+                        return Err(budget_err);
+                    }
+                } else if global_budget_flags() != 0 {
+                    let _ = self.memory_stats_locked(&oplog, &state, 0);
                 }
             }
             match result {
@@ -976,6 +1249,7 @@ impl LoroDoc {
         values: ImportedValues,
         origin: InternalString,
     ) -> Result<ImportStatus, LoroError> {
+        let linear_before = wasm_linear_memory_bytes();
         let mut oplog = self.oplog.lock();
         Self::check_not_in_txn(&self.state)?;
         oplog.check_history_parsable()?;
@@ -1008,8 +1282,10 @@ impl LoroDoc {
         if detached {
             // An enclosing `import_batch` scope validates the whole batch before it
             // reattaches (`BatchImportGuard::finish`).
-            let owns_rollback =
-                preflight.needs_state_apply_rollback && !oplog.has_import_rollback();
+            let owns_rollback = !oplog.has_import_rollback()
+                && (preflight.needs_state_apply_rollback
+                    || oplog.has_max_pending_bytes()
+                    || self.has_max_doc_bytes());
             if owns_rollback {
                 oplog.begin_import_rollback_with_arena(arena_checkpoint);
             }
@@ -1026,6 +1302,23 @@ impl LoroDoc {
                 if let Err(e) = oplog.validate_op_refs_in_import_scope() {
                     oplog.rollback_import(&mut self.state.lock());
                     return Err(e);
+                }
+                if self.has_max_doc_bytes() {
+                    let mut state = self.state.lock();
+                    self.enforce_watermarks_locked(&oplog, &mut state, 0, false);
+                    if let Err(e) = self.check_doc_budget_locked_with_linear(
+                        &oplog,
+                        &state,
+                        0,
+                        Some(linear_before),
+                    ) {
+                        oplog.rollback_import(&mut state);
+                        let _ = self.memory_stats_locked(&oplog, &state, 0);
+                        return Err(e);
+                    }
+                } else if global_budget_flags() != 0 {
+                    let state = self.state.lock();
+                    let _ = self.memory_stats_locked(&oplog, &state, 0);
                 }
                 oplog.commit_import_rollback();
             }
@@ -1045,27 +1338,66 @@ impl LoroDoc {
                         return Err(err);
                     }
                 };
+            let owns_rollback = !oplog.has_import_rollback()
+                && (oplog.has_max_pending_bytes() || self.has_max_doc_bytes());
+            let fallback_arena = if owns_rollback {
+                oplog.begin_import_rollback_with_arena(arena_checkpoint);
+                None
+            } else if !oplog.has_import_rollback() {
+                Some(arena_checkpoint)
+            } else {
+                None
+            };
             let result = match encoding::apply_decoded_changes_to_oplog(&mut oplog, changes) {
                 Ok(result) => result,
                 Err(err) => {
-                    if !oplog.has_import_rollback() {
-                        oplog.rollback_arena(arena_checkpoint, &mut self.state.lock());
+                    if owns_rollback {
+                        oplog.rollback_import(&mut self.state.lock());
+                    } else if let Some(arena_cp) = fallback_arena {
+                        oplog.rollback_arena(arena_cp, &mut self.state.lock());
                     }
                     return Err(err);
                 }
             };
             if result.has_deps_before_shallow_root {
+                if owns_rollback {
+                    oplog.commit_import_rollback();
+                }
                 // Preflight rejected this import's own obsolete changes. Only
                 // pre-existing pending changes were dropped here; newly parked
                 // changes still reference this import's arena allocations.
                 return Err(LoroError::ImportUpdatesThatDependsOnOutdatedVersion);
             }
 
-            if !pending_root_containers.is_empty() {
+            if !pending_root_containers.is_empty() || (owns_rollback && self.has_max_doc_bytes()) {
                 let mut state = self.state.lock();
+                if owns_rollback && self.has_max_doc_bytes() {
+                    state.store.begin_created_journal();
+                }
                 for id in pending_root_containers {
                     state.ensure_container(&id);
                 }
+                if owns_rollback && self.has_max_doc_bytes() {
+                    self.enforce_watermarks_locked(&oplog, &mut state, 0, false);
+                    if let Err(e) = self.check_doc_budget_locked_with_linear(
+                        &oplog,
+                        &state,
+                        0,
+                        Some(linear_before),
+                    ) {
+                        let created = state.store.take_created_journal();
+                        state.store.remove_created(&created);
+                        oplog.rollback_import(&mut state);
+                        let _ = self.memory_stats_locked(&oplog, &state, 0);
+                        return Err(e);
+                    }
+                    let _ = state.store.take_created_journal();
+                } else if !oplog.batch_importing && global_budget_flags() != 0 {
+                    let _ = self.memory_stats_locked(&oplog, &state, 0);
+                }
+            }
+            if owns_rollback {
+                oplog.commit_import_rollback();
             }
 
             return Ok(result.status);
@@ -1081,8 +1413,10 @@ impl LoroDoc {
                 !state.store.contains_id(&id)
             })
         });
-        let rollback_enabled =
-            preflight.needs_state_apply_rollback || oplog.change_store().may_have_unparsed_bodies();
+        let rollback_enabled = preflight.needs_state_apply_rollback
+            || oplog.change_store().may_have_unparsed_bodies()
+            || oplog.has_max_pending_bytes()
+            || self.has_max_doc_bytes();
         if rollback_enabled {
             oplog.begin_import_rollback_with_version(arena_checkpoint, old_vv.clone());
         }
@@ -1164,16 +1498,28 @@ impl LoroDoc {
                     return Err(err);
                 }
             };
-            if let Err(e) = state.apply_diff(
+            if rollback_enabled {
+                state.store.begin_created_journal();
+            }
+            // See the other import path: record how to undo it under a quota.
+            if rollback_enabled && !oplog.batch_importing && self.has_max_doc_bytes() {
+                state.begin_import_undo();
+            }
+            let applied = state.apply_diff(
                 InternalDocDiff {
                     origin,
                     diff: (diff).into(),
                     by: EventTriggerKind::Import,
                     new_version: Cow::Owned(oplog.frontiers().clone()),
+                    local_inverse: None,
                 },
                 diff_mode,
-            ) {
+            );
+            let undo = state.take_import_undo();
+            if let Err(e) = applied {
                 if rollback_enabled {
+                    let created = state.store.take_created_journal();
+                    state.store.remove_created(&created);
                     oplog.rollback_import(&mut state);
                     return Err(e);
                 }
@@ -1181,6 +1527,30 @@ impl LoroDoc {
                 panic!("state apply returned Err for import without rollback guard: {e}");
             }
             materialize_touched_roots(&mut state, &calc, &oplog.arena);
+            if rollback_enabled {
+                if let Some(undo) = undo {
+                    self.enforce_watermarks_locked(&oplog, &mut state, 0, false);
+                    if let Err(budget_err) = self.check_doc_budget_locked_with_linear(
+                        &oplog,
+                        &state,
+                        0,
+                        Some(linear_before),
+                    ) {
+                        state.undo_import(undo, old_frontiers.clone());
+                        let created = state.store.take_created_journal();
+                        state.store.remove_created(&created);
+                        oplog.rollback_import(&mut state);
+                        *self.diff_calculator.lock() = DiffCalculator::new(true);
+                        let _ = self.memory_stats_locked(&oplog, &state, 0);
+                        return Err(budget_err);
+                    }
+                } else if !oplog.batch_importing && global_budget_flags() != 0 {
+                    let _ = self.memory_stats_locked(&oplog, &state, 0);
+                }
+                let _ = state.store.take_created_journal();
+            } else if !oplog.batch_importing && global_budget_flags() != 0 {
+                let _ = self.memory_stats_locked(&oplog, &state, 0);
+            }
         }
 
         if result.has_deps_before_shallow_root {
@@ -1220,6 +1590,7 @@ impl LoroDoc {
     #[tracing::instrument(skip_all)]
     pub fn import_json_updates<T: TryInto<JsonSchema>>(&self, json: T) -> LoroResult<ImportStatus> {
         let json = json.try_into().map_err(|_| LoroError::InvalidJsonSchema)?;
+        self.check_import_json_limit(&json)?;
         self.check_import_not_nested()?;
         self.with_barrier(|| {
             let result = self.import_changes_and_apply_delta_to_state_if_needed(
@@ -1394,6 +1765,7 @@ impl LoroDoc {
     /// if it's str it will use Root container, which will not be None
     #[inline]
     pub fn try_get_text<I: IntoContainerId>(&self, id: I) -> Option<TextHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::Text);
         if !self.has_container(&id) {
             return None;
@@ -1414,6 +1786,7 @@ impl LoroDoc {
     /// if it's str it will use Root container, which will not be None
     #[inline]
     pub fn try_get_list<I: IntoContainerId>(&self, id: I) -> Option<ListHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::List);
         if !self.has_container(&id) {
             return None;
@@ -1434,6 +1807,7 @@ impl LoroDoc {
     /// if it's str it will use Root container, which will not be None
     #[inline]
     pub fn try_get_movable_list<I: IntoContainerId>(&self, id: I) -> Option<MovableListHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::MovableList);
         if !self.has_container(&id) {
             return None;
@@ -1456,6 +1830,7 @@ impl LoroDoc {
     /// if it's str it will use Root container, which will not be None
     #[inline]
     pub fn try_get_map<I: IntoContainerId>(&self, id: I) -> Option<MapHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::Map);
         if !self.has_container(&id) {
             return None;
@@ -1476,6 +1851,7 @@ impl LoroDoc {
     /// if it's str it will use Root container, which will not be None
     #[inline]
     pub fn try_get_tree<I: IntoContainerId>(&self, id: I) -> Option<TreeHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::Tree);
         if !self.has_container(&id) {
             return None;
@@ -1497,6 +1873,7 @@ impl LoroDoc {
         &self,
         id: I,
     ) -> Option<crate::handler::counter::CounterHandler> {
+        self.touch_access_tick();
         let id = id.into_container_id(&self.arena, ContainerType::Counter);
         if !self.has_container(&id) {
             return None;
@@ -1550,6 +1927,7 @@ impl LoroDoc {
     ) -> LoroResult<CommitWhenDrop<'_>> {
         self.undo_internal_with(
             id_span,
+            None,
             container_remap,
             post_transform_base,
             before_diff,
@@ -1562,9 +1940,15 @@ impl LoroDoc {
     /// recreate a container of an unknown type, `rejected_step` is set to the
     /// step's own changes, which stay in the doc: the undo manager treats them
     /// like remote changes for the steps before it.
+    /// `inverse`: the recorded inverse of `id_span`'s ops, if the undo manager has
+    /// one (see `crate::undo::LocalInverse`). When `id_span` is one run, it
+    /// replaces checking the document out at the span's last op and its deps.
+    /// See context/undo-log.md.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn undo_internal_with(
         &self,
         id_span: IdSpan,
+        inverse: Option<&crate::undo::LocalInverse>,
         container_remap: &mut FxHashMap<ContainerID, ContainerID>,
         post_transform_base: Option<&DiffBatch>,
         before_diff: &mut dyn FnMut(&DiffBatch),
@@ -1597,7 +1981,25 @@ impl LoroDoc {
         };
 
         let spans = self.oplog.lock().split_span_based_on_deps(id_span);
-        let (span_scopes, all_scopes) = match crate::undo::movable_list::scopes(self, &spans) {
+        // The recorded inverse replaces the checkouts only for exactly this
+        // transition, and one run.
+        let verify = crate::undo::verify_recorded_inverses();
+        let mut recorded = inverse
+            .and_then(|inv| inv.seal())
+            .filter(|inv| spans.len() == 1 && inv.span == spans[0].0 && inv.deps == spans[0].1);
+        // Every movable-list op of a recorded span is recorded, so its records
+        // name the elements `scopes` would find by reading history.
+        let scopes = match &recorded {
+            Some(inv) if !verify => {
+                let all = crate::undo::movable_list::scopes_from_records(&inv.movable);
+                Ok((
+                    vec![crate::undo::movable_list::scopes_from_records(&inv.movable)],
+                    all,
+                ))
+            }
+            _ => crate::undo::movable_list::scopes(self, &spans),
+        };
+        let (span_scopes, all_scopes) = match scopes {
             Ok(scopes) => scopes,
             Err(error) => {
                 if was_recording {
@@ -1610,7 +2012,19 @@ impl LoroDoc {
         };
         let inverse_lists = std::cell::RefCell::new(Vec::new());
         let revived_lists = std::cell::RefCell::new(Default::default());
-        let calc_diff = |from: &Frontiers, to: &Frontiers| {
+        if verify {
+            // What production takes from the records must be what history says
+            // (a shallow root trimming the deleted elements' history aside).
+            recorded = recorded.filter(|inv| {
+                crate::undo::movable_list::records_match_scopes(&inv.movable, &all_scopes)
+            });
+        }
+        let recorded = recorded.as_ref();
+        let recorded_diff = std::cell::RefCell::new(recorded.map(|inv| inv.full_diff(self)));
+        let recorded_used = std::cell::Cell::new(false);
+        let checked_out = std::cell::Cell::new(false);
+        let checkout_calc_diff = |from: &Frontiers, to: &Frontiers| {
+            checked_out.set(true);
             self._checkout_without_emitting(from, false, false).unwrap();
             let inverse_index = spans
                 .iter()
@@ -1674,6 +2088,23 @@ impl LoroDoc {
             }
             diff
         };
+        let calc_diff = |from: &Frontiers, to: &Frontiers| {
+            if let Some(inv) = recorded {
+                if *from == Frontiers::from_id(inv.span.id_last()) && *to == inv.deps {
+                    if let Some(diff) = recorded_diff.borrow_mut().take() {
+                        if verify {
+                            let from_checkout = checkout_calc_diff(from, to);
+                            crate::undo::assert_same_undo_diff(&from_checkout, &diff);
+                        }
+                        #[cfg(test)]
+                        crate::undo::RECORDED_INVERSES_USED.with(|n| n.set(n.get() + 1));
+                        recorded_used.set(true);
+                        return diff;
+                    }
+                }
+            }
+            checkout_calc_diff(from, to)
+        };
         // `before_diff` rebases the undo manager's other steps over this one,
         // so it only runs once the step is accepted
         let mut last_event_a = None;
@@ -1687,9 +2118,37 @@ impl LoroDoc {
             &mut |d| last_event_a = Some(d.clone()),
         );
 
-        self._checkout_without_emitting(&latest_frontiers, false, false)?;
-        self.set_detached(false);
+        if checked_out.get() {
+            self._checkout_without_emitting(&latest_frontiers, false, false)?;
+            self.set_detached(false);
+        }
         let mut inverse_lists = inverse_lists.take();
+        if let Some(inv) = recorded.filter(|_| recorded_used.get()) {
+            let mut from_records: Vec<_> = inv
+                .movable
+                .iter()
+                .map(|r| r.to_inverse(&inv.deps))
+                .collect();
+            if verify && !from_records.is_empty() {
+                // `inverse_lists` holds what the checkout captured.
+                for lists in [&mut inverse_lists, &mut from_records] {
+                    crate::undo::movable_list::complete_anchors(
+                        self,
+                        lists,
+                        &latest_frontiers,
+                        &all_scopes,
+                        element_remap,
+                        container_remap,
+                    )?;
+                }
+                crate::undo::movable_list::assert_same_inverses(
+                    &inverse_lists,
+                    &from_records,
+                    self.is_shallow(),
+                );
+            }
+            inverse_lists = from_records;
+        }
         crate::undo::movable_list::complete_anchors(
             self,
             &mut inverse_lists,
@@ -1956,19 +2415,42 @@ impl LoroDoc {
             frontiers_to_vv_or_not_found(&oplog, &frontiers)?;
         }
 
+        self.touch_access_tick();
+        let linear_before = wasm_linear_memory_bytes();
         let scope = self.begin_apply_diff_scope();
-        let result = self._apply_diff(
+        let mut result = self._apply_diff(
             diff,
             container_remap,
             skip_unreachable,
             align_revived_mergeable,
         );
+        if result.is_ok() {
+            let guard = self.txn.lock();
+            if let Some(txn) = guard.as_ref() {
+                if txn.doc_budget_limit.is_some()
+                    || (global_budget_flags() & BUDGET_FLAG_MAX_DOC != 0
+                        && txn.budget_base_scope().is_some())
+                {
+                    self.enforce_memory_watermarks_with_txn_bytes(
+                        txn.estimated_uncommitted_bytes(),
+                        false,
+                    );
+                    if let Err(err) = self.check_transaction_budget(txn, Some(linear_before)) {
+                        result = Err(err);
+                    }
+                }
+            }
+        }
+
         if let Some(scope) = scope {
             if result.is_ok() {
                 self.end_apply_diff_scope(scope);
-            } else if let Err(err) = self.rollback_apply_diff_scope(scope) {
-                return Err(err);
+            } else {
+                self.rollback_apply_diff_scope(scope)?;
             }
+        }
+        if global_budget_flags() != 0 {
+            self.refresh_cached_doc_bytes_unlocked();
         }
         result
     }
@@ -2008,13 +2490,17 @@ impl LoroDoc {
         self.begin_apply_diff_scope_with_txn(guard.as_mut()?)
     }
 
+    fn next_rollback_scope_id() -> u64 {
+        static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Also used by undo while it holds the preparation transaction guard.
     fn begin_apply_diff_scope_with_txn(&self, txn: &mut Transaction) -> Option<u64> {
-        static NEXT_SCOPE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if txn.has_rollback_scope() {
             return None;
         }
-        let id = NEXT_SCOPE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = Self::next_rollback_scope_id();
         txn.begin_rollback_scope(id);
         self.state.lock().begin_local_rollback(id);
         Some(id)
@@ -2026,6 +2512,19 @@ impl LoroDoc {
             txn.end_rollback_scope(scope);
         }
         self.state.lock().end_local_rollback(scope);
+    }
+
+    pub(crate) fn rollback_transaction_scope(
+        &self,
+        txn: &mut Transaction,
+        scope: u64,
+    ) -> LoroResult<()> {
+        if !txn.rollback_scope_is_intact(scope) {
+            txn.end_rollback_scope(scope);
+            self.state.lock().end_local_rollback(scope);
+            return Ok(());
+        }
+        self.rollback_transaction_scope_inner(txn, scope)
     }
 
     /// Undo the ops of a failed batch, keeping the ops the transaction held before it.
@@ -2050,8 +2549,16 @@ impl LoroDoc {
             self.state.lock().end_local_rollback(scope);
             return Ok(());
         };
+        self.rollback_transaction_scope_inner(txn, scope)
+    }
 
+    fn rollback_transaction_scope_inner(
+        &self,
+        txn: &mut Transaction,
+        scope: u64,
+    ) -> LoroResult<()> {
         let batch = txn.roll_back_scope(scope);
+        let txn_now_empty = txn.is_empty();
         let mut oplog = self.oplog.lock();
         let mut state = self.state.lock();
         if batch.batch_start < batch.batch_end {
@@ -2118,6 +2625,7 @@ impl LoroDoc {
                         by: EventTriggerKind::Checkout,
                         diff: Cow::Owned(diff),
                         new_version: Cow::Owned(before_batch.clone()),
+                        local_inverse: None,
                     },
                     diff_mode,
                 );
@@ -2127,6 +2635,7 @@ impl LoroDoc {
             })();
             // The temporary change must not stay in the op log if the checkout cannot be read.
             oplog.rollback_import_keeping_arena(&state);
+            oplog.free_history_cache();
             if txn_ops_before > 0 {
                 oplog.dag.update_version_on_new_local_op(
                     &batch.deps,
@@ -2139,6 +2648,9 @@ impl LoroDoc {
             undone?;
         }
         state.finish_local_rollback(scope, batch.peer, batch.batch_start);
+        if txn_now_empty {
+            state.clear_changed_idx_in_txn();
+        }
         Ok(())
     }
 
@@ -2894,6 +3406,13 @@ impl LoroDoc {
         self.import_batch_with_history_mode(bytes, false)
     }
 
+    /// Like [`Self::import_batch`], taking owned [`bytes::Bytes`] buffers and
+    /// releasing each buffer as soon as that blob finishes importing.
+    #[tracing::instrument(skip_all)]
+    pub fn import_batch_bytes(&self, bytes: Vec<bytes::Bytes>) -> LoroResult<ImportStatus> {
+        self.import_batch_with_history_mode_bytes(bytes, false)
+    }
+
     /// Like [`Self::import_batch`]. `json_lossy` is the same opt-in as
     /// [`Self::import_with_history_mode`].
     pub fn import_batch_with_history_mode(
@@ -2902,28 +3421,90 @@ impl LoroDoc {
         json_lossy: bool,
     ) -> LoroResult<ImportStatus> {
         self.check_import_not_nested()?;
-        let values = if json_lossy {
-            ImportedValues::JsonLossy
-        } else {
-            ImportedValues::Exact
-        };
         if bytes.is_empty() {
             return Ok(ImportStatus::default());
         }
-
         if bytes.len() == 1 {
             return self.import_with_history_mode(&bytes[0], Default::default(), json_lossy);
         }
 
+        let values = imported_values_for_mode(json_lossy);
         // Metadata that does not decode fails the batch before anything is imported.
         let blobs = bytes
             .iter()
             .enumerate()
             .map(|(index, blob)| {
+                self.check_import_blob_limit(blob.len())?;
                 let meta = LoroDoc::decode_import_blob_meta(blob, false)?;
-                Ok((index, meta, blob.as_slice()))
+                Ok((index, meta, BatchBlobSource::Slice(blob.as_slice())))
             })
             .collect::<LoroResult<Vec<_>>>()?;
+        self.finish_batch_status(blobs, values)
+    }
+
+    /// Like [`Self::import_batch_with_history_mode`], taking owned [`bytes::Bytes`]
+    /// buffers and dropping each buffer as soon as its blob finishes importing.
+    pub fn import_batch_with_history_mode_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+        json_lossy: bool,
+    ) -> LoroResult<ImportStatus> {
+        self.check_import_not_nested()?;
+        if bytes.is_empty() {
+            return Ok(ImportStatus::default());
+        }
+        if bytes.len() == 1 {
+            let blob = bytes.into_iter().next().expect("checked len == 1");
+            return self.import_with_history_mode_bytes(blob, Default::default(), json_lossy);
+        }
+
+        let values = imported_values_for_mode(json_lossy);
+        let blobs = bytes
+            .into_iter()
+            .enumerate()
+            .map(|(index, blob)| {
+                self.check_import_blob_limit(blob.len())?;
+                let meta = LoroDoc::decode_import_blob_meta_bytes(blob.clone(), false)?;
+                Ok((index, meta, BatchBlobSource::Bytes(blob)))
+            })
+            .collect::<LoroResult<Vec<_>>>()?;
+        self.finish_batch_status(blobs, values)
+    }
+
+    /// Import a batch whose metadata has already been decoded, loading each blob's
+    /// payload on demand and dropping each buffer immediately after its turn.
+    pub fn import_batch_with_loaders<'a, F>(
+        &self,
+        blobs: Vec<(ImportBlobMetadata, F)>,
+        json_lossy: bool,
+    ) -> LoroResult<ImportStatus>
+    where
+        F: FnOnce() -> LoroResult<bytes::Bytes> + 'a,
+    {
+        self.check_import_not_nested()?;
+        if blobs.is_empty() {
+            return Ok(ImportStatus::default());
+        }
+        if blobs.len() == 1 {
+            let (_, load) = blobs.into_iter().next().expect("checked len == 1");
+            let bytes = load()?;
+            return self.import_with_history_mode_bytes(bytes, Default::default(), json_lossy);
+        }
+
+        let values = imported_values_for_mode(json_lossy);
+        let sources = blobs
+            .into_iter()
+            .enumerate()
+            .map(|(index, (meta, load))| (index, meta, BatchBlobSource::Loader(Box::new(load))))
+            .collect();
+        self.finish_batch_status(sources, values)
+    }
+
+    fn finish_batch_status(
+        &self,
+        blobs: Vec<(usize, ImportBlobMetadata, BatchBlobSource<'_>)>,
+        values: ImportedValues,
+    ) -> LoroResult<ImportStatus> {
         let run = self.import_blobs_as_batch(blobs, values)?;
         if let Some(err) = run.rollback_error {
             return Err(err);
@@ -2972,6 +3553,15 @@ impl LoroDoc {
         self.import_batch_detailed_with_history_mode(bytes, false)
     }
 
+    /// Like [`Self::import_batch_detailed`], taking owned [`bytes::Bytes`] buffers
+    /// and dropping each buffer immediately after its blob finishes importing.
+    pub fn import_batch_detailed_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+    ) -> LoroResult<ImportBatchDetail> {
+        self.import_batch_detailed_with_history_mode_bytes(bytes, false)
+    }
+
     /// Like [`Self::import_batch_detailed`]. `json_lossy` is the same opt-in as
     /// [`Self::import_with_history_mode`].
     pub fn import_batch_detailed_with_history_mode(
@@ -2980,62 +3570,171 @@ impl LoroDoc {
         json_lossy: bool,
     ) -> LoroResult<ImportBatchDetail> {
         self.check_import_not_nested()?;
-        let values = if json_lossy {
-            ImportedValues::JsonLossy
-        } else {
-            ImportedValues::Exact
-        };
+        let values = imported_values_for_mode(json_lossy);
         if bytes.is_empty() {
-            let pending = self.oplog.lock().pending_changes.version_range();
-            return Ok(ImportBatchDetail {
-                blobs: Vec::new(),
-                status: ImportStatus {
-                    success: Default::default(),
-                    pending: non_empty(pending),
-                },
-                rollback_error: None,
-            });
+            return Ok(self.empty_batch_detail());
         }
-
         if bytes.len() == 1 {
-            // A plain import, as in `import_batch`. The pending range is read under
-            // the same transaction lock.
-            let (result, pending) = self.with_barrier(|| {
-                let result = self._import_with(&bytes[0], Default::default(), values);
-                (result, self.oplog.lock().pending_changes.version_range())
-            });
-            let (blob, success) = match result {
-                Ok(status) => {
-                    let success = status.success.clone();
-                    (ImportBlobOutcome::Imported(status), success)
-                }
-                // Only the transaction checks return this, before the blob is tried.
-                Err(LoroError::ImportWhenInTxn) => return Err(LoroError::ImportWhenInTxn),
-                Err(err) => (ImportBlobOutcome::Failed(err), Default::default()),
-            };
-            return Ok(ImportBatchDetail {
-                blobs: vec![blob],
-                status: ImportStatus {
-                    success,
-                    pending: non_empty(pending),
-                },
-                rollback_error: None,
-            });
+            return self.import_single_detailed(|| Ok(ImportInput::Slice(&bytes[0])), values);
         }
 
         let mut outcomes: Vec<Option<ImportBlobOutcome>> = Vec::with_capacity(bytes.len());
         let mut blobs = Vec::with_capacity(bytes.len());
         for (index, blob) in bytes.iter().enumerate() {
-            match LoroDoc::decode_import_blob_meta(blob, false) {
+            match self
+                .check_import_blob_limit(blob.len())
+                .and_then(|()| LoroDoc::decode_import_blob_meta(blob, false))
+            {
                 Ok(meta) => {
-                    blobs.push((index, meta, blob.as_slice()));
+                    blobs.push((index, meta, BatchBlobSource::Slice(blob.as_slice())));
                     outcomes.push(None);
                 }
                 // Unlike `import_batch`, the other blobs are still imported.
                 Err(err) => outcomes.push(Some(ImportBlobOutcome::Failed(err))),
             }
         }
+        self.finish_batch_detailed(blobs, outcomes, values)
+    }
 
+    /// Like [`Self::import_batch_detailed_with_history_mode`], taking owned
+    /// [`bytes::Bytes`] buffers and dropping each buffer right after its turn.
+    pub fn import_batch_detailed_with_history_mode_bytes(
+        &self,
+        bytes: Vec<bytes::Bytes>,
+        json_lossy: bool,
+    ) -> LoroResult<ImportBatchDetail> {
+        self.import_batch_detailed_with_blob_results(bytes.into_iter().map(Ok), json_lossy)
+    }
+
+    /// Detailed owned batch whose buffers can fail admission before allocation.
+    /// Keeps per-blob errors and the single-blob import boundary intact.
+    pub fn import_batch_detailed_with_blob_results<I>(
+        &self,
+        bytes: I,
+        json_lossy: bool,
+    ) -> LoroResult<ImportBatchDetail>
+    where
+        I: IntoIterator<Item = LoroResult<bytes::Bytes>>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        self.check_import_not_nested()?;
+        let values = imported_values_for_mode(json_lossy);
+        let mut bytes = bytes.into_iter();
+        let len = bytes.len();
+        if len == 0 {
+            return Ok(self.empty_batch_detail());
+        }
+        if len == 1 {
+            let blob = bytes.next().expect("checked len == 1");
+            return self.import_single_detailed(|| blob.map(ImportInput::Bytes), values);
+        }
+
+        let mut outcomes: Vec<Option<ImportBlobOutcome>> = Vec::with_capacity(len);
+        let mut blobs = Vec::with_capacity(len);
+        for (index, result) in bytes.enumerate() {
+            let blob = match result {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    outcomes.push(Some(ImportBlobOutcome::Failed(err)));
+                    continue;
+                }
+            };
+            match self
+                .check_import_blob_limit(blob.len())
+                .and_then(|()| LoroDoc::decode_import_blob_meta_bytes(blob.clone(), false))
+            {
+                Ok(meta) => {
+                    blobs.push((index, meta, BatchBlobSource::Bytes(blob)));
+                    outcomes.push(None);
+                }
+                Err(err) => outcomes.push(Some(ImportBlobOutcome::Failed(err))),
+            }
+        }
+        self.finish_batch_detailed(blobs, outcomes, values)
+    }
+
+    /// Detailed counterpart of [`Self::import_batch_with_loaders`].
+    pub fn import_batch_detailed_with_loaders<'a, F>(
+        &self,
+        blobs: Vec<(LoroResult<ImportBlobMetadata>, F)>,
+        json_lossy: bool,
+    ) -> LoroResult<ImportBatchDetail>
+    where
+        F: FnOnce() -> LoroResult<bytes::Bytes> + 'a,
+    {
+        self.check_import_not_nested()?;
+        let values = imported_values_for_mode(json_lossy);
+        if blobs.is_empty() {
+            return Ok(self.empty_batch_detail());
+        }
+        if blobs.len() == 1 {
+            let (_, load) = blobs.into_iter().next().expect("checked len == 1");
+            return self.import_single_detailed(|| load().map(ImportInput::Bytes), values);
+        }
+
+        let mut outcomes: Vec<Option<ImportBlobOutcome>> = Vec::with_capacity(blobs.len());
+        let mut valid = Vec::with_capacity(blobs.len());
+        for (index, (meta, load)) in blobs.into_iter().enumerate() {
+            match meta {
+                Ok(meta) => {
+                    valid.push((index, meta, BatchBlobSource::Loader(Box::new(load))));
+                    outcomes.push(None);
+                }
+                Err(err) => outcomes.push(Some(ImportBlobOutcome::Failed(err))),
+            }
+        }
+        self.finish_batch_detailed(valid, outcomes, values)
+    }
+
+    fn empty_batch_detail(&self) -> ImportBatchDetail {
+        let pending = self.oplog.lock().pending_changes.version_range();
+        ImportBatchDetail {
+            blobs: Vec::new(),
+            status: ImportStatus {
+                success: Default::default(),
+                pending: non_empty(pending),
+            },
+            rollback_error: None,
+        }
+    }
+
+    fn import_single_detailed<'a>(
+        &self,
+        load_input: impl FnOnce() -> LoroResult<ImportInput<'a>>,
+        values: ImportedValues,
+    ) -> LoroResult<ImportBatchDetail> {
+        // A plain import, as in `import_batch`. The pending range is read under
+        // the same transaction lock.
+        let (result, pending) = self.with_barrier(|| {
+            let result = load_input()
+                .and_then(|input| self._import_with_input(input, Default::default(), values));
+            (result, self.oplog.lock().pending_changes.version_range())
+        });
+        let (blob, success) = match result {
+            Ok(status) => {
+                let success = status.success.clone();
+                (ImportBlobOutcome::Imported(status), success)
+            }
+            // Only the transaction checks return this, before the blob is tried.
+            Err(LoroError::ImportWhenInTxn) => return Err(LoroError::ImportWhenInTxn),
+            Err(err) => (ImportBlobOutcome::Failed(err), Default::default()),
+        };
+        Ok(ImportBatchDetail {
+            blobs: vec![blob],
+            status: ImportStatus {
+                success,
+                pending: non_empty(pending),
+            },
+            rollback_error: None,
+        })
+    }
+
+    fn finish_batch_detailed(
+        &self,
+        blobs: Vec<(usize, ImportBlobMetadata, BatchBlobSource<'_>)>,
+        mut outcomes: Vec<Option<ImportBlobOutcome>>,
+        values: ImportedValues,
+    ) -> LoroResult<ImportBatchDetail> {
         // Nothing decoded, so there is nothing to import. `import_batch` returns
         // before this critical section; entering it would commit the local
         // transaction and, when detached editing is on, renew the peer id.
@@ -3079,13 +3778,13 @@ impl LoroDoc {
     }
 
     /// The critical section of a batch import, for blobs whose metadata decoded:
-    /// `(index in the caller's input, metadata, bytes)`.
+    /// `(index in the caller's input, metadata, payload source)`.
     ///
     /// Returns `Err` only when the batch is refused before anything changes. A blob
     /// that fails, and a failed closing checkout, are in the [`BatchRun`].
     fn import_blobs_as_batch(
         &self,
-        mut blobs: Vec<(usize, ImportBlobMetadata, &[u8])>,
+        mut blobs: Vec<(usize, ImportBlobMetadata, BatchBlobSource<'_>)>,
         values: ImportedValues,
     ) -> LoroResult<BatchRun> {
         let mut success = VersionRange::default();
@@ -3134,7 +3833,10 @@ impl LoroDoc {
         // stops reflecting later imports and local edits. `BatchImportGuard::finish`
         // owns that cleanup and the blob loop runs inside `catch_unwind` so it also
         // runs before a panic is re-raised.
+        self.touch_access_tick();
         let was_attached = !self.is_detached();
+        let linear_before = wasm_linear_memory_bytes();
+        let has_doc_budget = self.has_max_doc_bytes();
         // A snapshot can initialize state lazily, just as in `import`, even
         // with parked changes. Keep their original claims for batch rollback.
         // Keep the pre-snapshot arena checkpoint so a failed closing checkout
@@ -3157,26 +3859,43 @@ impl LoroDoc {
         } else {
             None
         };
+        let (pre_batch_frontiers, has_created_journal) =
+            if was_attached && snapshot_checkpoint.is_none() && has_doc_budget {
+                let mut state = self.state.lock();
+                state.store.begin_created_journal();
+                (state.frontiers.clone(), true)
+            } else {
+                (Frontiers::default(), false)
+            };
         self.set_detached(true);
-        {
+        let has_import_rollback = {
             let mut oplog = self.oplog.lock();
             oplog.batch_importing = true;
             // The history-only path touches just the `OpLog`, so a rollback
             // scope spanning the whole batch lets `BatchImportGuard::finish` restore
             // the pre-batch version if the closing reattach cannot apply the imported
-            // changes to `DocState`. Without it the doc would be left detached at a
-            // version it can never check out.
-            if was_attached && snapshot_checkpoint.is_none() {
+            // changes to `DocState` or `MemoryBudget::max_doc_bytes` is exceeded.
+            let need_scope = (was_attached && snapshot_checkpoint.is_none())
+                || (!was_attached && (has_doc_budget || oplog.has_max_pending_bytes()));
+            if need_scope {
                 oplog.begin_import_rollback();
+                true
+            } else {
+                false
             }
-        }
+        };
 
         let mut guard = BatchImportGuard {
             doc: self,
             was_attached,
+            has_doc_budget,
+            has_import_rollback,
+            has_created_journal,
+            pre_batch_frontiers,
             txn: Some(txn),
             options,
             snapshot_checkpoint,
+            linear_before,
             #[cfg(debug_assertions)]
             finished: false,
         };
@@ -3187,21 +3906,42 @@ impl LoroDoc {
         // terminates execution; only returned errors can be recovered there.
         let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut results = Vec::with_capacity(blobs.len());
-            for (order, (index, _meta, data)) in blobs.into_iter().enumerate() {
+            for (order, (index, _meta, source)) in blobs.into_iter().enumerate() {
                 #[cfg(test)]
                 take_panic_at_batch_import_blob_for_test();
+                let loaded = match source {
+                    BatchBlobSource::Slice(data) => Ok(ImportInput::Slice(data)),
+                    BatchBlobSource::Bytes(data) => Ok(ImportInput::Bytes(data)),
+                    BatchBlobSource::Loader(load) => load().map(ImportInput::Bytes),
+                };
                 let result = if let Some(checkpoint) =
                     guard.snapshot_checkpoint.as_ref().filter(|_| order == 0)
                 {
                     // Do not emit the snapshot event until the closing checkout
                     // succeeds. Its state is part of the batch's rollback scope.
-                    let result = parse_header_and_body(data, true).and_then(|parsed| {
-                        guard.doc.init_snapshot_preserving_pending(
-                            parsed.mode,
-                            parsed.body,
-                            Default::default(),
-                            values,
-                        )
+                    let result = loaded.and_then(|input| match input {
+                        ImportInput::Slice(data) => {
+                            guard.doc.check_import_blob_limit(data.len())?;
+                            parse_header_and_body(data, true).and_then(|parsed| {
+                                guard.doc.init_snapshot_preserving_pending(
+                                    parsed.mode,
+                                    parsed.body,
+                                    Default::default(),
+                                    values,
+                                )
+                            })
+                        }
+                        ImportInput::Bytes(data) => {
+                            guard.doc.check_import_blob_limit(data.len())?;
+                            parse_header_and_body_bytes(data, true).and_then(|parsed| {
+                                guard.doc.init_snapshot_preserving_pending_bytes(
+                                    parsed.mode,
+                                    parsed.body,
+                                    Default::default(),
+                                    values,
+                                )
+                            })
+                        }
                     });
                     if result.is_err() {
                         // The standalone decoder resets a failed snapshot to an
@@ -3218,9 +3958,11 @@ impl LoroDoc {
                     oplog.begin_import_rollback();
                     result
                 } else {
-                    guard
-                        .doc
-                        .import_without_emitting(data, Default::default(), values)
+                    loaded.and_then(|input| {
+                        guard
+                            .doc
+                            .import_without_emitting_input(input, Default::default(), values)
+                    })
                 };
                 if let Ok(s) = &result {
                     for (peer, (start, end)) in s.success.iter() {
@@ -3267,18 +4009,21 @@ impl LoroDoc {
     /// Get shallow value of the document.
     #[inline]
     pub fn get_value(&self) -> LoroValue {
+        self.touch_access_tick();
         self.state.lock().get_value()
     }
 
     /// Get deep value of the document.
     #[inline]
     pub fn get_deep_value(&self) -> LoroValue {
+        self.touch_access_tick();
         self.state.lock().get_deep_value()
     }
 
     /// Get deep value of the document with container id
     #[inline]
     pub fn get_deep_value_with_id(&self) -> LoroValue {
+        self.touch_access_tick();
         self.state.lock().get_deep_value_with_id()
     }
 
@@ -3383,6 +4128,7 @@ impl LoroDoc {
     /// its ops are in the DAG and not in the change store yet, so the history cannot
     /// be read. Commit it first.
     pub fn checkout(&self, frontiers: &Frontiers) -> LoroResult<()> {
+        self.touch_access_tick();
         // Checked here and not in `_checkout_without_emitting`: undo, `checkout_to_latest`
         // and the exporters call that and cannot return this error.
         self.oplog.lock().check_history_parsable()?;
@@ -3518,6 +4264,7 @@ impl LoroDoc {
                 diff: Cow::Owned(diff),
                 by: triggered_by,
                 new_version: Cow::Owned(frontiers.clone()),
+                local_inverse: None,
             },
             diff_mode,
         )?;
@@ -3954,6 +4701,7 @@ impl LoroDoc {
         mode: ExportMode,
         reject_partial_history: bool,
     ) -> Result<Vec<u8>, LoroEncodeError> {
+        self.touch_access_tick();
         self.with_barrier(|| {
             if reject_partial_history {
                 self.oplog.lock().check_history_parsable()?;
@@ -4475,6 +5223,10 @@ struct BatchImportGuard<'a> {
     /// Whether the doc was attached before the batch and therefore owes a reattach.
     /// It also decides whether we own the batch-wide import rollback scope.
     was_attached: bool,
+    has_doc_budget: bool,
+    has_import_rollback: bool,
+    has_created_journal: bool,
+    pre_batch_frontiers: Frontiers,
     /// Held for the whole batch so no other thread can renew the txn and edit while
     /// we are detached. `_checkout_to_latest_without_commit` requires it to be held.
     txn: Option<LoroMutexGuard<'a, Option<Transaction>>>,
@@ -4483,6 +5235,7 @@ struct BatchImportGuard<'a> {
     /// failure both its lazy state and its history must be reset, not just the
     /// updates recorded in the suffix journal.
     snapshot_checkpoint: Option<BatchSnapshotRollback>,
+    linear_before: u64,
     #[cfg(debug_assertions)]
     finished: bool,
 }
@@ -4498,6 +5251,36 @@ struct BatchRun {
     pending: VersionRange,
     /// The closing checkout failed and the whole batch was rolled back.
     rollback_error: Option<LoroError>,
+}
+
+enum ImportInput<'a> {
+    Slice(&'a [u8]),
+    Bytes(bytes::Bytes),
+}
+
+enum BatchBlobSource<'a> {
+    Slice(&'a [u8]),
+    Bytes(bytes::Bytes),
+    Loader(Box<dyn FnOnce() -> LoroResult<bytes::Bytes> + 'a>),
+}
+
+#[inline]
+fn imported_values_for_mode(json_lossy: bool) -> ImportedValues {
+    if json_lossy {
+        ImportedValues::JsonLossy
+    } else {
+        ImportedValues::Exact
+    }
+}
+
+#[inline]
+fn parsed_as_borrowed(parsed: &ParsedHeaderAndBodyBytes) -> ParsedHeaderAndBody<'_> {
+    ParsedHeaderAndBody {
+        checksum: parsed.checksum,
+        checksum_body: &parsed.checksum_body,
+        mode: parsed.mode,
+        body: &parsed.body,
+    }
 }
 
 fn non_empty(range: VersionRange) -> Option<VersionRange> {
@@ -4568,11 +5351,48 @@ impl BatchImportGuard<'_> {
             // The blobs were imported while detached inside this scope, so their
             // op references (movable-list elements, style end anchors) are validated
             // here, once per batch.
-            let validation = doc
-                .oplog
-                .lock()
-                .validate_op_refs_in_import_scope();
-            checkout = validation.and_then(|()| doc._checkout_to_latest_without_commit(true));
+            let validation = doc.oplog.lock().validate_op_refs_in_import_scope();
+            // A quota may reject the batch after the checkout changed the state;
+            // record how to undo it (see `state/undo_log.rs`).
+            let record_undo = self.has_doc_budget && self.snapshot_checkpoint.is_none();
+            if record_undo {
+                doc.state.lock().begin_import_undo();
+            }
+            checkout = validation.and_then(|()| {
+                doc._checkout_to_latest_without_commit_with_event(
+                    true,
+                    "checkout".into(),
+                    EventTriggerKind::Checkout,
+                    !self.has_doc_budget,
+                )
+            });
+            let mut undo = if record_undo {
+                doc.state.lock().take_import_undo()
+            } else {
+                None
+            };
+            if checkout.is_ok() && self.has_doc_budget {
+                doc.enforce_memory_watermarks_with_txn_bytes(0, false);
+                if let Err(budget_err) =
+                    doc.check_doc_budget_with_txn_bytes_and_linear(0, Some(self.linear_before))
+                {
+                    if self.snapshot_checkpoint.is_some() {
+                        let _ = doc.state.lock().take_events();
+                        checkout = Err(budget_err);
+                    } else {
+                        let mut state = doc.state.lock();
+                        let undo = undo.take().expect("a budgeted batch records its undo log");
+                        state.undo_import(undo, self.pre_batch_frontiers.clone());
+                        if self.has_created_journal {
+                            let created = state.store.take_created_journal();
+                            state.store.remove_created(&created);
+                            self.has_created_journal = false;
+                        }
+                        drop(state);
+                        checkout = Err(budget_err);
+                    }
+                }
+            }
             if let Err(e) = &checkout {
                 // Validation precedes mutation: state is still at its pre-batch
                 // version, or at the bootstrapped snapshot. Restore the matching
@@ -4581,13 +5401,21 @@ impl BatchImportGuard<'_> {
                 let mut oplog = doc.oplog.lock();
                 let mut state = doc.state.lock();
                 if let Some(checkpoint) = self.snapshot_checkpoint.take() {
+                    let _ = state.take_events();
                     state.reset_to_empty_for_failed_snapshot_import();
                     oplog.reset_to_empty_for_failed_snapshot_import(checkpoint.arena, &mut state);
                     oplog.pending_changes = checkpoint.pending;
                     for id in checkpoint.empty_containers {
                         state.ensure_container(&id);
                     }
+                    oplog.set_block_cache(doc.kv_block_cache.clone());
+                    state.set_block_cache(doc.kv_block_cache.clone());
                 } else {
+                    if self.has_created_journal {
+                        let created = state.store.take_created_journal();
+                        state.store.remove_created(&created);
+                        self.has_created_journal = false;
+                    }
                     oplog.rollback_import(&mut state);
                 }
                 drop(state);
@@ -4597,10 +5425,40 @@ impl BatchImportGuard<'_> {
                 *doc.diff_calculator.lock() = DiffCalculator::new(true);
                 doc.set_detached(false);
             } else {
+                if self.has_created_journal {
+                    let _ = doc.state.lock().store.take_created_journal();
+                    self.has_created_journal = false;
+                }
+                doc.oplog.lock().commit_import_rollback();
+                if self.has_doc_budget {
+                    doc.emit_events();
+                }
+            }
+        } else if self.has_import_rollback {
+            if self.has_doc_budget {
+                doc.enforce_memory_watermarks_with_txn_bytes(0, false);
+                if let Err(budget_err) =
+                    doc.check_doc_budget_with_txn_bytes_and_linear(0, Some(self.linear_before))
+                {
+                    let mut oplog = doc.oplog.lock();
+                    let mut state = doc.state.lock();
+                    oplog.rollback_import(&mut state);
+                    drop(state);
+                    drop(oplog);
+                    *doc.diff_calculator.lock() = DiffCalculator::new(true);
+                    checkout = Err(budget_err);
+                } else {
+                    doc.oplog.lock().commit_import_rollback();
+                }
+            } else {
                 doc.oplog.lock().commit_import_rollback();
             }
         }
 
+        doc.enforce_memory_watermarks_with_txn_bytes(0, false);
+        if global_budget_flags() != 0 {
+            doc.refresh_cached_doc_bytes_unlocked();
+        }
         let pending = doc.oplog.lock().pending_changes.version_range();
         doc._renew_txn_if_auto_commit_with_guard(options, txn);
         (checkout.err(), pending)
@@ -5448,6 +6306,1902 @@ mod test {
     }
 }
 
+const BUDGET_FLAG_MAX_DOC: u8 = 1 << 0;
+const BUDGET_FLAG_WATERMARKS: u8 = 1 << 1;
+const BUDGET_FLAG_MAX_IMPORT_BLOB: u8 = 1 << 2;
+
+static GLOBAL_BUDGET_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static NEXT_POOL_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static GLOBAL_ACCESS_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static GLOBAL_POOL: std::sync::OnceLock<GlobalMemoryPool> = std::sync::OnceLock::new();
+
+/// Whether a document's cached statistics (`cached_doc_bytes`) may be stale.
+///
+/// The native global estimate (no allocator tracker) used to recompute every live
+/// document's statistics on each budgeted commit, so a commit cost grew with the
+/// number of documents. Now it sums the cached values and recomputes only
+/// documents marked here ([`GlobalMemoryPool::refresh_dirty_docs`]).
+///
+/// Marking rule: whatever can change a component of [`DocMemoryStats`] marks the
+/// document while it holds the lock that component is read under, or after the
+/// change. The refresh clears the flag after taking the document's locks and before
+/// reading the components, so a change is either seen by that read or marks again.
+/// Marks come from every acquisition of the document's `Txn`, `OpLog`, `DocState`
+/// and `DiffCalculator` locks (`LoroMutex::set_stats_dirty`), arena writes
+/// (`SharedArena::mark_stats_dirty`; handlers register containers without the
+/// document's locks), change blocks parsed by the creator resolver, and undo
+/// managers (`MarkedUndoGuard`). A flag going from clean to dirty adds the id to
+/// `GlobalMemoryPool::dirty_docs`, also without a global budget (the statistics
+/// APIs work without one); a document starts dirty and queued. The set holds live
+/// documents only (`unregister` removes the id), and a document that is never
+/// refreshed is added once.
+#[derive(Debug)]
+pub(crate) struct DocStatsDirty {
+    doc_id: u64,
+    dirty: std::sync::atomic::AtomicBool,
+}
+
+impl DocStatsDirty {
+    fn new(doc_id: u64) -> Self {
+        Self {
+            doc_id,
+            // Queued by `GlobalMemoryPool::register`.
+            dirty: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Marks the statistics stale. Cheap when already dirty (one relaxed load); a
+    /// stale `true` read cannot skip a needed push, since the refresh that cleared
+    /// it held the lock the marker holds now, or ran before the change it marks.
+    #[inline]
+    pub(crate) fn mark(&self) {
+        if !self.dirty.load(Relaxed) {
+            self.mark_slow();
+        }
+    }
+
+    #[cold]
+    fn mark_slow(&self) {
+        if self.doc_id == 0 || self.dirty.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if let Some(pool) = GLOBAL_POOL.get() {
+            pool.push_dirty(self.doc_id);
+        }
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[inline]
+pub(crate) fn global_budget_flags() -> u8 {
+    GLOBAL_BUDGET_FLAGS.load(Acquire)
+}
+
+#[inline]
+fn global_watermarks_active() -> bool {
+    global_budget_flags() & BUDGET_FLAG_WATERMARKS != 0
+}
+
+fn compute_global_flags(budget: &GlobalMemoryBudget) -> u8 {
+    let mut flags = 0u8;
+    let has_wasm_limit = cfg!(target_arch = "wasm32") && budget.max_wasm_linear_bytes.is_some();
+    if budget.max_heap_bytes.is_some() || has_wasm_limit {
+        flags |= BUDGET_FLAG_MAX_DOC | BUDGET_FLAG_MAX_IMPORT_BLOB;
+    }
+    if budget.effective_high_watermark().is_some()
+        || budget.max_kv_block_cache_bytes.is_some()
+        || has_wasm_limit
+    {
+        flags |= BUDGET_FLAG_WATERMARKS;
+    }
+    if budget.max_import_blob_bytes.is_some() {
+        flags |= BUDGET_FLAG_MAX_IMPORT_BLOB;
+    }
+    flags
+}
+
+fn make_global_budget_err(used: u64, limit: u64) -> LoroError {
+    let limit_usize = usize::try_from(limit)
+        .unwrap_or(usize::MAX - 1)
+        .min(usize::MAX - 1);
+    let used_usize = usize::try_from(used)
+        .unwrap_or(usize::MAX)
+        .max(limit_usize.saturating_add(1));
+    LoroError::memory_limit_exceeded(MemoryLimitKind::GlobalBudget, used_usize, limit_usize)
+}
+
+/// Registered documents and the drop gate each shares with its handles.
+type RegistryEntries = FxHashMap<u64, (std::sync::Weak<LoroDocInner>, Arc<crate::DocDropGate>)>;
+
+struct GlobalMemoryPool {
+    budget: parking_lot::Mutex<GlobalMemoryBudget>,
+    docs: parking_lot::Mutex<RegistryEntries>,
+    total_cached_doc_bytes: std::sync::atomic::AtomicU64,
+    /// Sum of `cached_spilled_bytes`.
+    total_cached_spilled_bytes: std::sync::atomic::AtomicU64,
+    /// Live documents whose cached statistics may be stale; see [`DocStatsDirty`].
+    dirty_docs: parking_lot::Mutex<FxHashSet<u64>>,
+    global_block_cache: SharedBlockCache,
+    /// See [`GlobalMemoryPool::soft_reclaim_backed_off`].
+    soft_backoff: SoftBackoff,
+}
+
+/// Skips soft sweeps that recently failed to reach their target: one global
+/// (`GlobalMemoryPool::soft_backoff`) and one per document
+/// (`LoroDocInner::soft_backoff`, used by `enforce_watermarks_with_budget_locked`).
+#[derive(Debug)]
+pub(crate) struct SoftBackoff {
+    /// Usage left by the last sweep that could not reach its target, or 0.
+    floor: std::sync::atomic::AtomicU64,
+    /// Sweeps skipped since `floor` was set.
+    skips: std::sync::atomic::AtomicU32,
+}
+
+impl SoftBackoff {
+    pub(crate) const fn new() -> Self {
+        Self {
+            floor: std::sync::atomic::AtomicU64::new(0),
+            skips: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Whether a sweep should be skipped for usage `used` above the high
+    /// watermark: the previous sweep could not get below its target, usage has
+    /// not grown meaningfully since, and fewer than [`SOFT_BACKOFF_MAX_SKIPS`]
+    /// checks were skipped.
+    fn backed_off(&self, used: u64) -> bool {
+        let floor = self.floor.load(Relaxed);
+        if floor == 0 {
+            return false;
+        }
+        let growth = (floor / SOFT_BACKOFF_GROWTH_DIVISOR).max(SOFT_BACKOFF_MIN_GROWTH);
+        used <= floor.saturating_add(growth)
+            && self.skips.fetch_add(1, Relaxed) < SOFT_BACKOFF_MAX_SKIPS
+    }
+
+    fn record(&self, reached_target: bool, used: u64) {
+        if reached_target {
+            self.reset();
+        } else {
+            self.skips.store(0, Relaxed);
+            self.floor.store(used.max(1), Relaxed);
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        if self.floor.load(Relaxed) != 0 {
+            self.floor.store(0, Relaxed);
+        }
+    }
+}
+
+/// A failed soft sweep is retried once usage grows by this fraction of what it
+/// left (at least [`SOFT_BACKOFF_MIN_GROWTH`]) ...
+const SOFT_BACKOFF_GROWTH_DIVISOR: u64 = 8;
+const SOFT_BACKOFF_MIN_GROWTH: u64 = 256 * 1024;
+/// ... or after this many skipped checks, so documents that became idle in the
+/// meantime are still reclaimed without growth.
+const SOFT_BACKOFF_MAX_SKIPS: u32 = 64;
+
+impl GlobalMemoryPool {
+    fn new() -> Self {
+        Self {
+            budget: parking_lot::Mutex::new(GlobalMemoryBudget::default()),
+            docs: parking_lot::Mutex::new(FxHashMap::default()),
+            total_cached_doc_bytes: std::sync::atomic::AtomicU64::new(0),
+            total_cached_spilled_bytes: std::sync::atomic::AtomicU64::new(0),
+            dirty_docs: parking_lot::Mutex::new(FxHashSet::default()),
+            global_block_cache: SharedBlockCache::new(DEFAULT_GLOBAL_BLOCK_CACHE_BYTES),
+            soft_backoff: SoftBackoff::new(),
+        }
+    }
+
+    /// Whether the soft sweep should be skipped for usage `used` above the high
+    /// watermark: the previous sweep could not get below its target, usage has
+    /// not grown meaningfully since, and fewer than [`SOFT_BACKOFF_MAX_SKIPS`]
+    /// checks were skipped. Each sweep runs Stage 1 (including a full KV flush
+    /// and arena copy) on the active document, so repeating one that cannot
+    /// succeed made every commit pay for it. Hard admission does not use this.
+    fn soft_reclaim_backed_off(&self, used: u64) -> bool {
+        self.soft_backoff.backed_off(used)
+    }
+
+    fn record_soft_sweep_result(&self, reached_target: bool, used: u64) {
+        self.soft_backoff.record(reached_target, used);
+    }
+
+    fn register(
+        &self,
+        id: u64,
+        weak: std::sync::Weak<LoroDocInner>,
+        gate: Arc<crate::DocDropGate>,
+    ) {
+        self.docs.lock().insert(id, (weak, gate));
+        self.push_dirty(id);
+    }
+
+    fn unregister(&self, id: u64, last_cached_bytes: usize, last_spilled_bytes: usize) {
+        self.docs.lock().remove(&id);
+        self.dirty_docs.lock().remove(&id);
+        sub_saturating(&self.total_cached_doc_bytes, last_cached_bytes);
+        sub_saturating(&self.total_cached_spilled_bytes, last_spilled_bytes);
+    }
+
+    fn live_doc_count(&self) -> usize {
+        self.docs
+            .lock()
+            .values()
+            .filter(|(weak, _)| weak.strong_count() > 0)
+            .count()
+    }
+
+    fn push_dirty(&self, id: u64) {
+        self.dirty_docs.lock().insert(id);
+    }
+
+    /// Recomputes the statistics of the documents marked dirty, except `active_id`,
+    /// which stays queued: its caller supplies its bytes and keeps changing it.
+    /// A document that is busy (or whose undo manager is) keeps its cached value and
+    /// stays queued, as the full scan used to keep a busy document's cached value.
+    fn refresh_dirty_docs(&self, active_id: Option<u64>) {
+        let ids = std::mem::take(&mut *self.dirty_docs.lock());
+        if ids.is_empty() {
+            return;
+        }
+        let mut requeue = Vec::new();
+        let targets: Vec<_> = {
+            let docs = self.docs.lock();
+            ids.into_iter()
+                .filter_map(|id| {
+                    if active_id == Some(id) {
+                        requeue.push(id);
+                        return None;
+                    }
+                    docs.get(&id)
+                        .map(|(weak, gate)| (id, weak.clone(), gate.clone()))
+                })
+                .collect()
+        };
+        for (id, weak, gate) in targets {
+            #[cfg(test)]
+            DIRTY_REFRESHES.with(|n| n.set(n.get() + 1));
+            // A document that cannot be upgraded is being dropped and unregisters.
+            if let Some(doc) = RegistryRef::upgrade(&weak, gate) {
+                if !refresh_cached_doc_bytes_for_inner(&doc) {
+                    requeue.push(id);
+                }
+            }
+        }
+        if !requeue.is_empty() {
+            self.dirty_docs.lock().extend(requeue);
+        }
+    }
+
+    /// The estimated bytes of all documents plus the global block cache, and their
+    /// spilled bytes, with `active`'s bytes as given. Costs the number of documents
+    /// changed since the last call, not the number of documents.
+    fn estimated_docs_total(&self, active: Option<(&LoroDocInner, usize)>) -> (u64, u64) {
+        self.refresh_dirty_docs(active.map(|(doc, _)| doc.pool_doc_id));
+        if let Some((doc, bytes)) = active {
+            self.update_cached_doc_bytes(doc, bytes, None);
+        }
+        #[cfg(debug_assertions)]
+        self.debug_assert_clean_caches_fresh(active.map(|(doc, _)| doc.pool_doc_id));
+        (
+            self.cached_estimated_total(),
+            self.total_cached_spilled_bytes.load(Relaxed),
+        )
+    }
+
+    /// Debug builds: every clean document's cache equals a fresh computation.
+    /// Skips documents that are busy, dirty, or marked while being checked.
+    #[cfg(debug_assertions)]
+    fn debug_assert_clean_caches_fresh(&self, active_id: Option<u64>) {
+        for doc in self.snapshot_live_docs() {
+            if Some(doc.pool_doc_id) == active_id || doc.stats_dirty.is_dirty() {
+                continue;
+            }
+            // Compare while the statistics locks are held. A writer and another
+            // refresh can otherwise replace the cache after the fresh read.
+            let _ = fresh_doc_stats_unmarked(&doc);
+        }
+    }
+
+    /// Upgrades every registered document under its drop gate. The returned
+    /// references release under the same gate, so they never make a document's
+    /// last handle skip its final commit (see `crate::DocDropGate`). The registry
+    /// lock is not held while a gate is taken: the final drop of a document may
+    /// run under its gate and then takes the registry lock to unregister.
+    fn snapshot_live_docs(&self) -> Vec<RegistryRef> {
+        let entries: Vec<_> = {
+            let mut docs = self.docs.lock();
+            docs.retain(|_, (weak, _)| weak.strong_count() > 0);
+            docs.values()
+                .map(|(weak, gate)| (weak.clone(), gate.clone()))
+                .collect()
+        };
+        entries
+            .into_iter()
+            .filter_map(|(weak, gate)| RegistryRef::upgrade(&weak, gate))
+            .collect()
+    }
+
+    fn update_cached_doc_bytes(
+        &self,
+        doc: &LoroDocInner,
+        new_bytes: usize,
+        new_spilled: Option<usize>,
+    ) {
+        swap_cached(
+            &doc.cached_doc_bytes,
+            &self.total_cached_doc_bytes,
+            new_bytes,
+        );
+        if let Some(spilled) = new_spilled {
+            swap_cached(
+                &doc.cached_spilled_bytes,
+                &self.total_cached_spilled_bytes,
+                spilled,
+            );
+        }
+    }
+
+    fn current_heap_or_estimated_used(&self) -> u64 {
+        if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.estimated_docs_total(None).0
+        }
+    }
+
+    fn cached_estimated_total(&self) -> u64 {
+        self.total_cached_doc_bytes
+            .load(Relaxed)
+            .saturating_add(self.global_block_cache.used_bytes() as u64)
+    }
+
+    fn reclaim_idle_docs_to_target(
+        &self,
+        live: &[RegistryRef],
+        exclude_doc_id: Option<u64>,
+        target_bytes: u64,
+        force_full: bool,
+    ) -> u64 {
+        let mut cur_used = if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.cached_estimated_total()
+        };
+        if !force_full && cur_used <= target_bytes {
+            return cur_used;
+        }
+        if self.global_block_cache.used_bytes() > 0 {
+            self.global_block_cache.clear();
+            cur_used = if heap_tracker_active() {
+                tracked_allocated_heap_bytes()
+            } else {
+                self.cached_estimated_total()
+            };
+            if !force_full && cur_used <= target_bytes {
+                return cur_used;
+            }
+        }
+
+        let mut candidates: Vec<&RegistryRef> = live
+            .iter()
+            .filter(|doc| exclude_doc_id != Some(doc.pool_doc_id))
+            .collect();
+        candidates.sort_by_key(|doc| doc.last_access_tick.load(Relaxed));
+
+        let mut stage1_done = FxHashSet::default();
+        // Pass 1 (Stage 1): clear auxiliary caches, compact history, flush KV, shrink spare arena.
+        for doc in &candidates {
+            if !force_full && cur_used <= target_bytes {
+                break;
+            }
+            if try_reclaim_idle_doc(doc, false, 0, false) {
+                stage1_done.insert(doc.pool_doc_id);
+            }
+            cur_used = if heap_tracker_active() {
+                tracked_allocated_heap_bytes()
+            } else {
+                self.cached_estimated_total()
+            };
+        }
+
+        if !force_full && cur_used <= target_bytes {
+            return cur_used;
+        }
+
+        // Pass 2 (Stage 2): demote cold materialized containers to compressed KV stores (LRU first).
+        for doc in &candidates {
+            if !force_full && cur_used <= target_bytes {
+                break;
+            }
+            let need = if force_full {
+                usize::MAX
+            } else {
+                usize::try_from(cur_used.saturating_sub(target_bytes)).unwrap_or(usize::MAX)
+            };
+            let _ = try_reclaim_idle_doc(doc, true, need, stage1_done.contains(&doc.pool_doc_id));
+            cur_used = if heap_tracker_active() {
+                tracked_allocated_heap_bytes()
+            } else {
+                self.cached_estimated_total()
+            };
+        }
+
+        cur_used
+    }
+
+    fn reclaim_for_watermark(
+        &self,
+        target_bytes: u64,
+        exclude_doc_id: Option<u64>,
+        force_full: bool,
+    ) {
+        if !heap_tracker_active() {
+            let _ = self.estimated_docs_total(None);
+        }
+        let live = self.snapshot_live_docs();
+        let _ = self.reclaim_idle_docs_to_target(&live, exclude_doc_id, target_bytes, force_full);
+    }
+
+    fn enforce_global_watermarks_for_active(
+        &self,
+        active_doc: &LoroDoc,
+        oplog: &OpLog,
+        state: &mut DocState,
+        uncommitted_txn_bytes: usize,
+        active_bytes: usize,
+    ) {
+        self.update_cached_doc_bytes(active_doc, active_bytes, None);
+        let budget = self.budget.lock().clone();
+        let Some(high) = budget.effective_high_watermark() else {
+            return;
+        };
+        let target = budget.effective_target_watermark().unwrap_or(high);
+        let initial_used = if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.estimated_docs_total(Some((active_doc, active_bytes)))
+                .0
+        };
+        let wasm_pressure = cfg!(target_arch = "wasm32")
+            && budget.wasm_heap_pressure(wasm_linear_memory_bytes(), initial_used);
+        if initial_used <= high && !wasm_pressure {
+            self.record_soft_sweep_result(true, initial_used);
+            return;
+        }
+
+        let effective_target = if wasm_pressure && initial_used <= high {
+            target.min(budget.max_wasm_linear_bytes.unwrap().saturating_mul(65) / 100)
+        } else {
+            target
+        };
+        if initial_used <= effective_target && !wasm_pressure {
+            return;
+        }
+        if self.soft_reclaim_backed_off(initial_used) {
+            return;
+        }
+
+        let live = self.snapshot_live_docs();
+        let mut cur_used = self.reclaim_idle_docs_to_target(
+            &live,
+            Some(active_doc.pool_doc_id),
+            effective_target,
+            false,
+        );
+        if cur_used <= effective_target {
+            self.record_soft_sweep_result(true, cur_used);
+            return;
+        }
+
+        // Fallback: if idle docs alone couldn't meet target, trim Stage 1 + Stage 2 on active doc.
+        #[cfg(test)]
+        ACTIVE_FALLBACK_PASSES.with(|n| n.set(n.get() + 1));
+        state.evict_value_cache_to_bytes(0);
+        state.reclaim_auxiliary_caches();
+        oplog.compact_history();
+        oplog.flush_kv();
+        oplog.with_history_cache(|h| h.free_all());
+        oplog.arena.shrink_spare_capacity();
+        active_doc.diff_calculator.lock().reclaim_cold_caches(0);
+        let _ = shrink_undo_managers_inner(active_doc);
+
+        let _ = active_doc.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+        cur_used = if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.cached_estimated_total()
+        };
+        if cur_used <= effective_target {
+            self.record_soft_sweep_result(true, cur_used);
+            return;
+        }
+
+        let need = usize::try_from(cur_used.saturating_sub(effective_target)).unwrap_or(usize::MAX);
+        let target_state_bytes = state
+            .state_estimated_bytes()
+            .saturating_sub(need.saturating_mul(3) / 2);
+        state.demote_cold_states(target_state_bytes, &Default::default());
+        state.flush_kv();
+        oplog.flush_kv();
+        let _ = active_doc.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+        cur_used = if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.cached_estimated_total()
+        };
+        self.record_soft_sweep_result(cur_used <= effective_target, cur_used);
+    }
+
+    fn check_global_budget_with_active(
+        &self,
+        active_doc: &LoroDocInner,
+        active_bytes: Option<usize>,
+        linear_before: Option<u64>,
+    ) -> LoroResult<()> {
+        if global_budget_flags() & BUDGET_FLAG_MAX_DOC == 0 {
+            return Ok(());
+        }
+        let budget = self.budget.lock().clone();
+        let used = if heap_tracker_active() {
+            tracked_allocated_heap_bytes()
+        } else {
+            self.estimated_docs_total(active_bytes.map(|b| (active_doc, b)))
+                .0
+        };
+        if let Some(max_heap) = budget.max_heap_bytes {
+            if used > max_heap {
+                return Err(make_global_budget_err(used, max_heap));
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(max_lin) = budget.max_wasm_linear_bytes {
+            let lin_now = wasm_linear_memory_bytes();
+            if lin_now > max_lin {
+                let fits_existing_pages = linear_before.is_some_and(|before| {
+                    lin_now <= before && heap_fits_existing_pages(max_lin, used)
+                });
+                if !fits_existing_pages {
+                    return Err(make_global_budget_err(lin_now, max_lin));
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = linear_before;
+        Ok(())
+    }
+}
+
+impl LoroDocInner {
+    /// On the inner document, so the registry can arm a scope without creating a
+    /// temporary `LoroDoc` handle while it holds the transaction lock.
+    pub(crate) fn arm_budget_scope_on_txn(&self, txn: &mut Transaction) {
+        if txn.budget_base_scope().is_some() || txn.has_rollback_scope() {
+            return;
+        }
+        txn.doc_budget_limit = self.memory_budget.lock().max_doc_bytes;
+        let id = LoroDoc::next_rollback_scope_id();
+        txn.begin_budget_rollback_scope(id);
+        self.state.lock().begin_local_rollback(id);
+    }
+}
+
+/// A temporary strong reference taken by the global registry. See
+/// [`GlobalMemoryPool::snapshot_live_docs`].
+pub(crate) struct RegistryRef {
+    doc: Option<Arc<LoroDocInner>>,
+    gate: Arc<crate::DocDropGate>,
+}
+
+impl RegistryRef {
+    #[cfg(test)]
+    fn from_doc(doc: &LoroDoc) -> Self {
+        let gate = doc.drop_gate.clone();
+        let weak = Arc::downgrade(&doc.inner);
+        Self::upgrade(&weak, gate).unwrap()
+    }
+
+    fn upgrade(
+        weak: &std::sync::Weak<LoroDocInner>,
+        gate: Arc<crate::DocDropGate>,
+    ) -> Option<Self> {
+        let doc = {
+            let mut refs = gate.registry_refs.lock_ignoring_poison();
+            let doc = weak.upgrade()?;
+            *refs += 1;
+            doc
+        };
+        Some(Self {
+            doc: Some(doc),
+            gate,
+        })
+    }
+}
+
+impl std::ops::Deref for RegistryRef {
+    type Target = Arc<LoroDocInner>;
+
+    fn deref(&self) -> &Self::Target {
+        self.doc
+            .as_ref()
+            .expect("registry reference is alive until drop")
+    }
+}
+
+impl Drop for RegistryRef {
+    fn drop(&mut self) {
+        let mut refs = self.gate.registry_refs.lock_ignoring_poison();
+        // Drop before decrementing: the gate must never see this reference in
+        // `strong_count` without also seeing it in `registry_refs`. If this was
+        // the last reference, the last handle has already committed.
+        drop(self.doc.take());
+        *refs -= 1;
+    }
+}
+
+fn global_pool() -> &'static GlobalMemoryPool {
+    GLOBAL_POOL.get_or_init(GlobalMemoryPool::new)
+}
+
+pub(crate) fn unregister_doc_from_global_pool(
+    pool_doc_id: u64,
+    last_cached_bytes: usize,
+    last_spilled_bytes: usize,
+) {
+    if pool_doc_id == 0 {
+        return;
+    }
+    if let Some(pool) = GLOBAL_POOL.get() {
+        pool.unregister(pool_doc_id, last_cached_bytes, last_spilled_bytes);
+    }
+}
+
+fn shrink_undo_managers_inner(doc: &LoroDocInner) -> usize {
+    let managers = {
+        let mut guard = doc.undo_managers.lock();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()
+    };
+    let mut freed = 0usize;
+    for manager in managers {
+        if let Some(lock) = manager.try_lock() {
+            if let Ok(mut inner) = lock.try_borrow_mut() {
+                let before = inner.used_bytes();
+                inner.shrink_to_fit();
+                let after = inner.used_bytes();
+                freed = freed.saturating_add(before.saturating_sub(after));
+            }
+        }
+    }
+    freed
+}
+
+/// The undo managers' bytes, and whether every manager could be read.
+fn sum_undo_bytes_inner(doc: &LoroDocInner) -> (usize, bool) {
+    let managers = {
+        let mut guard = doc.undo_managers.lock();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect::<Vec<_>>()
+    };
+    let mut total = 0usize;
+    let mut complete = true;
+    for manager in managers {
+        match manager.try_lock() {
+            Some(lock) => match lock.try_borrow() {
+                Ok(inner) => total = total.saturating_add(inner.used_bytes()),
+                Err(_) => complete = false,
+            },
+            None => complete = false,
+        }
+    }
+    (total, complete)
+}
+
+fn compute_doc_stats_locked_inner(
+    doc: &LoroDocInner,
+    oplog: &OpLog,
+    state: &DocState,
+    uncommitted_txn_bytes: usize,
+    try_diff_only: bool,
+) -> DocMemoryStats {
+    let diff_calc_bytes = if try_diff_only {
+        doc.diff_calculator
+            .try_lock()
+            .map_or(0, |d| d.estimated_bytes())
+    } else {
+        doc.diff_calculator.lock().estimated_bytes()
+    };
+    let undo_bytes = sum_undo_bytes_inner(doc).0;
+    let stats = doc_stats_from_parts(
+        doc,
+        oplog,
+        state,
+        uncommitted_txn_bytes,
+        diff_calc_bytes,
+        undo_bytes,
+    );
+    if doc.pool_doc_id != 0 {
+        if let Some(pool) = GLOBAL_POOL.get() {
+            pool.update_cached_doc_bytes(doc, stats.total_bytes, Some(stats.spilled_disk_bytes));
+        } else {
+            doc.cached_doc_bytes.store(stats.total_bytes, Release);
+            doc.cached_spilled_bytes
+                .store(stats.spilled_disk_bytes, Release);
+        }
+    }
+    stats
+}
+
+/// The statistics from their parts; no side effects on the caches.
+fn doc_stats_from_parts(
+    doc: &LoroDocInner,
+    oplog: &OpLog,
+    state: &DocState,
+    uncommitted_txn_bytes: usize,
+    diff_calc_bytes: usize,
+    undo_bytes: usize,
+) -> DocMemoryStats {
+    let oplog_mem = oplog.estimated_memory_breakdown();
+    let state_bytes = state.state_estimated_bytes();
+    let value_cache_bytes = state.value_cache_bytes();
+    let state_kv_bytes = state.kv_estimated_bytes();
+    let state_spilled = state.spilled_disk_bytes();
+    let kv_bytes = state_kv_bytes.saturating_add(oplog_mem.change_kv_bytes);
+    let block_cache_bytes = doc.kv_block_cache.local_used_bytes();
+    let spilled_disk_bytes = state_spilled.saturating_add(oplog_mem.spilled_disk_bytes);
+
+    let total_bytes = state_bytes
+        .saturating_add(value_cache_bytes)
+        .saturating_add(kv_bytes)
+        .saturating_add(block_cache_bytes)
+        .saturating_add(oplog_mem.change_cache_bytes)
+        .saturating_add(oplog_mem.dag_bytes)
+        .saturating_add(oplog_mem.arena_bytes)
+        .saturating_add(oplog_mem.pending_bytes)
+        .saturating_add(oplog_mem.history_cache_bytes)
+        .saturating_add(diff_calc_bytes)
+        .saturating_add(undo_bytes)
+        .saturating_add(uncommitted_txn_bytes);
+
+    DocMemoryStats {
+        total_bytes,
+        state_bytes,
+        value_cache_bytes,
+        kv_bytes,
+        block_cache_bytes,
+        change_cache_bytes: oplog_mem.change_cache_bytes,
+        dag_bytes: oplog_mem.dag_bytes,
+        arena_bytes: oplog_mem.arena_bytes,
+        pending_bytes: oplog_mem.pending_bytes,
+        history_cache_bytes: oplog_mem.history_cache_bytes,
+        diff_calc_bytes,
+        undo_bytes,
+        uncommitted_txn_bytes,
+        spilled_disk_bytes,
+    }
+}
+
+/// Recomputes `doc`'s cached statistics if none of its locks (nor its undo
+/// managers) are busy, and clears its dirty flag. Returns `false`, leaving the
+/// flag set, when it could not; the caller keeps the document queued. Takes the
+/// locks without marking: this is the reader the marks are for (see
+/// [`DocStatsDirty`]).
+fn refresh_cached_doc_bytes_for_inner(doc: &LoroDocInner) -> bool {
+    let Some(txn) = doc.txn.try_lock_unmarked() else {
+        return false;
+    };
+    let Some(oplog) = doc.oplog.try_lock_unmarked() else {
+        return false;
+    };
+    let Some(state) = doc.state.try_lock_unmarked() else {
+        return false;
+    };
+    let Some(diff_calc) = doc.diff_calculator.try_lock_unmarked() else {
+        return false;
+    };
+    // Clear before reading: a change made from now on marks again.
+    doc.stats_dirty
+        .dirty
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let uncommitted = txn
+        .as_ref()
+        .map_or(0, Transaction::estimated_uncommitted_bytes);
+    let (undo_bytes, undo_complete) = sum_undo_bytes_inner(doc);
+    let stats = doc_stats_from_parts(
+        doc,
+        &oplog,
+        &state,
+        uncommitted,
+        diff_calc.estimated_bytes(),
+        undo_bytes,
+    );
+    if doc.pool_doc_id != 0 {
+        if let Some(pool) = GLOBAL_POOL.get() {
+            pool.update_cached_doc_bytes(doc, stats.total_bytes, Some(stats.spilled_disk_bytes));
+        }
+    }
+    if !undo_complete {
+        doc.stats_dirty
+            .dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        return false;
+    }
+    true
+}
+
+/// `doc`'s statistics, computed without marking it or updating its cache, or
+/// `None` if something is busy.
+#[cfg(debug_assertions)]
+fn fresh_doc_stats_unmarked(doc: &LoroDocInner) -> Option<DocMemoryStats> {
+    let txn = doc.txn.try_lock_unmarked()?;
+    let oplog = doc.oplog.try_lock_unmarked()?;
+    let state = doc.state.try_lock_unmarked()?;
+    let diff_calc = doc.diff_calculator.try_lock_unmarked()?;
+    let (undo_bytes, complete) = sum_undo_bytes_inner(doc);
+    if !complete {
+        return None;
+    }
+    let uncommitted = txn
+        .as_ref()
+        .map_or(0, Transaction::estimated_uncommitted_bytes);
+    let stats = doc_stats_from_parts(
+        doc,
+        &oplog,
+        &state,
+        uncommitted,
+        diff_calc.estimated_bytes(),
+        undo_bytes,
+    );
+    if !doc.stats_dirty.is_dirty() {
+        let cached = doc
+            .cached_doc_bytes
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            cached, stats.total_bytes,
+            "doc {} is not marked dirty but its cached statistics are stale: {stats:?}",
+            doc.pool_doc_id,
+        );
+    }
+    Some(stats)
+}
+
+fn swap_cached(
+    cached: &std::sync::atomic::AtomicUsize,
+    total: &std::sync::atomic::AtomicU64,
+    new: usize,
+) {
+    let prev = cached.swap(new, AcqRel);
+    if new > prev {
+        total.fetch_add((new - prev) as u64, Relaxed);
+    } else if new < prev {
+        sub_saturating(total, prev - new);
+    }
+}
+
+fn sub_saturating(total: &std::sync::atomic::AtomicU64, diff: usize) {
+    if diff > 0 {
+        let diff = diff as u64;
+        let _ = total.fetch_update(Relaxed, Relaxed, |cur| Some(cur.saturating_sub(diff)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static IDLE_STAGE1_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ACTIVE_FALLBACK_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DIRTY_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static DOC_STAGE1_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn try_reclaim_idle_doc(
+    doc: &Arc<LoroDocInner>,
+    stage2: bool,
+    target_reduction_bytes: usize,
+    stage1_completed: bool,
+) -> bool {
+    let Some(txn_guard) = doc.txn.try_lock() else {
+        return false;
+    };
+    if txn_guard
+        .as_ref()
+        .is_some_and(|txn| !txn.is_empty() || txn.has_rollback_scope())
+    {
+        return false;
+    }
+    let Some(oplog) = doc.oplog.try_lock() else {
+        return false;
+    };
+    if oplog.batch_importing || oplog.has_import_rollback() || oplog.dag.has_pending_txn() {
+        return false;
+    }
+    let Some(mut state) = doc.state.try_lock() else {
+        return false;
+    };
+
+    if !stage1_completed {
+        #[cfg(test)]
+        IDLE_STAGE1_PASSES.with(|n| n.set(n.get() + 1));
+        state.evict_value_cache_to_bytes(0);
+        if !doc.kv_block_cache.is_delegating_to_parent() {
+            doc.kv_block_cache.clear();
+        }
+        state.reclaim_auxiliary_caches();
+        oplog.compact_history();
+        oplog.flush_kv();
+        oplog.with_history_cache(|h| h.free_all());
+        oplog.arena.shrink_spare_capacity();
+        if let Some(mut diff_calc) = doc.diff_calculator.try_lock() {
+            diff_calc.reclaim_cold_caches(0);
+        }
+        let _ = shrink_undo_managers_inner(doc);
+    }
+
+    if stage2 {
+        let cur_state_bytes = state.state_estimated_bytes();
+        let target_state_bytes = if target_reduction_bytes == usize::MAX {
+            0
+        } else {
+            let demote_budget = target_reduction_bytes.saturating_mul(3) / 2;
+            cur_state_bytes.saturating_sub(demote_budget)
+        };
+        state.demote_cold_states(target_state_bytes, &Default::default());
+        state.flush_kv();
+        oplog.flush_kv();
+    }
+
+    let _ = compute_doc_stats_locked_inner(doc, &oplog, &state, 0, true);
+    true
+}
+
+/// Configures process-wide (or WASM-instance-wide) memory watermarks, shared KV block
+/// cache size, and hard heap / linear-memory limits across all live [`LoroDoc`] instances.
+pub fn set_global_memory_budget(budget: GlobalMemoryBudget) {
+    let pool = global_pool();
+    let enabled = budget.is_enabled();
+    let flags = compute_global_flags(&budget);
+    pool.global_block_cache
+        .set_max_bytes(budget.effective_block_cache_bytes());
+    *pool.budget.lock() = budget;
+    pool.record_soft_sweep_result(true, 0);
+    GLOBAL_BUDGET_FLAGS.store(flags, Release);
+
+    let live = pool.snapshot_live_docs();
+    if enabled {
+        let arm_hard_scope = flags & BUDGET_FLAG_MAX_DOC != 0;
+        for doc in &live {
+            doc.kv_block_cache
+                .set_parent(Some(&pool.global_block_cache));
+            // Marks made while no budget was set did not queue the document.
+            if !refresh_cached_doc_bytes_for_inner(doc) {
+                pool.push_dirty(doc.pool_doc_id);
+            }
+            if arm_hard_scope {
+                if let Some(mut txn_guard) = doc.txn.try_lock() {
+                    if let Some(txn) = txn_guard.as_mut() {
+                        if txn.is_empty()
+                            && !txn.has_rollback_scope()
+                            && txn.budget_base_scope().is_none()
+                        {
+                            doc.arm_budget_scope_on_txn(txn);
+                        }
+                    }
+                }
+            }
+        }
+        if flags & BUDGET_FLAG_WATERMARKS != 0 {
+            let high = pool.budget.lock().effective_high_watermark();
+            let target = pool.budget.lock().effective_target_watermark();
+            if let Some(h) = high {
+                let used = pool.current_heap_or_estimated_used();
+                if used > h {
+                    pool.reclaim_for_watermark(target.unwrap_or(h), None, false);
+                }
+            }
+        }
+    } else {
+        for doc in &live {
+            doc.kv_block_cache.set_parent(None);
+        }
+        pool.global_block_cache.clear();
+    }
+}
+
+/// Returns a snapshot of the active [`GlobalMemoryBudget`] configuration.
+pub fn global_memory_budget() -> GlobalMemoryBudget {
+    global_pool().budget.lock().clone()
+}
+
+/// Returns global memory statistics across all live [`LoroDoc`] instances and the active
+/// global allocator (if tracked, as on WASM).
+pub fn global_memory_stats() -> GlobalMemoryStats {
+    let pool = global_pool();
+    let live_doc_count = pool.live_doc_count();
+    let (docs_estimated_bytes, spilled_disk_bytes) = pool.estimated_docs_total(None);
+    let global_block_cache_bytes = pool.global_block_cache.used_bytes();
+    GlobalMemoryStats {
+        live_doc_count,
+        docs_estimated_bytes,
+        global_block_cache_bytes,
+        allocated_heap_bytes: tracked_allocated_heap_bytes(),
+        peak_allocated_heap_bytes: tracked_peak_allocated_heap_bytes(),
+        wasm_linear_memory_bytes: wasm_linear_memory_bytes(),
+        spilled_disk_bytes,
+    }
+}
+
+/// Runs cross-document reclamation across idle [`LoroDoc`]s down to `target_bytes`
+/// (or full Stage 1 + Stage 2 reclamation across all idle docs when `None`),
+/// returning the observed byte reduction.
+pub fn reclaim_global_memory(target_bytes: Option<u64>) -> u64 {
+    let pool = global_pool();
+    let before = if heap_tracker_active() {
+        tracked_allocated_heap_bytes()
+    } else {
+        pool.estimated_docs_total(None).0
+    };
+    let live = pool.snapshot_live_docs();
+    let (target, force_full) = match target_bytes {
+        Some(t) => (t, false),
+        None => (0, true),
+    };
+    let after = pool.reclaim_idle_docs_to_target(&live, None, target, force_full);
+    before.saturating_sub(after)
+}
+
+/// Returns `true` when running on `wasm32` with an active global WASM linear-memory ceiling.
+#[inline]
+pub fn has_global_wasm_linear_limit() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if global_budget_flags() & BUDGET_FLAG_MAX_DOC == 0 {
+            return false;
+        }
+        global_pool().budget.lock().max_wasm_linear_bytes.is_some()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
+    }
+}
+
+/// Checks whether allocating `needed_bytes` on the WASM heap would exceed
+/// `GlobalMemoryBudget::max_wasm_linear_bytes`, reclaiming idle docs first when possible.
+pub fn preflight_wasm_linear_alloc(needed_bytes: u64) -> LoroResult<()> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = needed_bytes;
+        Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let pool = global_pool();
+        let Some(max_lin) = pool.budget.lock().max_wasm_linear_bytes else {
+            return Ok(());
+        };
+        let mut used = tracked_allocated_heap_bytes();
+        if used.saturating_add(needed_bytes) > max_lin.saturating_mul(80) / 100 {
+            pool.reclaim_for_watermark(max_lin.saturating_mul(50) / 100, None, false);
+            used = tracked_allocated_heap_bytes();
+        }
+        let projected = used.saturating_add(needed_bytes);
+        if projected > max_lin {
+            return Err(make_global_budget_err(projected, max_lin));
+        }
+        Ok(())
+    }
+}
+
+/// Runs full global reclamation and checks whether global usage now satisfies
+/// [`GlobalMemoryBudget::max_heap_bytes`] and [`GlobalMemoryBudget::max_wasm_linear_bytes`].
+pub fn try_reclaim_global_to_budget() -> LoroResult<GlobalMemoryStats> {
+    let _ = reclaim_global_memory(None);
+    let stats = global_memory_stats();
+    let budget = global_memory_budget();
+    if let Some(max_heap) = budget.max_heap_bytes {
+        let used = if heap_tracker_active() {
+            stats.allocated_heap_bytes
+        } else {
+            stats.docs_estimated_bytes
+        };
+        if used > max_heap {
+            return Err(make_global_budget_err(used, max_heap));
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(max_lin) = budget.max_wasm_linear_bytes {
+        if !linear_budget_satisfied(
+            stats.wasm_linear_memory_bytes,
+            max_lin,
+            stats.allocated_heap_bytes,
+        ) {
+            return Err(make_global_budget_err(
+                stats.wasm_linear_memory_bytes,
+                max_lin,
+            ));
+        }
+    }
+    Ok(stats)
+}
+
+/// Live heap that counts as within `max_wasm_linear_bytes` once the linear
+/// memory itself has grown past it: WASM pages never shrink, so only heap use
+/// can come back down. Shared by hard admission (which also requires that the
+/// commit added no pages) and [`try_reclaim_global_to_budget`].
+fn heap_fits_existing_pages(max_lin: u64, used_heap: u64) -> bool {
+    used_heap <= max_lin.saturating_mul(70) / 100
+}
+
+/// Whether `max_wasm_linear_bytes` is met after a reclamation: the pages are
+/// within it, or they grew past it (permanently) but the live heap is back under
+/// the share [`heap_fits_existing_pages`] allows, the same rule `try_commit`
+/// uses. Before, `try_reclaim_global_to_budget` failed forever once the pages
+/// had grown, while commits still succeeded. See context/memory-budget.md,
+/// "WASM linear memory ceiling".
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+fn linear_budget_satisfied(lin_now: u64, max_lin: u64, used_heap: u64) -> bool {
+    lin_now <= max_lin || heap_fits_existing_pages(max_lin, used_heap)
+}
+
+/// Whether the WASM linear memory has grown past
+/// [`GlobalMemoryBudget::max_wasm_linear_bytes`]. It cannot shrink again; an
+/// application may want to recreate the instance once its documents are saved.
+/// Always `false` on native targets.
+pub fn wasm_linear_memory_exceeded() -> bool {
+    let lin = wasm_linear_memory_bytes();
+    global_pool()
+        .budget
+        .lock()
+        .max_wasm_linear_bytes
+        .is_some_and(|max_lin| lin > max_lin)
+}
+
+impl LoroDoc {
+    /// Configures soft memory watermarks and hard memory quotas for this document.
+    /// A new hard document quota applies to the next transaction. Pending edits
+    /// retain the quota captured when that transaction began accepting edits.
+    ///
+    /// If moving the document to a new `spill_dir` fails, the document keeps its
+    /// current storage (and [`Self::memory_budget`] keeps reporting the previous
+    /// directory, so setting the same directory again retries), the failure is
+    /// logged, and the other settings are applied. Use
+    /// [`Self::try_set_memory_budget`] to get the error instead.
+    pub fn set_memory_budget(&self, budget: MemoryBudget) {
+        let _ = self.set_memory_budget_inner(budget, false);
+    }
+
+    /// Like [`Self::set_memory_budget`], but if moving the document to a new
+    /// `spill_dir` fails (the directory cannot be created, or the spilled tables
+    /// cannot be written), returns the error and changes nothing.
+    pub fn try_set_memory_budget(&self, budget: MemoryBudget) -> LoroResult<()> {
+        self.set_memory_budget_inner(budget, true)
+    }
+
+    fn set_memory_budget_inner(&self, mut budget: MemoryBudget, strict: bool) -> LoroResult<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let prev_spill_dir = self.memory_budget.lock().spill_dir.clone();
+            if prev_spill_dir != budget.spill_dir {
+                if let Err(err) = self.switch_spill_backend(budget.spill_dir.as_deref()) {
+                    let err = LoroError::Unknown(
+                        format!("failed to switch the out-of-core spill directory: {err}")
+                            .into_boxed_str(),
+                    );
+                    if strict {
+                        return Err(err);
+                    }
+                    tracing::warn!(dir = ?budget.spill_dir, "{err}");
+                    budget.spill_dir = prev_spill_dir;
+                }
+            }
+        }
+        let _ = strict;
+        #[cfg(not(target_arch = "wasm32"))]
+        if budget.spill_dir.is_some() && budget.effective_high_watermark().is_none() {
+            // A spill directory only chooses where flushed tables live; nothing
+            // flushes automatically without watermarks or `max_doc_bytes`.
+            // See context/memory-budget.md, "Spill directory without a budget".
+            tracing::warn!(
+                dir = ?budget.spill_dir,
+                "spill_dir is set without watermarks or max_doc_bytes: memory moves to disk \
+                 only on reclaim_memory"
+            );
+        }
+        self.soft_backoff.reset();
+        let mut flags = 0u8;
+        if budget.max_doc_bytes.is_some() {
+            flags |= BUDGET_FLAG_MAX_DOC;
+        }
+        if budget.effective_high_watermark().is_some()
+            || budget.max_kv_block_cache_bytes.is_some()
+            || budget.max_decoded_value_cache_bytes.is_some()
+            || budget.max_undo_bytes.is_some()
+        {
+            flags |= BUDGET_FLAG_WATERMARKS;
+        }
+        if budget.max_import_blob_bytes.is_some() {
+            flags |= BUDGET_FLAG_MAX_IMPORT_BLOB;
+        }
+        self.kv_block_cache
+            .set_explicit_max_bytes(budget.max_kv_block_cache_bytes);
+        self.config.set_decoded_value_cache_bytes_limit(
+            budget.max_decoded_value_cache_bytes.unwrap_or(usize::MAX),
+        );
+        let max_pending = budget.max_pending_bytes;
+        let max_undo = budget.max_undo_bytes;
+        let has_max_doc = budget.max_doc_bytes.is_some();
+        *self.memory_budget.lock() = budget;
+        self.budget_flags.store(flags, Release);
+
+        self.oplog.lock().set_max_pending_bytes(max_pending);
+        if let Some(max_undo_bytes) = max_undo {
+            for manager in self.live_undo_managers() {
+                if let Some(lock) = manager.try_lock() {
+                    if let Ok(mut inner) = lock.try_borrow_mut() {
+                        inner.set_max_undo_bytes_from_doc(max_undo_bytes);
+                    };
+                }
+            }
+        }
+
+        if !self.txn.is_held_by_current_thread() {
+            let mut txn_guard = self.txn.lock();
+            if let Some(txn) = txn_guard.as_mut() {
+                if txn.is_empty() && !txn.has_rollback_scope() {
+                    if has_max_doc && txn.budget_base_scope().is_none() {
+                        self.arm_budget_scope_on_txn(txn);
+                    }
+                    txn.doc_budget_limit = self.memory_budget.lock().max_doc_bytes;
+                }
+            }
+        }
+
+        self.enforce_memory_watermarks();
+        Ok(())
+    }
+
+    /// Move the op log and state stores (including a shallow root) to new
+    /// backends: out-of-core files under `dir`, or memory for `None`. Both new
+    /// stores are filled and flushed before either is installed, under the op
+    /// log and state locks, so a failure leaves the current stores in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn switch_spill_backend(&self, dir: Option<&std::path::Path>) -> Result<(), String> {
+        let block_cache = self.kv_block_cache.clone();
+        let (oplog_kv, state_kv): (
+            Box<dyn crate::kv_store::KvStore>,
+            Arc<crate::sync::Mutex<dyn crate::kv_store::KvStore>>,
+        ) = match dir {
+            Some(dir) => {
+                let make = |config: crate::kv_store::MemKvConfig| {
+                    crate::kv_store::FileKvStore::new(dir, config)
+                        .map_err(|e| format!("{}: {e}", dir.display()))
+                };
+                (
+                    Box::new(make(
+                        crate::kv_store::MemKvConfig::default().block_cache(block_cache.clone()),
+                    )?),
+                    Arc::new(crate::sync::Mutex::new(make(
+                        crate::kv_store::MemKvConfig::default()
+                            .should_encode_none(false)
+                            .block_cache(block_cache.clone()),
+                    )?)),
+                )
+            }
+            None => (
+                Box::new(crate::kv_store::MemKvStore::new(
+                    crate::kv_store::MemKvConfig::default().block_cache(block_cache.clone()),
+                )),
+                Arc::new(crate::sync::Mutex::new(crate::kv_store::MemKvStore::new(
+                    crate::kv_store::MemKvConfig::default()
+                        .should_encode_none(false)
+                        .block_cache(block_cache.clone()),
+                ))),
+            ),
+        };
+        let oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        let oplog_kv = oplog.prepare_kv_backend(oplog_kv)?;
+        let state_kv = state.prepare_kv_backend(state_kv)?;
+        oplog.install_kv_backend(oplog_kv);
+        state.install_kv_backend(state_kv);
+        Ok(())
+    }
+
+    /// Returns a clone of the current [`MemoryBudget`] configuration.
+    pub fn memory_budget(&self) -> MemoryBudget {
+        self.memory_budget.lock().clone()
+    }
+
+    #[inline]
+    pub(crate) fn touch_access_tick(&self) {
+        if global_budget_flags() != 0 {
+            let tick = GLOBAL_ACCESS_TICK.fetch_add(1, Relaxed);
+            self.last_access_tick.store(tick, Relaxed);
+        }
+    }
+
+    pub(crate) fn on_commit_completed(&self) {
+        self.touch_access_tick();
+        if self.has_watermark_budget() {
+            self.enforce_memory_watermarks();
+        } else if global_budget_flags() != 0 {
+            self.refresh_cached_doc_bytes_unlocked();
+        }
+    }
+
+    pub(crate) fn refresh_cached_doc_bytes_unlocked(&self) {
+        if self.pool_doc_id == 0 {
+            return;
+        }
+        let uncommitted = if self.txn.is_held_by_current_thread() {
+            0
+        } else {
+            self.txn
+                .try_lock()
+                .and_then(|g| g.as_ref().map(Transaction::estimated_uncommitted_bytes))
+                .unwrap_or(0)
+        };
+        if let (Some(oplog), Some(state)) = (self.oplog.try_lock(), self.state.try_lock()) {
+            let _ = compute_doc_stats_locked_inner(self, &oplog, &state, uncommitted, true);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_max_doc_bytes(&self) -> bool {
+        (self.budget_flags.load(Acquire) | global_budget_flags()) & BUDGET_FLAG_MAX_DOC != 0
+    }
+
+    #[inline]
+    fn has_watermark_budget(&self) -> bool {
+        (self.budget_flags.load(Acquire) | global_budget_flags()) & BUDGET_FLAG_WATERMARKS != 0
+    }
+
+    #[inline]
+    fn has_max_import_blob_bytes(&self) -> bool {
+        (self.budget_flags.load(Acquire) | global_budget_flags()) & BUDGET_FLAG_MAX_IMPORT_BLOB != 0
+    }
+
+    pub fn check_import_blob_limit(&self, len: usize) -> LoroResult<()> {
+        self.preflight_import_bytes(len, false)
+    }
+
+    /// Pre-allocation check called by bindings (such as `loro-wasm`) immediately before copying
+    /// an external `len`-byte buffer into WASM linear memory / Rust heap.
+    pub fn preflight_external_import_alloc(&self, len: usize) -> LoroResult<()> {
+        self.preflight_import_bytes(len, true)
+    }
+
+    fn preflight_import_bytes(&self, len: usize, include_buffer_alloc: bool) -> LoroResult<()> {
+        if !self.has_max_import_blob_bytes() {
+            return Ok(());
+        }
+        if self.budget_flags.load(Acquire) & BUDGET_FLAG_MAX_IMPORT_BLOB != 0 {
+            if let Some(limit) = self.memory_budget.lock().max_import_blob_bytes {
+                if len > limit {
+                    return Err(LoroError::memory_limit_exceeded(
+                        MemoryLimitKind::ImportBlob,
+                        len,
+                        limit,
+                    ));
+                }
+            }
+        }
+        if global_budget_flags() & BUDGET_FLAG_MAX_IMPORT_BLOB != 0 {
+            let pool = global_pool();
+            let budget = pool.budget.lock().clone();
+            if let Some(limit) = budget.max_import_blob_bytes {
+                if len > limit {
+                    return Err(LoroError::memory_limit_exceeded(
+                        MemoryLimitKind::ImportBlob,
+                        len,
+                        limit,
+                    ));
+                }
+            }
+            let wasm_limit = if cfg!(target_arch = "wasm32") {
+                budget.max_wasm_linear_bytes
+            } else {
+                None
+            };
+            let hard_cap = match (budget.max_heap_bytes, wasm_limit) {
+                (Some(h), Some(w)) => Some(h.min(w)),
+                (Some(h), None) => Some(h),
+                (None, Some(w)) => Some(w),
+                (None, None) => None,
+            };
+            if let Some(cap) = hard_cap {
+                let len_u64 = len as u64;
+                if len_u64 > cap {
+                    return Err(make_global_budget_err(len_u64, cap));
+                }
+                let mut used = pool.current_heap_or_estimated_used();
+                let high = budget.effective_high_watermark().unwrap_or(cap);
+                let target = budget.effective_target_watermark().unwrap_or(high);
+                let head_target = target.min(cap.saturating_sub(len_u64));
+                if used.saturating_add(len_u64) > high.min(cap) {
+                    let exclude = if self.txn.is_held_by_current_thread()
+                        || self.oplog.is_locked()
+                        || self.state.is_locked()
+                    {
+                        Some(self.pool_doc_id)
+                    } else {
+                        None
+                    };
+                    pool.reclaim_for_watermark(head_target, exclude, false);
+                    used = pool.current_heap_or_estimated_used();
+                }
+                if include_buffer_alloc {
+                    let projected = used.saturating_add(len_u64);
+                    if let Some(max_heap) = budget.max_heap_bytes {
+                        if projected > max_heap {
+                            return Err(make_global_budget_err(projected, max_heap));
+                        }
+                    }
+                    if let Some(max_lin) = wasm_limit {
+                        if projected > max_lin {
+                            return Err(make_global_budget_err(projected, max_lin));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_import_json_limit(&self, json: &JsonSchema) -> LoroResult<()> {
+        if !self.has_max_import_blob_bytes() {
+            return Ok(());
+        }
+        struct CountingWriter {
+            count: usize,
+            limit: usize,
+        }
+        impl std::io::Write for CountingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.count = self.count.saturating_add(buf.len());
+                if self.count > self.limit {
+                    return Err(std::io::Error::other("import json exceeds limit"));
+                }
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let local_limit = if self.budget_flags.load(Acquire) & BUDGET_FLAG_MAX_IMPORT_BLOB != 0 {
+            self.memory_budget.lock().max_import_blob_bytes
+        } else {
+            None
+        };
+        let global_limit = if global_budget_flags() & BUDGET_FLAG_MAX_IMPORT_BLOB != 0 {
+            global_pool().budget.lock().max_import_blob_bytes
+        } else {
+            None
+        };
+        let effective_limit = match (local_limit, global_limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let Some(limit) = effective_limit else {
+            return Ok(());
+        };
+        let mut writer = CountingWriter { count: 0, limit };
+        if serde_json::to_writer(&mut writer, json).is_err() || writer.count > limit {
+            return Err(LoroError::memory_limit_exceeded(
+                MemoryLimitKind::ImportBlob,
+                writer.count.max(limit.saturating_add(1)),
+                limit,
+            ));
+        }
+        Ok(())
+    }
+
+    fn live_undo_managers(
+        &self,
+    ) -> Vec<Arc<parking_lot::ReentrantMutex<std::cell::RefCell<crate::undo::UndoManagerInner>>>>
+    {
+        let mut guard = self.undo_managers.lock();
+        guard.retain(|w| w.strong_count() > 0);
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    }
+
+    fn shrink_undo_managers(&self) -> usize {
+        shrink_undo_managers_inner(self)
+    }
+
+    /// Returns a snapshot of estimated RAM and disk usage across all document subsystems.
+    pub fn memory_stats(&self) -> DocMemoryStats {
+        let uncommitted_txn_bytes = if self.txn.is_held_by_current_thread() {
+            0
+        } else {
+            self.txn
+                .lock()
+                .as_ref()
+                .map_or(0, Transaction::estimated_uncommitted_bytes)
+        };
+        self.memory_stats_with_txn_bytes(uncommitted_txn_bytes)
+    }
+
+    fn memory_stats_with_txn_bytes(&self, uncommitted_txn_bytes: usize) -> DocMemoryStats {
+        let oplog = self.oplog.lock();
+        let state = self.state.lock();
+        self.memory_stats_locked(&oplog, &state, uncommitted_txn_bytes)
+    }
+
+    fn memory_stats_locked(
+        &self,
+        oplog: &OpLog,
+        state: &DocState,
+        uncommitted_txn_bytes: usize,
+    ) -> DocMemoryStats {
+        compute_doc_stats_locked_inner(self, oplog, state, uncommitted_txn_bytes, false)
+    }
+
+    pub(crate) fn check_doc_budget_with_limit(
+        &self,
+        uncommitted_txn_bytes: usize,
+        limit: usize,
+    ) -> LoroResult<()> {
+        let stats = self.memory_stats_with_txn_bytes(uncommitted_txn_bytes);
+        if stats.total_bytes > limit {
+            return Err(LoroError::memory_limit_exceeded(
+                MemoryLimitKind::DocBudget,
+                stats.total_bytes,
+                limit,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_transaction_budget(
+        &self,
+        txn: &Transaction,
+        linear_before: Option<u64>,
+    ) -> LoroResult<()> {
+        if let Some(limit) = txn.doc_budget_limit {
+            self.check_doc_budget_with_limit(txn.estimated_uncommitted_bytes(), limit)?;
+        }
+        if global_budget_flags() & BUDGET_FLAG_MAX_DOC != 0 && txn.budget_base_scope().is_some() {
+            let active_bytes = if heap_tracker_active() {
+                None
+            } else {
+                Some(
+                    self.memory_stats_with_txn_bytes(txn.estimated_uncommitted_bytes())
+                        .total_bytes,
+                )
+            };
+            global_pool().check_global_budget_with_active(self, active_bytes, linear_before)?;
+        }
+        Ok(())
+    }
+
+    fn check_doc_budget_with_txn_bytes_and_linear(
+        &self,
+        uncommitted_txn_bytes: usize,
+        linear_before: Option<u64>,
+    ) -> LoroResult<()> {
+        let local_limit = if self.budget_flags.load(Acquire) & BUDGET_FLAG_MAX_DOC != 0 {
+            self.memory_budget.lock().max_doc_bytes
+        } else {
+            None
+        };
+        let has_global = global_budget_flags() & BUDGET_FLAG_MAX_DOC != 0;
+        if local_limit.is_none() && !has_global {
+            return Ok(());
+        }
+        let need_stats = local_limit.is_some() || (has_global && !heap_tracker_active());
+        let active_bytes = if need_stats {
+            let stats = self.memory_stats_with_txn_bytes(uncommitted_txn_bytes);
+            if let Some(limit) = local_limit {
+                if stats.total_bytes > limit {
+                    return Err(LoroError::memory_limit_exceeded(
+                        MemoryLimitKind::DocBudget,
+                        stats.total_bytes,
+                        limit,
+                    ));
+                }
+            }
+            Some(stats.total_bytes)
+        } else {
+            None
+        };
+        if has_global {
+            global_pool().check_global_budget_with_active(self, active_bytes, linear_before)?;
+        }
+        Ok(())
+    }
+
+    fn check_doc_budget_locked_with_linear(
+        &self,
+        oplog: &OpLog,
+        state: &DocState,
+        uncommitted_txn_bytes: usize,
+        linear_before: Option<u64>,
+    ) -> LoroResult<()> {
+        let local_limit = if self.budget_flags.load(Acquire) & BUDGET_FLAG_MAX_DOC != 0 {
+            self.memory_budget.lock().max_doc_bytes
+        } else {
+            None
+        };
+        let has_global = global_budget_flags() & BUDGET_FLAG_MAX_DOC != 0;
+        if local_limit.is_none() && !has_global {
+            return Ok(());
+        }
+        let need_stats = local_limit.is_some() || (has_global && !heap_tracker_active());
+        let active_bytes = if need_stats {
+            let stats = self.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+            if let Some(limit) = local_limit {
+                if stats.total_bytes > limit {
+                    return Err(LoroError::memory_limit_exceeded(
+                        MemoryLimitKind::DocBudget,
+                        stats.total_bytes,
+                        limit,
+                    ));
+                }
+            }
+            Some(stats.total_bytes)
+        } else {
+            None
+        };
+        if has_global {
+            global_pool().check_global_budget_with_active(self, active_bytes, linear_before)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn enforce_memory_watermarks(&self) {
+        if !self.has_watermark_budget() {
+            return;
+        }
+        let uncommitted_txn_bytes = if self.txn.is_held_by_current_thread() {
+            0
+        } else {
+            self.txn
+                .lock()
+                .as_ref()
+                .map_or(0, Transaction::estimated_uncommitted_bytes)
+        };
+        self.enforce_memory_watermarks_with_txn_bytes(uncommitted_txn_bytes, false);
+    }
+
+    pub(crate) fn enforce_memory_watermarks_with_txn_bytes(
+        &self,
+        uncommitted_txn_bytes: usize,
+        force_full: bool,
+    ) {
+        if !force_full && !self.has_watermark_budget() {
+            return;
+        }
+        let budget = self.memory_budget.lock().clone();
+        if !force_full
+            && heap_tracker_active()
+            && budget == MemoryBudget::default()
+            && global_watermarks_active()
+        {
+            let global = global_pool().budget.lock().clone();
+            let used = tracked_allocated_heap_bytes();
+            if global
+                .effective_high_watermark()
+                .is_some_and(|high| used <= high)
+                && !(cfg!(target_arch = "wasm32")
+                    && global.wasm_heap_pressure(wasm_linear_memory_bytes(), used))
+            {
+                return;
+            }
+        }
+        if !force_full
+            && !global_watermarks_active()
+            && budget.effective_high_watermark().is_none()
+            && budget.max_kv_block_cache_bytes.is_none()
+            && budget.max_decoded_value_cache_bytes.is_none()
+            && budget.max_undo_bytes.is_none()
+        {
+            return;
+        }
+        let oplog = self.oplog.lock();
+        let mut state = self.state.lock();
+        self.enforce_watermarks_with_budget_locked(
+            &budget,
+            &oplog,
+            &mut state,
+            uncommitted_txn_bytes,
+            force_full,
+        );
+    }
+
+    fn enforce_watermarks_locked(
+        &self,
+        oplog: &OpLog,
+        state: &mut DocState,
+        uncommitted_txn_bytes: usize,
+        force_full: bool,
+    ) {
+        if !force_full && !self.has_watermark_budget() {
+            return;
+        }
+        let budget = self.memory_budget.lock().clone();
+        if !force_full
+            && !global_watermarks_active()
+            && budget.effective_high_watermark().is_none()
+            && budget.max_kv_block_cache_bytes.is_none()
+            && budget.max_decoded_value_cache_bytes.is_none()
+            && budget.max_undo_bytes.is_none()
+        {
+            return;
+        }
+        self.enforce_watermarks_with_budget_locked(
+            &budget,
+            oplog,
+            state,
+            uncommitted_txn_bytes,
+            force_full,
+        );
+    }
+
+    fn enforce_watermarks_with_budget_locked(
+        &self,
+        budget: &MemoryBudget,
+        oplog: &OpLog,
+        state: &mut DocState,
+        uncommitted_txn_bytes: usize,
+        force_full: bool,
+    ) {
+        if let Some(limit) = budget.max_kv_block_cache_bytes {
+            self.kv_block_cache.set_explicit_max_bytes(Some(limit));
+        }
+        if let Some(limit) = budget.max_decoded_value_cache_bytes {
+            state.evict_value_cache_to_bytes(limit);
+        }
+
+        let high = if force_full {
+            Some(0)
+        } else {
+            budget.effective_high_watermark()
+        };
+        let target = if force_full {
+            Some(0)
+        } else {
+            budget.effective_target_watermark()
+        };
+
+        if let Some(high) = high {
+            let stats = self.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+            if stats.total_bytes <= high && !force_full {
+                self.soft_backoff.reset();
+            } else if !force_full && self.soft_backoff.backed_off(stats.total_bytes as u64) {
+                // The last sweep could not reach the target and usage has barely
+                // grown: skip Stage 1's history compaction and full KV flush (with a
+                // spill directory, a rewrite of the whole table) on every commit.
+            } else {
+                #[cfg(test)]
+                DOC_STAGE1_PASSES.with(|n| n.set(n.get() + 1));
+                // Stage 1: Reclaim caches and soft buffers before touching materialized states.
+                state.evict_value_cache_to_bytes(if force_full {
+                    0
+                } else {
+                    budget.max_decoded_value_cache_bytes.unwrap_or(0)
+                });
+                if (force_full || budget.max_kv_block_cache_bytes.is_none())
+                    && !self.kv_block_cache.is_delegating_to_parent()
+                {
+                    self.kv_block_cache.clear();
+                }
+                state.reclaim_auxiliary_caches();
+                oplog.compact_history();
+                #[cfg(not(target_arch = "wasm32"))]
+                if force_full || budget.spill_dir.is_some() {
+                    oplog.flush_kv();
+                }
+                #[cfg(target_arch = "wasm32")]
+                if force_full {
+                    oplog.flush_kv();
+                }
+                oplog.with_history_cache(|h| h.free_all());
+                if force_full {
+                    oplog.arena.shrink_spare_capacity();
+                }
+                self.diff_calculator
+                    .lock()
+                    .reclaim_cold_caches(if force_full { 0 } else { 4 });
+                let _ = self.shrink_undo_managers();
+
+                let target_limit = target.unwrap_or(high);
+                let stats_after_stage1 =
+                    self.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+                let mut left = stats_after_stage1.total_bytes;
+                if stats_after_stage1.total_bytes > target_limit || force_full {
+                    // Stage 2: Demote cold materialized container states and compress KV memtables.
+                    let need = stats_after_stage1.total_bytes.saturating_sub(target_limit);
+                    let target_state_bytes = if force_full {
+                        0
+                    } else {
+                        state.state_estimated_bytes().saturating_sub(need)
+                    };
+                    state.demote_cold_states(target_state_bytes, &Default::default());
+                    state.flush_kv();
+                    oplog.flush_kv();
+                    if !force_full {
+                        left = self
+                            .memory_stats_locked(oplog, state, uncommitted_txn_bytes)
+                            .total_bytes;
+                    }
+                }
+                if !force_full {
+                    self.soft_backoff.record(left <= target_limit, left as u64);
+                }
+            }
+        }
+
+        if !force_full && global_watermarks_active() {
+            let active_stats = self.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+            global_pool().enforce_global_watermarks_for_active(
+                self,
+                oplog,
+                state,
+                uncommitted_txn_bytes,
+                active_stats.total_bytes,
+            );
+        } else if global_budget_flags() != 0 {
+            let _ = self.memory_stats_locked(oplog, state, uncommitted_txn_bytes);
+        }
+    }
+
+    /// Takes the first failure to write spilled tables to the
+    /// [`MemoryBudget::spill_dir`] since the previous call, or `None`.
+    ///
+    /// A flush that cannot write keeps its tables in memory, so no data is lost,
+    /// but the document is no longer (fully) out of core and its memory grows.
+    /// Errors from the op log and the state stores are joined with `"; "`.
+    /// Always `None` without a spill directory, and on `wasm32`, where spilling
+    /// is a no-op.
+    pub fn take_spill_error(&self) -> Option<String> {
+        let oplog = self.oplog.lock().change_store().take_spill_error();
+        let state = self.state.lock().take_spill_error();
+        crate::state::container_store::join_spill_errors(oplog, state)
+    }
+
+    /// Reclaims caches and demotes cold container states, returning estimated freed bytes.
+    pub fn reclaim_memory(&self) -> usize {
+        let before = self.memory_stats().total_bytes;
+        let uncommitted_txn_bytes = if self.txn.is_held_by_current_thread() {
+            0
+        } else {
+            self.txn
+                .lock()
+                .as_ref()
+                .map_or(0, Transaction::estimated_uncommitted_bytes)
+        };
+        self.enforce_memory_watermarks_with_txn_bytes(uncommitted_txn_bytes, true);
+        let after = self
+            .memory_stats_with_txn_bytes(uncommitted_txn_bytes)
+            .total_bytes;
+        before.saturating_sub(after)
+    }
+
+    /// Runs full reclamation and checks whether usage now fits within [`MemoryBudget::max_doc_bytes`].
+    pub fn try_reclaim_to_budget(&self) -> LoroResult<DocMemoryStats> {
+        let _ = self.reclaim_memory();
+        let stats = self.memory_stats();
+        if let Some(limit) = self.memory_budget.lock().max_doc_bytes {
+            if stats.total_bytes > limit {
+                return Err(LoroError::memory_limit_exceeded(
+                    MemoryLimitKind::DocBudget,
+                    stats.total_bytes,
+                    limit,
+                ));
+            }
+        }
+        Ok(stats)
+    }
+}
+
 // Helpers of `LoroDoc::check_apply_diff_creates_no_unknown_container`
 
 fn resolve_container_remap(
@@ -5516,4 +8270,261 @@ struct PlannedAlignment {
     edit: Option<crate::event::Diff>,
     /// Children kept by the alignment, whose own entries are full states too
     kept: FxHashSet<ContainerID>,
+}
+
+#[cfg(test)]
+mod reclamation_work_tests {
+    use super::*;
+
+    #[test]
+    fn the_linear_ceiling_is_met_by_pages_or_by_heap_within_existing_pages() {
+        let max = 1000;
+        assert!(
+            linear_budget_satisfied(1000, max, 990),
+            "pages within the ceiling"
+        );
+        assert!(
+            linear_budget_satisfied(4000, max, 700),
+            "pages grew; heap back at 70%"
+        );
+        assert!(!linear_budget_satisfied(4000, max, 701));
+    }
+    #[test]
+    fn a_two_pass_global_sweep_runs_stage1_once_per_idle_document() {
+        let doc = LoroDoc::new_auto_commit();
+        doc.get_map("map").insert("value", 1).unwrap();
+        doc.commit_then_renew();
+        let pool = GlobalMemoryPool::new();
+        IDLE_STAGE1_PASSES.with(|n| n.set(0));
+        pool.reclaim_idle_docs_to_target(&[RegistryRef::from_doc(&doc)], None, 0, true);
+        IDLE_STAGE1_PASSES.with(|n| assert_eq!(n.get(), 1));
+        assert_eq!(doc.get_map("map").get("value").unwrap(), LoroValue::I64(1));
+    }
+
+    /// The native global estimate recomputes only documents marked dirty, not
+    /// every live document (it used to cost ~1 ms per commit with 1,000 idle
+    /// documents). Global budgets are off in this test binary, so marks do not
+    /// queue documents themselves; the test queues the dirty ones by hand.
+    #[test]
+    fn the_global_estimate_refreshes_only_documents_marked_dirty() {
+        let pool = GlobalMemoryPool::new();
+        let docs: Vec<LoroDoc> = (0..40)
+            .map(|i| {
+                let doc = LoroDoc::new_auto_commit();
+                doc.get_map("m").insert("v", i).unwrap();
+                doc.commit_then_renew();
+                pool.register(
+                    doc.pool_doc_id,
+                    Arc::downgrade(&doc.inner),
+                    doc.drop_gate.clone(),
+                );
+                doc
+            })
+            .collect();
+        DIRTY_REFRESHES.with(|n| n.set(0));
+        let _ = pool.estimated_docs_total(None);
+        assert_eq!(
+            DIRTY_REFRESHES.with(|n| n.get()),
+            40,
+            "new documents start queued"
+        );
+        assert!(docs.iter().all(|d| !d.stats_dirty.is_dirty()));
+        let refreshes_for_queued_dirty_docs = || {
+            for doc in &docs {
+                if doc.stats_dirty.is_dirty() {
+                    pool.push_dirty(doc.pool_doc_id);
+                }
+            }
+            DIRTY_REFRESHES.with(|n| n.set(0));
+            let _ = pool.estimated_docs_total(None);
+            DIRTY_REFRESHES.with(|n| n.get())
+        };
+        assert_eq!(refreshes_for_queued_dirty_docs(), 0);
+
+        let _ = docs[3].get_map("m").get("v");
+        assert!(
+            docs[3].stats_dirty.is_dirty(),
+            "a read takes the state lock"
+        );
+        let _ = docs[4].get_map("only_registered");
+        assert!(
+            docs[4].stats_dirty.is_dirty(),
+            "a handler registers in the arena"
+        );
+        docs[5]
+            .get_text("t")
+            .insert(0, "x", crate::cursor::PosType::Unicode)
+            .unwrap();
+        let undo = crate::UndoManager::new(&docs[6]);
+        refresh_cached_doc_bytes_for_inner(&docs[6].inner);
+        docs[6]
+            .get_text("t")
+            .insert(0, "y", crate::cursor::PosType::Unicode)
+            .unwrap();
+        docs[6].commit_then_renew();
+        let dirty = docs.iter().filter(|d| d.stats_dirty.is_dirty()).count();
+        assert_eq!(dirty, 4);
+        assert_eq!(refreshes_for_queued_dirty_docs(), 4);
+        assert!(docs.iter().all(|d| !d.stats_dirty.is_dirty()));
+        drop(undo);
+        assert!(
+            docs[6].stats_dirty.is_dirty(),
+            "undo bytes left with the manager"
+        );
+        assert_eq!(refreshes_for_queued_dirty_docs(), 1);
+
+        // A busy document keeps its cached value and stays queued.
+        let state = docs[7].state.lock();
+        assert!(docs[7].stats_dirty.is_dirty());
+        assert_eq!(refreshes_for_queued_dirty_docs(), 1);
+        assert_eq!(
+            pool.dirty_docs.lock().iter().copied().collect::<Vec<_>>(),
+            vec![docs[7].pool_doc_id]
+        );
+        drop(state);
+        DIRTY_REFRESHES.with(|n| n.set(0));
+        let _ = pool.estimated_docs_total(None);
+        assert_eq!(DIRTY_REFRESHES.with(|n| n.get()), 1);
+        assert!(pool.dirty_docs.lock().is_empty());
+
+        // (Refreshes update the process-wide pool's totals, so compare per document.)
+        for doc in &docs {
+            let fresh = fresh_doc_stats_unmarked(&doc.inner).unwrap();
+            assert_eq!(doc.cached_doc_bytes.load(Relaxed), fresh.total_bytes);
+        }
+    }
+
+    /// The per-document Stage 1 (with a spill directory it flushes the whole KV
+    /// table) used to run on every commit above the high watermark even when the
+    /// previous sweep could not reach the target. It now backs off like the
+    /// global sweep.
+    #[test]
+    fn a_failed_document_soft_sweep_backs_off_until_usage_grows() {
+        let doc = LoroDoc::new_auto_commit();
+        let text = doc.get_text("t");
+        text.insert(0, "first", crate::cursor::PosType::Unicode)
+            .unwrap();
+        doc.commit_then_renew();
+        let passes = || DOC_STAGE1_PASSES.with(|n| n.get());
+        let edit = |s: &str| {
+            text.insert(0, s, crate::cursor::PosType::Unicode).unwrap();
+            doc.commit_then_renew();
+        };
+        let tiny = || MemoryBudget {
+            high_watermark_bytes: Some(1),
+            target_watermark_bytes: Some(1),
+            ..Default::default()
+        };
+        let start = passes();
+        doc.set_memory_budget(tiny());
+        assert_eq!(
+            passes() - start,
+            1,
+            "setting the budget sweeps once and fails"
+        );
+        for _ in 0..10 {
+            edit("x");
+        }
+        assert_eq!(passes() - start, 1, "no growth: backed off");
+        edit(&"grow".repeat(256 * 1024));
+        assert_eq!(passes() - start, 2, "usage grew: swept again");
+        doc.set_memory_budget(tiny());
+        assert_eq!(passes() - start, 3, "a new budget clears the backoff");
+        let _ = doc.reclaim_memory();
+        assert_eq!(passes() - start, 4, "explicit reclamation never backs off");
+        assert_eq!(text.len_unicode(), "first".len() + 10 + 4 * 256 * 1024);
+    }
+
+    /// A soft sweep that cannot reach its target is not repeated on every
+    /// commit; it is retried after usage grows or after a bounded number of
+    /// skipped checks. (Hard admission, `check_global_budget_with_active`, never
+    /// reads the backoff.)
+    #[test]
+    fn a_failed_global_soft_sweep_backs_off_until_usage_grows() {
+        let pool = GlobalMemoryPool::new();
+        *pool.budget.lock() = GlobalMemoryBudget {
+            high_watermark_bytes: Some(1),
+            target_watermark_bytes: Some(1),
+            ..Default::default()
+        };
+        let doc = LoroDoc::new_auto_commit();
+        pool.register(
+            doc.pool_doc_id,
+            Arc::downgrade(&doc.inner),
+            doc.drop_gate.clone(),
+        );
+        let text = doc.get_text("t");
+        let edit_and_check = |s: &str| {
+            text.insert(0, s, crate::cursor::PosType::Unicode).unwrap();
+            doc.commit_then_renew();
+            let oplog = doc.oplog.lock();
+            let mut state = doc.state.lock();
+            let bytes = doc.memory_stats_locked(&oplog, &state, 0).total_bytes;
+            // `cached_doc_bytes` is shared with the process-wide pool; start this
+            // private pool's total from the active document alone.
+            doc.cached_doc_bytes.store(0, Relaxed);
+            pool.total_cached_doc_bytes.store(0, Relaxed);
+            pool.enforce_global_watermarks_for_active(&doc, &oplog, &mut state, 0, bytes);
+        };
+        let passes = || ACTIVE_FALLBACK_PASSES.with(|n| n.get());
+        let start = passes();
+        edit_and_check("first");
+        assert_eq!(passes() - start, 1);
+        for _ in 0..10 {
+            edit_and_check("x");
+        }
+        assert_eq!(passes() - start, 1, "no growth: backed off");
+
+        edit_and_check(&"grow".repeat(256 * 1024));
+        assert_eq!(passes() - start, 2, "usage grew: swept again");
+
+        for _ in 0..SOFT_BACKOFF_MAX_SKIPS + 1 {
+            edit_and_check("y");
+        }
+        assert_eq!(passes() - start, 3, "retried after the skip limit");
+    }
+
+    /// The registry's temporary reference must not make the last handle skip its
+    /// implicit commit; the registry's own release must not commit either.
+    #[test]
+    fn last_handle_commits_while_the_registry_holds_a_reference() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let doc = LoroDoc::new_auto_commit();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let counter = updates.clone();
+        doc.subscribe_local_update(Box::new(move |_| {
+            counter.fetch_add(1, SeqCst);
+            true
+        }))
+        .detach();
+        doc.get_text("t")
+            .insert(0, "x", crate::cursor::PosType::Unicode)
+            .unwrap();
+        let weak = Arc::downgrade(&doc.inner);
+        let held = RegistryRef::from_doc(&doc);
+        let other = doc.clone();
+        drop(doc);
+        assert_eq!(updates.load(SeqCst), 0, "another handle is still alive");
+        drop(other);
+        assert_eq!(updates.load(SeqCst), 1, "the last handle commits");
+        assert!(weak.upgrade().is_some());
+        drop(held);
+        assert_eq!(updates.load(SeqCst), 1);
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// Arming the hard scope from `set_global_memory_budget` used to create a
+    /// temporary `LoroDoc` while holding the transaction lock.
+    #[test]
+    fn arming_a_global_scope_does_not_create_a_handle() {
+        let doc = LoroDoc::new_auto_commit();
+        let before = Arc::strong_count(&doc.inner);
+        let held = RegistryRef::from_doc(&doc);
+        let mut guard = held.txn.try_lock().unwrap();
+        held.arm_budget_scope_on_txn(guard.as_mut().unwrap());
+        assert_eq!(Arc::strong_count(&doc.inner), before + 1);
+        drop(guard);
+        drop(held);
+        assert_eq!(Arc::strong_count(&doc.inner), before);
+    }
 }

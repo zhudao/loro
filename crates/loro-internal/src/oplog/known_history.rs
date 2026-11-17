@@ -835,9 +835,9 @@ fn list_op_eq(values: ImportedValues, a: &InnerListOp, b: &InnerListOp) -> bool 
             // A one-atom delete has no direction: `signed_len` 1 and -1 delete the
             // same element, and which one is stored depends on how it was sliced.
             a.id_start == b.id_start
-                && a.span.pos == b.span.pos
-                && (a.span.signed_len == b.span.signed_len
-                    || (a.span.signed_len.abs() == 1 && b.span.signed_len.abs() == 1))
+                && a.pos == b.pos
+                && (a.signed_len == b.signed_len
+                    || (a.signed_len.abs() == 1 && b.signed_len.abs() == 1))
         }
         (
             InnerListOp::Move {
@@ -851,37 +851,15 @@ fn list_op_eq(values: ImportedValues, a: &InnerListOp, b: &InnerListOp) -> bool 
                 to: b_to,
             },
         ) => a_from == b_from && a_elem == b_elem && a_to == b_to,
-        (
-            InnerListOp::Set {
-                elem_id: a_elem,
-                value: a_value,
-            },
-            InnerListOp::Set {
-                elem_id: b_elem,
-                value: b_value,
-            },
-        ) => a_elem == b_elem && values.eq(a_value, b_value),
-        (
-            InnerListOp::StyleStart {
-                start: a_start,
-                end: a_end,
-                key: a_key,
-                value: a_value,
-                info: a_info,
-            },
-            InnerListOp::StyleStart {
-                start: b_start,
-                end: b_end,
-                key: b_key,
-                value: b_value,
-                info: b_info,
-            },
-        ) => {
-            a_start == b_start
-                && a_end == b_end
-                && a_key == b_key
-                && values.eq(a_value, b_value)
-                && a_info == b_info
+        (InnerListOp::Set(a_set), InnerListOp::Set(b_set)) => {
+            a_set.elem_id == b_set.elem_id && values.eq(&a_set.value, &b_set.value)
+        }
+        (InnerListOp::StyleStart(a), InnerListOp::StyleStart(b)) => {
+            a.start == b.start
+                && a.end == b.end
+                && a.key == b.key
+                && values.eq(&a.value, &b.value)
+                && a.info == b.info
         }
         (InnerListOp::StyleEnd, InnerListOp::StyleEnd) => true,
         _ => false,
@@ -1032,11 +1010,13 @@ impl<'a> CausalWorkspace<'a> {
                 let child_id = child.id;
                 if let Some(child_sum) = self.memo.get(&child_id) {
                     frame.local.merge(child_sum);
-                } else if !self.indices.contains_key(&child_id) {
+                } else if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.indices.entry(child_id)
+                {
                     frame.pending_child = Some(child_id);
                     let idx = next_index;
                     next_index += 1;
-                    self.indices.insert(child_id, idx);
+                    entry.insert(idx);
                     self.lowlink.insert(child_id, idx);
                     self.on_stack.insert(child_id);
                     self.scc_stack.push((child_id, CausalSummary::default()));

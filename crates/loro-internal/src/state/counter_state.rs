@@ -33,6 +33,10 @@ impl CounterState {
     pub(crate) fn new(idx: ContainerIdx) -> Self {
         Self { idx, value: 0. }
     }
+
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
 }
 
 impl ContainerState for CounterState {
@@ -56,6 +60,17 @@ impl ContainerState for CounterState {
     fn apply_diff(&mut self, diff: InternalDiff, ctx: DiffApplyContext) -> LoroResult<()> {
         let _ = self.apply_diff_and_convert(diff, ctx);
         Ok(())
+    }
+
+    fn undo_record(&mut self, _diff: &InternalDiff) -> super::undo_log::StateUndo {
+        super::undo_log::StateUndo::Counter(self.value)
+    }
+
+    fn apply_undo(&mut self, undo: super::undo_log::StateUndo) {
+        let super::undo_log::StateUndo::Counter(value) = undo else {
+            unreachable!()
+        };
+        self.value = value;
     }
 
     fn apply_local_op(&mut self, raw_op: &RawOp, _op: &Op) -> LoroResult<ApplyLocalOpReturn> {
