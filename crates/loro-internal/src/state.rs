@@ -38,6 +38,7 @@ pub(crate) mod container_store;
 mod counter_state;
 mod dead_containers_cache;
 mod deep_value;
+pub(crate) mod direct_import;
 mod list_state;
 mod map_state;
 mod mergeable;
@@ -76,6 +77,30 @@ pub(crate) fn fail_next_import_state_apply_for_test() {
     FAIL_NEXT_IMPORT_STATE_APPLY.with(|fail| fail.set(true));
 }
 
+/// Whether this import must fail before any container write.
+///
+/// The origin match does not clear the thread-local, matching `apply_diff`.
+/// The thread-local is consumed only when it is set. Call this only when the
+/// direct path is about to mutate; a skip must leave the flag for `apply_diff`.
+#[cfg(test)]
+pub(crate) fn take_import_apply_failpoint(origin: &str) -> bool {
+    if origin == "__loro_fail_import_state_apply" {
+        return true;
+    }
+    FAIL_NEXT_IMPORT_STATE_APPLY.with(|fail| {
+        let should_fail = fail.get();
+        if should_fail {
+            fail.set(false);
+        }
+        should_fail
+    })
+}
+
+#[cfg(not(test))]
+pub(crate) fn take_import_apply_failpoint(_origin: &str) -> bool {
+    false
+}
+
 fn visible_container_value_is_empty(kind: ContainerType, value: &LoroValue) -> bool {
     match kind {
         ContainerType::Text => value.as_string().is_some_and(|value| value.is_empty()),
@@ -87,6 +112,23 @@ fn visible_container_value_is_empty(kind: ContainerType, value: &LoroValue) -> b
         ContainerType::Counter => false,
         ContainerType::Unknown(_) => false,
     }
+}
+
+#[test]
+fn small_commits_release_transaction_mark_capacity_after_a_large_batch() {
+    let doc = crate::LoroDoc::new();
+    doc.start_auto_commit();
+    for index in 0..4096 {
+        doc.get_map(format!("map-{index}"))
+            .insert("value", index as i64)
+            .unwrap();
+    }
+    let _ = doc.commit_then_renew();
+    assert!(doc.state.lock().changed_idx_in_txn.capacity() >= 4096);
+    doc.get_map("map-0").insert("value", 42).unwrap();
+    let _ = doc.commit_then_renew();
+    assert!(doc.state.lock().changed_idx_in_txn.capacity() <= 64);
+    assert_eq!(doc.get_map("map-4095").get("value"), Some(4095.into()));
 }
 
 fn deleted_root_container_value_is_cleared(kind: ContainerType, value: &LoroValue) -> bool {
@@ -160,6 +202,66 @@ fn decode_lamport_from_delta(
     u32::try_from(lamport).map_err(|_| state_decode_error(format!("{context}: negative lamport")))
 }
 
+#[derive(Debug, Default)]
+struct ChangedIdxSet {
+    first: Option<ContainerIdx>,
+    rest: FxHashSet<ContainerIdx>,
+}
+
+impl ChangedIdxSet {
+    #[inline]
+    fn insert(&mut self, idx: ContainerIdx) {
+        match self.first {
+            None => self.first = Some(idx),
+            Some(first) if first == idx => {}
+            Some(_) => {
+                self.rest.insert(idx);
+            }
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.first = None;
+        if !self.rest.is_empty() {
+            self.rest.clear();
+        }
+    }
+
+    #[inline]
+    fn clear_shrinking(&mut self) {
+        self.first = None;
+        let cap = self.rest.capacity();
+        if cap == 0 {
+            return;
+        }
+        if cap > self.rest.len().saturating_mul(4).max(64) {
+            self.rest = FxHashSet::default();
+        } else if !self.rest.is_empty() {
+            self.rest.clear();
+        }
+    }
+
+    fn to_pinned_set(&self, extra_pinned: &FxHashSet<ContainerIdx>) -> FxHashSet<ContainerIdx> {
+        let mut pinned = self.rest.clone();
+        if let Some(first) = self.first {
+            pinned.insert(first);
+        }
+        pinned.extend(extra_pinned.iter().copied());
+        pinned
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.rest.capacity()
+    }
+}
+
 pub struct DocState {
     pub(super) peer: Arc<AtomicU64>,
 
@@ -172,7 +274,7 @@ pub struct DocState {
     doc: Weak<LoroDocInner>,
     // txn related stuff
     in_txn: bool,
-    changed_idx_in_txn: FxHashSet<ContainerIdx>,
+    changed_idx_in_txn: ChangedIdxSet,
 
     // diff related stuff
     event_recorder: EventRecorder,
@@ -594,7 +696,7 @@ impl DocState {
                 doc,
                 config,
                 in_txn: false,
-                changed_idx_in_txn: FxHashSet::default(),
+                changed_idx_in_txn: ChangedIdxSet::default(),
                 event_recorder: Default::default(),
                 dead_containers_cache: Default::default(),
                 alive_containers_cache: None,
@@ -622,7 +724,7 @@ impl DocState {
             config,
             doc,
             in_txn: false,
-            changed_idx_in_txn: FxHashSet::default(),
+            changed_idx_in_txn: ChangedIdxSet::default(),
             event_recorder: Default::default(),
             dead_containers_cache: Default::default(),
             alive_containers_cache: None,
@@ -1226,12 +1328,12 @@ impl DocState {
 
     pub(crate) fn clear_local_rollback_stack(&mut self) {
         self.local_rollback_stack.clear();
-        self.changed_idx_in_txn.clear();
+        self.clear_changed_idx_in_txn();
         self.store.clear_created_journals();
     }
 
     pub(crate) fn clear_changed_idx_in_txn(&mut self) {
-        self.changed_idx_in_txn.clear();
+        self.changed_idx_in_txn.clear_shrinking();
     }
 
     /// Takes the event recorder out, so that a state change the caller discards
@@ -1361,8 +1463,8 @@ impl DocState {
 
     /// Ensure the container is created and will be encoded in the next `encode` call
     #[inline]
-    pub(crate) fn ensure_container(&mut self, id: &ContainerID) {
-        self.store.ensure_container(id);
+    pub(crate) fn ensure_container(&mut self, id: &ContainerID) -> ContainerIdx {
+        self.store.ensure_container(id)
     }
 
     /// Ensure all alive containers are created in DocState and will be encoded in the next
@@ -1531,7 +1633,6 @@ impl DocState {
         }
 
         if !unknown_containers.is_empty() {
-            let mut diff_calc = DiffCalculator::new(false);
             let stack_vv;
             let vv = if oplog.frontiers() == &frontiers {
                 oplog.vv()
@@ -1540,7 +1641,7 @@ impl DocState {
                 stack_vv.as_ref().unwrap()
             };
 
-            let (unknown_diffs, _diff_mode) = diff_calc.calc_diff_internal(
+            let (unknown_diffs, _diff_mode) = DiffCalculator::new(false).calc_diff_internal(
                 oplog,
                 &Default::default(),
                 &Default::default(),
@@ -2343,6 +2444,33 @@ impl DocState {
             panic!("diffs is empty");
         }
 
+        // One container: skip the dedup map. A missing path falls through so a
+        // hidden container matches the slow path.
+        if diffs.len() == 1 && diffs[0].diff.len() == 1 {
+            let idx = diffs[0].diff[0].idx;
+            if let Some(path) = self.get_path(idx) {
+                let diff0 = diffs.into_iter().next().unwrap();
+                let id = self.arena.get_container_id(idx).unwrap();
+                let is_unknown = id.is_unknown();
+                let container_diff = diff0.diff.into_owned().into_iter().next().unwrap();
+                return DocDiff {
+                    from,
+                    to: diff0.new_version.into_owned(),
+                    origin: diff0.origin,
+                    by: diff0.by,
+                    diff: vec![ContainerDiff {
+                        id,
+                        idx,
+                        diff: container_diff.diff.into_external().unwrap(),
+                        is_unknown,
+                        path,
+                        kept: container_diff.kept,
+                    }],
+                    local_inverse: diff0.local_inverse,
+                };
+            }
+        }
+
         let triggered_by = diffs[0].by;
         debug_assert!(diffs.iter().all(|x| x.by == triggered_by));
         let mut containers = FxHashMap::default();
@@ -2512,6 +2640,14 @@ impl DocState {
 
     // The container may be overwritten, so it may return None.
     pub(super) fn get_path(&mut self, idx: ContainerIdx) -> Option<Vec<(ContainerID, Index)>> {
+        let first_id = self.arena.idx_to_id(idx)?;
+        if !first_id.is_mergeable() {
+            if let ContainerID::Root { ref name, .. } = first_id {
+                let name = name.clone();
+                return Some(vec![(first_id, Index::Key(name))]);
+            }
+        }
+
         let mut ans = Vec::new();
         let mut idx = idx;
         loop {
@@ -2948,8 +3084,7 @@ impl DocState {
                 .store
                 .demote_cold_states(target_state_bytes, extra_pinned);
         }
-        let mut pinned = self.changed_idx_in_txn.clone();
-        pinned.extend(extra_pinned.iter().copied());
+        let pinned = self.changed_idx_in_txn.to_pinned_set(extra_pinned);
         self.store.demote_cold_states(target_state_bytes, &pinned)
     }
 }
